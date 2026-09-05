@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "id": "desktop",
+  "name": "Desktop",
+  "version": "0.1.0",
+  "status": "implemented",
+  "description": "KDE Plasma 6 workstation desktop, configured (not forked) via upstream Breeze color schemes, a Look-and-Feel package, and /etc/xdg distribution defaults. Package installation and configuration application are not performed by S1 — see docs/desktop/installation-plan.md for what 'implemented' means at this phase.",
+  "dependencies": ["core"],
+  "conflicts": [],
+  "packages": [
+    "ark",
+    "breeze",
+    "breeze-gtk",
+    "dolphin",
+    "kinfocenter",
+    "konsole",
+    "kwin-wayland",
+    "plasma-desktop",
+    "plasma-integration",
+    "plasma-nm",
+    "plasma-pa",
+    "plasma-workspace",
+    "print-manager",
+    "sddm",
+    "sddm-theme-breeze",
+    "systemsettings",
+    "xdg-desktop-portal-kde"
+  ],
+  "services": ["sddm.service"],
+  "configuration_units": [
+    "xdg-kdeglobals",
+    "xdg-kwinrc",
+    "sddm-dropin",
+    "color-scheme",
+    "konsole-profile",
+    "konsole-colorscheme",
+    "lookandfeel-metadata",
+    "lookandfeel-layout"
+  ],
+  "hardware_conditions": [],
+  "verification_checks": [
+    "desktop_os_compatibility",
+    "desktop_plasma_availability",
+    "desktop_kwin_availability",
+    "desktop_sddm_availability",
+    "desktop_wayland_session",
+    "desktop_config_contract",
+    "desktop_required_resources"
+  ],
+  "rollback": {
+    "supported": false,
+    "notes": "No package installation or configuration write is performed by S1; rollback is not applicable yet. See docs/desktop/configuration-ownership.md for the ownership model a future Apply/rollback implementation would rely on."
+  }
+}

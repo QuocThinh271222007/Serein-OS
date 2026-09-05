@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/desktop-state.schema.json",
+  "title": "Serein Desktop Status",
+  "description": "Output of `serein desktop status --json` (DesktopStatusReport.to_dict()).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "profile_id",
+    "profile_status",
+    "os_compatibility",
+    "availability",
+    "session",
+    "config"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "profile_id": { "type": "string" },
+    "profile_status": { "type": "string", "enum": ["declared", "implemented"] },
+    "os_compatibility": { "type": "string" },
+    "availability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plasma_installed", "kwin_wayland_installed", "kwin_x11_installed", "sddm_installed"],
+      "properties": {
+        "plasma_installed": { "type": "boolean" },
+        "kwin_wayland_installed": { "type": "boolean" },
+        "kwin_x11_installed": { "type": "boolean" },
+        "sddm_installed": { "type": "boolean" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desktop_environment", "session_type"],
+      "properties": {
+        "desktop_environment": { "type": ["string", "null"] },
+        "session_type": { "type": ["string", "null"], "enum": ["wayland", "x11", null] }
+      }
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["serein_preset_applied", "desktop_config_version"],
+      "properties": {
+        "serein_preset_applied": { "type": "boolean" },
+        "desktop_config_version": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    }
+  }
+}

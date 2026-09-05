@@ -1,0 +1,18 @@
+# Serein Plasma/KDE distribution defaults.
+#
+# Ships as /etc/xdg/kdeglobals (installed by a future Apply step; not
+# applied by S1). Per docs/desktop/configuration-ownership.md, this is a
+# lower-priority layer beneath each user's ~/.config/kdeglobals: any key a
+# user has already set always wins, and this file introduces no font
+# overrides (see docs/desktop/visual-design.md).
+
+[General]
+ColorScheme=SereinDark
+Name=Serein Dark
+widgetStyle=Breeze
+
+[Icons]
+Theme=breeze-dark
+
+[KDE]
+LookAndFeelPackage=org.serein.desktop
