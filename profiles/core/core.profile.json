@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "id": "core",
+  "name": "Core",
+  "version": "0.1.0",
+  "status": "implemented",
+  "description": "Baseline profile representing the unmodified Ubuntu host as integrated by Serein. Establishes the profile manifest contract; performs no package installation, service changes, or configuration mutation in S0.",
+  "dependencies": [],
+  "conflicts": [],
+  "packages": [],
+  "services": [],
+  "configuration_units": [],
+  "hardware_conditions": [],
+  "verification_checks": [],
+  "rollback": {
+    "supported": false,
+    "notes": "No mutation is performed by this profile in S0; rollback is not applicable yet."
+  }
+}

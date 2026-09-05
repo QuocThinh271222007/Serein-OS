@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/hardware-report.schema.json",
+  "title": "Serein Hardware Report",
+  "description": "Output of `serein hardware probe --json`.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "os",
+    "kernel",
+    "cpu",
+    "memory",
+    "gpu",
+    "storage",
+    "power",
+    "environment"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "os": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "id_like", "name", "version_id", "pretty_name", "is_ubuntu"],
+      "properties": {
+        "id": { "type": ["string", "null"] },
+        "id_like": { "type": "array", "items": { "type": "string" } },
+        "name": { "type": ["string", "null"] },
+        "version_id": { "type": ["string", "null"] },
+        "pretty_name": { "type": ["string", "null"] },
+        "is_ubuntu": { "type": "boolean" }
+      }
+    },
+    "kernel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "release", "version"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "release": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] }
+      }
+    },
+    "cpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["vendor", "model_name", "architecture", "logical_cores", "physical_cores"],
+      "properties": {
+        "vendor": { "type": ["string", "null"] },
+        "model_name": { "type": ["string", "null"] },
+        "architecture": { "type": ["string", "null"] },
+        "logical_cores": { "type": ["integer", "null"], "minimum": 1 },
+        "physical_cores": { "type": ["integer", "null"], "minimum": 1 }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_bytes", "available_bytes"],
+      "properties": {
+        "total_bytes": { "type": ["integer", "null"], "minimum": 0 },
+        "available_bytes": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "gpu": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["vendor", "model", "kind"],
+        "properties": {
+          "vendor": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "kind": { "type": ["string", "null"], "enum": ["integrated", "discrete", "unknown", null] }
+        }
+      }
+    },
+    "storage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "device_class", "size_bytes"],
+        "properties": {
+          "name": { "type": ["string", "null"] },
+          "device_class": { "type": ["string", "null"], "enum": ["nvme", "ssd", "hdd", "unknown", null] },
+          "size_bytes": { "type": ["integer", "null"], "minimum": 0 }
+        }
+      }
+    },
+    "power": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["has_battery", "battery_count", "on_ac_power"],
+      "properties": {
+        "has_battery": { "type": "boolean" },
+        "battery_count": { "type": "integer", "minimum": 0 },
+        "on_ac_power": { "type": ["boolean", "null"] }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["virtualization", "is_wsl", "is_container"],
+      "properties": {
+        "virtualization": { "type": "string" },
+        "is_wsl": { "type": "boolean" },
+        "is_container": { "type": "boolean" }
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+processor	: 0
+vendor_id	: AuthenticAMD
+model name	: Common KVM processor
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov hypervisor
+physical id	: 0
+core id		: 0

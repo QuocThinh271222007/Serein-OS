@@ -1,0 +1,11 @@
+processor	: 0
+vendor_id	: AuthenticAMD
+model name	: AMD EPYC 7763 64-Core Processor
+physical id	: 0
+core id		: 0
+
+processor	: 1
+vendor_id	: AuthenticAMD
+model name	: AMD EPYC 7763 64-Core Processor
+physical id	: 0
+core id		: 1

@@ -1,0 +1,48 @@
+processor	: 0
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 0
+
+processor	: 1
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 1
+
+processor	: 2
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 2
+
+processor	: 3
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 3
+
+processor	: 4
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 4
+
+processor	: 5
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 5
+
+processor	: 6
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 6
+
+processor	: 7
+vendor_id	: GenuineIntel
+model name	: Intel(R) Xeon(R) W-2245 CPU @ 3.90GHz
+physical id	: 0
+core id		: 7
+

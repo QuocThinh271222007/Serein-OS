@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serein"
+dynamic = ["version"]
+description = "Serein OS control-plane CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Serein OS project" }]
+# No license has been selected yet by the project owner. Do not add a
+# `license` table or LICENSE file until that decision is made.
+classifiers = ["Private :: Do Not Upload"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/QuocThinh271222007/Serein-OS"
+
+[project.scripts]
+serein = "serein.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "jsonschema>=4.20",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "serein.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/serein"]
+ignore_missing_imports = true
+disallow_untyped_defs = true
