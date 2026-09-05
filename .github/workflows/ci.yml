@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (editable, with dev dependencies)
+        run: python -m pip install -e ".[dev]"
+
+      - name: Import validation
+        run: python -c "import serein; import serein.cli; print(serein.__version__)"
+
+      - name: Run test suite
+        run: python -m pytest
+
+      - name: Ruff
+        run: python -m ruff check src tests
+
+      - name: Mypy
+        run: python -m mypy
+
+      - name: CLI smoke test
+        run: |
+          serein version
+          serein status
+          serein doctor --json
+          serein hardware probe --json
+          serein profile list

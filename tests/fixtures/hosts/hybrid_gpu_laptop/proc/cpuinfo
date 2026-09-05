@@ -1,0 +1,36 @@
+processor	: 0
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-11800H CPU @ 2.30GHz
+physical id	: 0
+core id		: 0
+
+processor	: 1
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-11800H CPU @ 2.30GHz
+physical id	: 0
+core id		: 1
+
+processor	: 2
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-11800H CPU @ 2.30GHz
+physical id	: 0
+core id		: 2
+
+processor	: 3
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-11800H CPU @ 2.30GHz
+physical id	: 0
+core id		: 3
+
+processor	: 4
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-11800H CPU @ 2.30GHz
+physical id	: 0
+core id		: 4
+
+processor	: 5
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-11800H CPU @ 2.30GHz
+physical id	: 0
+core id		: 5
+

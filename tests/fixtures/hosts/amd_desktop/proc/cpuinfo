@@ -1,0 +1,72 @@
+processor	: 0
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 0
+
+processor	: 1
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 1
+
+processor	: 2
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 2
+
+processor	: 3
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 3
+
+processor	: 4
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 4
+
+processor	: 5
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 5
+
+processor	: 6
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 0
+
+processor	: 7
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 1
+
+processor	: 8
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 2
+
+processor	: 9
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 3
+
+processor	: 10
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 4
+
+processor	: 11
+vendor_id	: AuthenticAMD
+model name	: AMD Ryzen 5 5600X 6-Core Processor
+physical id	: 0
+core id		: 5
+
