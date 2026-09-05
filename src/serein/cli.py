@@ -15,8 +15,12 @@ from collections.abc import Sequence
 
 from serein import __version__
 from serein.core.status import build_status_report
+from serein.desktop.config import RESOURCES, missing_resources
+from serein.desktop.doctor import run_desktop_checks
+from serein.desktop.plan import build_desktop_plan
+from serein.desktop.status import build_desktop_status
 from serein.doctor.checks import run_checks
-from serein.doctor.models import CheckStatus
+from serein.doctor.models import CheckStatus, DoctorReport
 from serein.hardware.probe import probe_hardware
 from serein.profiles.registry import list_profiles
 
@@ -50,13 +54,8 @@ def _cmd_status(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_doctor(args: argparse.Namespace) -> int:
-    report = run_checks()
-    if args.json:
-        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
-        return report.exit_code
-
-    print("SEREIN DOCTOR")
+def _print_doctor_report(header: str, report: DoctorReport) -> None:
+    print(header)
     for check in report.checks:
         marker = {
             CheckStatus.PASS: "PASS",
@@ -72,6 +71,15 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         f"{summary['PASS']} pass, {summary['WARN']} warn, "
         f"{summary['FAIL']} fail, {summary['SKIP']} skip"
     )
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    report = run_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN DOCTOR", report)
     return report.exit_code
 
 
@@ -126,6 +134,77 @@ def _cmd_profile_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_desktop_status(_args: argparse.Namespace) -> int:
+    status = build_desktop_status()
+    print("SEREIN DESKTOP")
+    print()
+    print(f"Profile        {status.profile_id}")
+    print(f"Implementation {status.profile_status}")
+    print()
+    print("Session")
+    print(f"  Desktop      {status.session.desktop_environment or 'unavailable'}")
+    print(f"  Type         {status.session.session_type or 'unavailable'}")
+    kwin = status.availability.kwin_wayland_installed or status.availability.kwin_x11_installed
+    print(f"  KWin         {'detected' if kwin else 'unavailable'}")
+    print(f"  SDDM         {'detected' if status.availability.sddm_installed else 'unavailable'}")
+    print()
+    print("Configuration")
+    applied = "yes" if status.config.serein_preset_applied else "no"
+    print(f"  Serein preset applied    {applied}")
+    print()
+    print("Compatibility")
+    print(f"  Ubuntu target            {status.os_compatibility}")
+    return 0
+
+
+def _cmd_desktop_doctor(args: argparse.Namespace) -> int:
+    report = run_desktop_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN DESKTOP DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_desktop_plan(args: argparse.Namespace) -> int:
+    plan = build_desktop_plan()
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("Desktop installation plan")
+    print()
+    print("Packages:")
+    for pkg in plan.packages:
+        print(f"  install {pkg}")
+    print()
+    print("System configuration:")
+    for step in plan.system_configuration:
+        print(f"  {step.action:<24} {step.detail}")
+    print()
+    print("User configuration:")
+    for step in plan.user_configuration:
+        print(f"  {step.action:<28} {step.detail}")
+    print()
+    print("Verification:")
+    for check_id in plan.verification:
+        print(f"  {check_id}")
+    return 0
+
+
+def _cmd_desktop_config_status(_args: argparse.Namespace) -> int:
+    missing = {r.id for r in missing_resources()}
+    print("SEREIN DESKTOP CONFIG RESOURCES")
+    for resource in RESOURCES:
+        state = "MISSING" if resource.id in missing else "present"
+        print(f"[{state:7}] {resource.id:<22} -> {resource.target_path}")
+    print()
+    print("'present' means the file ships in this repository under desktop/;")
+    print("it does not mean the file has been installed onto this host.")
+    return 1 if missing else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="serein", description="Serein OS control-plane CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -154,6 +233,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     profile_list_parser.set_defaults(func=_cmd_profile_list)
+
+    desktop_parser = subparsers.add_parser("desktop", help="Desktop (KDE Plasma) integration")
+    desktop_subparsers = desktop_parser.add_subparsers(dest="desktop_command", required=True)
+
+    desktop_subparsers.add_parser("status", help="Show desktop state").set_defaults(
+        func=_cmd_desktop_status
+    )
+
+    desktop_doctor_parser = desktop_subparsers.add_parser(
+        "doctor", help="Run desktop-level diagnostics"
+    )
+    desktop_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    desktop_doctor_parser.set_defaults(func=_cmd_desktop_doctor)
+
+    desktop_plan_parser = desktop_subparsers.add_parser(
+        "plan", help="Show the desktop installation plan"
+    )
+    desktop_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    desktop_plan_parser.set_defaults(func=_cmd_desktop_plan)
+
+    desktop_config_parser = desktop_subparsers.add_parser("config", help="Desktop config resources")
+    desktop_config_subparsers = desktop_config_parser.add_subparsers(
+        dest="desktop_config_command", required=True
+    )
+    desktop_config_subparsers.add_parser(
+        "status", help="Show which desktop config resources ship in this repository"
+    ).set_defaults(func=_cmd_desktop_config_status)
 
     return parser
 
