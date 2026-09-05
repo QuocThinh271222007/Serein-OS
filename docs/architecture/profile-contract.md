@@ -24,19 +24,24 @@ path that would actually apply a profile) is not implemented. Reporting an
 inactive profile as active would violate the "no fake PASS output" rule
 that also governs `doctor`.
 
-## S0 scope
+## Current scope (as of S1)
 
-- `core` is the only `implemented` profile: `profiles/core/core.profile.json`.
-  It describes the unmodified host — empty `packages`/`services`/etc. — and
-  exists to prove the schema and loader work end to end, not to do
-  anything yet.
+- `core` (S0): `profiles/core/core.profile.json`. Describes the
+  unmodified host — empty `packages`/`services`/etc. — and exists to
+  prove the schema and loader work end to end, not to do anything yet.
+- `desktop` (S1): `profiles/desktop/desktop.profile.json`. A real
+  package/configuration manifest with non-empty `packages`,
+  `configuration_units`, and `verification_checks` — see
+  `docs/desktop/architecture.md`. Still performs no installation; see
+  `docs/desktop/installation-plan.md` for what "implemented" means here.
 - `balanced`, `dev`, `ai`, `battery`, `cyber` are `declared` only
   (`src/serein/profiles/registry.py:DECLARED_ONLY_PROFILES`). They carry a
   name and description so the roadmap is visible in `profile list`, and
   nothing else.
-- `desktop`/veil-privacy profiles are **not** declared yet; they belong to
-  S1/S6 respectively and should be added when those phases start, not
-  before.
+- `desktop` became `implemented` in S1 (`profiles/desktop/desktop.profile.json`
+  — see `docs/desktop/architecture.md`). The veil/privacy profile is
+  **not** declared yet; it belongs to S6 and should be added when that
+  phase starts, not before.
 
 ## Manifest fields
 
