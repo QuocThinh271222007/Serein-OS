@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/doctor-report.schema.json",
+  "title": "Serein Doctor Report",
+  "description": "Output of `serein doctor --json`.",
+  "type": "object",
+  "required": ["schema_version", "summary", "checks"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "summary": {
+      "type": "object",
+      "required": ["PASS", "WARN", "FAIL", "SKIP"],
+      "additionalProperties": false,
+      "properties": {
+        "PASS": { "type": "integer", "minimum": 0 },
+        "WARN": { "type": "integer", "minimum": 0 },
+        "FAIL": { "type": "integer", "minimum": 0 },
+        "SKIP": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "status", "detail"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "status": { "type": "string", "enum": ["PASS", "WARN", "FAIL", "SKIP"] },
+          "detail": { "type": "string" }
+        }
+      }
+    }
+  }
+}

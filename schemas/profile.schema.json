@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/profile.schema.json",
+  "title": "Serein Profile Manifest",
+  "description": "A declarative Serein capability bundle. Most fields (packages, services, configuration_units, hardware_conditions, verification_checks) are contract surface for phases after S0 and may legitimately be empty arrays today; their presence here fixes the shape future profiles must use.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "name",
+    "version",
+    "status",
+    "description",
+    "dependencies",
+    "conflicts",
+    "packages",
+    "services",
+    "configuration_units",
+    "hardware_conditions",
+    "verification_checks",
+    "rollback"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+    "name": { "type": "string", "minLength": 1 },
+    "version": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "enum": ["declared", "implemented"] },
+    "description": { "type": "string", "minLength": 1 },
+    "dependencies": { "type": "array", "items": { "type": "string" } },
+    "conflicts": { "type": "array", "items": { "type": "string" } },
+    "packages": { "type": "array", "items": { "type": "string" } },
+    "services": { "type": "array", "items": { "type": "string" } },
+    "configuration_units": { "type": "array", "items": { "type": "string" } },
+    "hardware_conditions": { "type": "array", "items": { "type": "string" } },
+    "verification_checks": { "type": "array", "items": { "type": "string" } },
+    "rollback": {
+      "type": "object",
+      "required": ["supported"],
+      "additionalProperties": false,
+      "properties": {
+        "supported": { "type": "boolean" },
+        "notes": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
