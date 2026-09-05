@@ -9,6 +9,9 @@ from pathlib import Path
 import jsonschema
 import pytest
 
+from serein.desktop.doctor import run_desktop_checks
+from serein.desktop.plan import build_desktop_plan
+from serein.desktop.status import build_desktop_status
 from serein.doctor.checks import run_checks
 from serein.hardware.probe import probe_hardware
 from serein.profiles.models import ProfileManifest
@@ -23,7 +26,13 @@ def _load_schema(name: str) -> dict:
 
 @pytest.mark.parametrize(
     "name",
-    ["hardware-report.schema.json", "doctor-report.schema.json", "profile.schema.json"],
+    [
+        "hardware-report.schema.json",
+        "doctor-report.schema.json",
+        "profile.schema.json",
+        "desktop-plan.schema.json",
+        "desktop-state.schema.json",
+    ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:
     schema = _load_schema(name)
@@ -48,10 +57,35 @@ def test_doctor_report_validates_against_schema(host_root) -> None:
     jsonschema.validate(instance=report.to_dict(), schema=schema)
 
 
-def test_core_profile_manifest_validates_against_schema() -> None:
+@pytest.mark.parametrize("profile_id", ["core", "desktop"])
+def test_profile_manifest_validates_against_schema(profile_id: str) -> None:
     schema = _load_schema("profile.schema.json")
-    data = json.loads((REPO_ROOT / "profiles" / "core" / "core.profile.json").read_text())
+    manifest_path = REPO_ROOT / "profiles" / profile_id / f"{profile_id}.profile.json"
+    data = json.loads(manifest_path.read_text())
     jsonschema.validate(instance=data, schema=schema)
     # Also confirm it round-trips through our own model shape.
     manifest = ProfileManifest.from_dict(data)
     jsonschema.validate(instance=manifest.to_dict(), schema=schema)
+
+
+def test_desktop_plan_validates_against_schema() -> None:
+    schema = _load_schema("desktop-plan.schema.json")
+    jsonschema.validate(instance=build_desktop_plan().to_dict(), schema=schema)
+
+
+def test_desktop_status_validates_against_schema(host_root) -> None:
+    schema = _load_schema("desktop-state.schema.json")
+    status = build_desktop_status(root=host_root("plasma_wayland_managed"), env={})
+    jsonschema.validate(instance=status.to_dict(), schema=schema)
+
+
+def test_desktop_status_validates_for_missing_data(host_root) -> None:
+    schema = _load_schema("desktop-state.schema.json")
+    status = build_desktop_status(root=host_root("missing_data"), env={})
+    jsonschema.validate(instance=status.to_dict(), schema=schema)
+
+
+def test_desktop_doctor_report_validates_against_schema(host_root) -> None:
+    schema = _load_schema("doctor-report.schema.json")
+    report = run_desktop_checks(host_root("amd_desktop"), env={})
+    jsonschema.validate(instance=report.to_dict(), schema=schema)

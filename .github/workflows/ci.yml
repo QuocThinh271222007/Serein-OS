@@ -37,3 +37,16 @@ jobs:
           serein doctor --json
           serein hardware probe --json
           serein profile list
+
+      - name: Desktop CLI smoke test
+        run: |
+          serein desktop status
+          serein desktop plan
+          serein desktop plan --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein desktop config status
+          # desktop doctor may legitimately exit non-zero on a CI image with
+          # no KDE Plasma installed (SKIP/WARN checks are expected there) —
+          # what matters is that it runs cleanly and emits valid JSON, not
+          # that every check PASSes. See docs/architecture/doctor-contract.md.
+          serein desktop doctor || true
+          serein desktop doctor --json | python -c "import json,sys; json.load(sys.stdin)"
