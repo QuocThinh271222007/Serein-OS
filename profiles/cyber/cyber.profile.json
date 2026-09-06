@@ -2,16 +2,30 @@
   "schema_version": 1,
   "id": "cyber",
   "name": "Cybersecurity Research",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "status": "implemented",
-  "description": "Hardware resource policy for VM/container-heavy security research workloads: the same conservative, evidence-based CPU/memory/storage policy as 'balanced', biased for stable virtualization behavior rather than AI-style peak compute. This is resource policy only \u2014 the actual isolated security tooling/VM images (S5 scope, ADR-0004) are separate, unimplemented future work. No networking or security configuration is touched in S2. See docs/hardware/architecture.md.",
+  "description": "Combines the S2 hardware resource policy (conservative, evidence-based CPU/memory/storage policy biased for stable virtualization behavior) with the S5 cybersecurity-workspace software layer: a compact Host Cyber Light diagnostic/capture/reverse-engineering baseline, packet-capture privilege modeling, isolated toolbox detection (reusing S3's Podman/Distrobox architecture), and read-only KVM/VM capability detection. Specialized/offensive tooling (password cracking, exploit frameworks, wireless auditing, full Kali) is classified toolbox- or VM-tier, never installed on the host. No package is installed, no container/VM is created, no packet is captured, and no network is scanned by this repository - see docs/cyber/architecture.md and docs/cyber/known-limitations.md.",
   "dependencies": [
     "core"
   ],
   "conflicts": [],
   "packages": [
+    "binutils",
+    "dnsutils",
+    "ethtool",
+    "file",
+    "libimage-exiftool-perl",
+    "mtr-tiny",
+    "netcat-openbsd",
+    "nmap",
+    "openssl",
     "power-profiles-daemon",
-    "systemd-zram-generator"
+    "socat",
+    "systemd-zram-generator",
+    "tcpdump",
+    "tshark",
+    "whois",
+    "wireshark"
   ],
   "services": [],
   "configuration_units": [
@@ -28,10 +42,16 @@
     "hardware_gpu_topology_confidence",
     "hardware_profile_plan_generation",
     "hardware_virtualization_guard",
-    "hardware_required_resources"
+    "hardware_required_resources",
+    "cyber_profile_integrity",
+    "cyber_package_manifest",
+    "cyber_plan_generation",
+    "cyber_host_hygiene",
+    "cyber_capture_backend_consistency",
+    "cyber_container_engine_conflict"
   ],
   "rollback": {
     "supported": false,
-    "notes": "No Apply mechanism exists yet in S2; serein hardware plan is read-only. See docs/hardware/architecture.md for what a future Apply step would need."
+    "notes": "No Apply mechanism exists yet in S2/S5; serein hardware plan and serein cyber plan are both read-only. See docs/hardware/architecture.md and docs/cyber/architecture.md for what a future Apply step would need."
   }
 }
