@@ -25,7 +25,7 @@ from serein.ai.nvidia import detect_nvidia_status
 from serein.ai.packages import all_tools
 from serein.ai.planner import VALID_COMPONENTS, build_ai_plan
 from serein.ai.python_env import detect_python_ai_packages, probe_python_package
-from serein.ai.pytorch import detect_pytorch_status
+from serein.ai.pytorch import detect_pytorch_status, select_pytorch_backend
 from serein.ai.storage import build_ai_storage_info
 from serein.development.runner import CommandResult
 from serein.doctor.models import CheckStatus
@@ -243,11 +243,40 @@ class TestNvidia:
         status = detect_nvidia_status(policy, runner=runner, root=tmp_path)
         assert status.cuda_toolkit_installed is True
 
-    def test_toolkit_via_marker_directory(self, tmp_path):
+    def test_toolkit_via_dpkg_package_state(self, tmp_path):
+        runner = FakeCommandRunner({"dpkg-query": _ok("dpkg-query", "install ok installed")})
+        policy = _gpu_policy(nvidia_present=True)
+        status = detect_nvidia_status(policy, runner=runner, root=tmp_path)
+        assert status.cuda_toolkit_installed is True
+
+    def test_empty_marker_directory_is_not_installed(self, tmp_path):
+        # S4R Section 16/19 regression: a bare marker (empty directory,
+        # no nvcc, no dpkg evidence) must NOT prove installation.
         (tmp_path / "usr" / "local" / "cuda").mkdir(parents=True)
         policy = _gpu_policy(nvidia_present=True)
         status = detect_nvidia_status(policy, runner=FakeCommandRunner({}), root=tmp_path)
+        assert status.cuda_toolkit_installed is False
+        assert status.cuda_toolkit_marker_present is True
+
+    def test_stale_marker_with_no_evidence_is_not_installed(self, tmp_path):
+        # A marker existing (stale symlink case simulated as a plain
+        # directory - real symlink creation is awkward/unportable in
+        # fixtures, see the S4R brief's own hedge on this) with no
+        # nvcc/dpkg evidence must still not prove installation.
+        (tmp_path / "usr" / "local" / "cuda").mkdir(parents=True)
+        runner = FakeCommandRunner({"dpkg-query": CommandResult(1, "", "no packages found")})
+        policy = _gpu_policy(nvidia_present=True)
+        status = detect_nvidia_status(policy, runner=runner, root=tmp_path)
+        assert status.cuda_toolkit_installed is False
+        assert status.cuda_toolkit_marker_present is True
+
+    def test_marker_present_but_installed_true_when_nvcc_also_present(self, tmp_path):
+        (tmp_path / "usr" / "local" / "cuda").mkdir(parents=True)
+        runner = FakeCommandRunner({"nvcc": _ok("nvcc", "release 12.6, V12.6.85")})
+        policy = _gpu_policy(nvidia_present=True)
+        status = detect_nvidia_status(policy, runner=runner, root=tmp_path)
         assert status.cuda_toolkit_installed is True
+        assert status.cuda_toolkit_marker_present is True
 
     def test_multiple_toolkit_dirs_reported(self, tmp_path):
         (tmp_path / "usr" / "local" / "cuda-12.4").mkdir(parents=True)
@@ -287,13 +316,13 @@ class TestAmd:
     def test_no_hardware(self):
         status = detect_amd_status(_gpu_policy(), runner=FakeCommandRunner({}))
         assert status.hardware_present is False
-        assert status.rocm_support.supported is None
+        assert status.rocm_support.gpu_enumerated is None
 
     def test_hardware_no_rocminfo_is_unknown_not_true(self):
         policy = _gpu_policy([GPUClassification("AMD", "discrete", "high")])
         status = detect_amd_status(policy, runner=FakeCommandRunner({}))
         assert status.hardware_present is True
-        assert status.rocm_support.supported is None
+        assert status.rocm_support.gpu_enumerated is None
         assert status.rocm_support.confidence == "low"
 
     def test_rocminfo_confirms_gpu_agent(self):
@@ -306,7 +335,7 @@ class TestAmd:
             "rocminfo": _ok("rocminfo", rocminfo_output),
         })
         status = detect_amd_status(policy, runner=runner)
-        assert status.rocm_support.supported is True
+        assert status.rocm_support.gpu_enumerated is True
         assert status.rocm_support.confidence == "high"
 
     def test_rocminfo_reports_no_gpu_agent(self):
@@ -315,7 +344,7 @@ class TestAmd:
             "rocminfo": _ok("rocminfo", "Agent 1\n  Device Type:             CPU\n"),
         })
         status = detect_amd_status(policy, runner=runner)
-        assert status.rocm_support.supported is False
+        assert status.rocm_support.gpu_enumerated is False
         assert status.rocm_support.confidence == "high"
 
     def test_never_guesses_from_vendor_id_alone(self):
@@ -323,7 +352,7 @@ class TestAmd:
         # unknown, never silently True.
         policy = _gpu_policy([GPUClassification("AMD", "unknown", "low")])
         status = detect_amd_status(policy, runner=FakeCommandRunner({}))
-        assert status.rocm_support.supported is not True
+        assert status.rocm_support.gpu_enumerated is not True
 
 
 class TestIntel:
@@ -436,6 +465,192 @@ class TestPyTorch:
         detect_pytorch_status(runner=runner)
         code = runner.calls[-1][-1]
         assert "is_available" not in code
+
+
+class TestSelectPytorchBackend:
+    """S4R Section 4-9/41/63: the shared runtime-gated backend decision.
+    A hardware candidate alone must never be sufficient for an
+    accelerator-specific target - only proven driver/runtime readiness
+    is."""
+
+    def test_no_gpu_is_cpu_ready(self):
+        gpu_policy = _gpu_policy()
+        backend = classify_backend([], gpu_policy)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "cpu"
+        assert decision.status == "APPLY"
+
+    def test_unknown_vendor_is_cpu_ready(self):
+        gpus = [GPUDevice(vendor="0x1234", kind="unknown")]
+        gpu_policy = _gpu_policy([GPUClassification("0x1234", "unknown", "low")])
+        backend = classify_backend(gpus, gpu_policy)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "cpu"
+        assert decision.status == "APPLY"
+
+    def test_nvidia_hardware_no_driver_is_blocked_not_cpu(self):
+        gpus = [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        gpu_policy = _gpu_policy(
+            [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+        )
+        backend = classify_backend(gpus, gpu_policy)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        # Never silently substitutes cpu while a real accelerator
+        # candidate's readiness is unresolved (S4R Section 5).
+        assert decision.target == "cuda"
+        assert decision.status == "BLOCKED"
+
+    def test_nvidia_driver_proven_is_cuda_ready(self):
+        gpus = [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        gpu_policy = _gpu_policy(
+            [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+        )
+        backend = classify_backend(gpus, gpu_policy)
+        runner = FakeCommandRunner({
+            "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+        })
+        nvidia = detect_nvidia_status(gpu_policy, runner=runner)
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "cuda"
+        assert decision.status == "APPLY"
+
+    def test_amd_gpu_enumerated_is_blocked_not_ready(self):
+        # rocminfo enumerating a GPU proves ROCm/HSA hardware
+        # recognition, NOT PyTorch-wheel/MIOpen framework compatibility
+        # - so this must stay BLOCKED, never auto-selected as ready.
+        gpus = [GPUDevice(vendor="AMD", kind="discrete")]
+        gpu_policy = _gpu_policy([GPUClassification("AMD", "discrete", "high")])
+        backend = classify_backend(gpus, gpu_policy)
+        runner = FakeCommandRunner({
+            "rocminfo": _ok("rocminfo", "Agent 1\n  Device Type:             GPU\n"),
+        })
+        amd = detect_amd_status(gpu_policy, runner=runner)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "rocm"
+        assert decision.status == "BLOCKED"
+
+    def test_amd_confirmed_unsupported_falls_back_to_cpu(self):
+        gpus = [GPUDevice(vendor="AMD", kind="discrete")]
+        gpu_policy = _gpu_policy([GPUClassification("AMD", "discrete", "high")])
+        backend = classify_backend(gpus, gpu_policy)
+        runner = FakeCommandRunner({
+            "rocminfo": _ok("rocminfo", "Agent 1\n  Device Type:             CPU\n"),
+        })
+        amd = detect_amd_status(gpu_policy, runner=runner)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "cpu"
+        assert decision.status == "APPLY"
+
+    def test_amd_no_runtime_is_blocked(self):
+        gpus = [GPUDevice(vendor="AMD", kind="discrete")]
+        gpu_policy = _gpu_policy([GPUClassification("AMD", "discrete", "high")])
+        backend = classify_backend(gpus, gpu_policy)
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "rocm"
+        assert decision.status == "BLOCKED"
+
+    def test_intel_gpu_is_blocked_never_silently_cpu(self):
+        # Section 8/45: do not automatically map intel_gpu -> cpu as if
+        # that were "the Intel strategy" - Intel is a real candidate,
+        # just one whose XPU compatibility is unresolved.
+        gpus = [GPUDevice(vendor="Intel", kind="discrete")]
+        gpu_policy = _gpu_policy([GPUClassification("Intel", "discrete", "high")])
+        backend = classify_backend(gpus, gpu_policy)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "xpu"
+        assert decision.status == "BLOCKED"
+
+    def test_intel_igpu_also_blocked_not_conflated_with_arc(self):
+        gpus = [GPUDevice(vendor="Intel", kind="integrated")]
+        gpu_policy = _gpu_policy([GPUClassification("Intel", "integrated", "medium")])
+        backend = classify_backend(gpus, gpu_policy)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert decision.target == "xpu"
+        assert decision.status == "BLOCKED"
+
+    def test_invariant_cuda_target_ready_implies_driver_not_false(self):
+        """Section 41/63 invariant, exercised across a matrix of
+        scenarios: target=='cuda' and status=='APPLY' must never occur
+        without nvidia.driver_version being set."""
+        gpus = [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        gpu_policy = _gpu_policy(
+            [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+        )
+        backend = classify_backend(gpus, gpu_policy)
+        intel = detect_intel_status(gpu_policy)
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        scenarios = [
+            FakeCommandRunner({}),
+            FakeCommandRunner({
+                "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+            }),
+        ]
+        for runner in scenarios:
+            nvidia = detect_nvidia_status(gpu_policy, runner=runner)
+            decision = select_pytorch_backend(backend, nvidia, amd, intel)
+            if decision.target == "cuda" and decision.status == "APPLY":
+                assert nvidia.driver_version is not None
+
+    def test_invariant_rocm_target_ready_never_occurs(self):
+        """Given this pass's Option C choice (no reliable PyTorch-ROCm
+        compatibility source exists), target=='rocm' must never be
+        paired with status=='APPLY' - framework compatibility is always
+        conservatively unresolved. See docs/ai/amd-rocm-strategy.md."""
+        gpus = [GPUDevice(vendor="AMD", kind="discrete")]
+        gpu_policy = _gpu_policy([GPUClassification("AMD", "discrete", "high")])
+        backend = classify_backend(gpus, gpu_policy)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        scenarios = [
+            FakeCommandRunner({}),
+            FakeCommandRunner({
+                "rocminfo": _ok("rocminfo", "Agent 1\n  Device Type:             GPU\n"),
+            }),
+            FakeCommandRunner({
+                "rocminfo": _ok("rocminfo", "Agent 1\n  Device Type:             CPU\n"),
+            }),
+        ]
+        for runner in scenarios:
+            amd = detect_amd_status(gpu_policy, runner=runner)
+            decision = select_pytorch_backend(backend, nvidia, amd, intel)
+            assert not (decision.target == "rocm" and decision.status == "APPLY")
+
+    def test_invariant_xpu_target_ready_never_occurs(self):
+        """Same reasoning for Intel: xpu_compatibility is always
+        "unknown" in this pass, so target=='xpu' must never be paired
+        with status=='APPLY'."""
+        gpus = [GPUDevice(vendor="Intel", kind="discrete")]
+        gpu_policy = _gpu_policy([GPUClassification("Intel", "discrete", "high")])
+        backend = classify_backend(gpus, gpu_policy)
+        nvidia = detect_nvidia_status(gpu_policy, runner=FakeCommandRunner({}))
+        amd = detect_amd_status(gpu_policy, runner=FakeCommandRunner({}))
+        intel = detect_intel_status(gpu_policy)
+        decision = select_pytorch_backend(backend, nvidia, amd, intel)
+        assert not (decision.target == "xpu" and decision.status == "APPLY")
 
 
 class TestInference:
@@ -630,6 +845,37 @@ class TestPackages:
         for optional_id in ("bitsandbytes", "flash-attn", "datasets", "peft", "trl"):
             assert optional_id not in base_ids
 
+    def test_ollama_requires_root(self):
+        # S4R Section 36-39: the official installer is system-level
+        # (systemd service, system user/group, /usr/local/bin), never
+        # a quiet user-level install.
+        ollama = next(t for t in all_tools() if t.id == "ollama")
+        assert ollama.requires_root is True
+
+    def test_ipex_not_in_manifest(self):
+        # S4R Section 32/33: Intel Extension for PyTorch is not
+        # Serein's recommended path; no separate tool entry exists.
+        ids = {t.id for t in all_tools()}
+        assert "intel-extension-for-pytorch" not in ids
+
+    def test_cuda_toolkit_source_is_ubuntu_repository(self):
+        # S4R Section 20/60: verified live against Ubuntu 26.04's own
+        # archive - see docs/validation/s4/ubuntu-package-validation.md.
+        toolkit = next(t for t in all_tools() if t.id == "cuda-toolkit")
+        assert toolkit.source_type == "ubuntu-repository"
+        assert toolkit.package == "cuda-toolkit"
+
+    def test_rocm_source_is_ubuntu_repository(self):
+        rocm = next(t for t in all_tools() if t.id == "rocm")
+        assert rocm.source_type == "ubuntu-repository"
+        assert rocm.package == "rocm"
+
+    def test_nvidia_container_toolkit_source_remains_third_party(self):
+        # Confirmed genuinely absent from Ubuntu's archive - see
+        # docs/validation/s4/ubuntu-package-validation.md.
+        toolkit = next(t for t in all_tools() if t.id == "nvidia-container-toolkit")
+        assert toolkit.source_type == "official-upstream-repository"
+
 
 class TestCapabilities:
     def test_schema_version(self):
@@ -709,16 +955,139 @@ class TestCapabilities:
         assert by_id["pytorch_cpu"].installed is True
         assert by_id["pytorch_cpu"].usable is True
 
-    def test_pytorch_cuda_never_verified_via_is_available(self):
+    def test_pytorch_cuda_never_guessed_true_without_confirmed_readiness(self):
+        # No NVIDIA hardware/driver evidence in this runner - a CUDA
+        # build being installed must never be reported usable=True
+        # without select_pytorch_backend() confirming readiness first
+        # (torch.cuda.is_available() is never called to check this).
         payload = json.dumps({"version": "2.5.1+cu124", "cuda": "12.4", "hip": None})
         runner = FakeCommandRunner({"python3": _ok("python3", payload)})
         report = build_ai_capabilities(runner=runner)
         by_id = {c.id: c for c in report.capabilities}
-        assert by_id["pytorch_cuda"].usable is None
+        assert by_id["pytorch_cuda"].usable is not True
+
+    def test_pytorch_cuda_usable_true_only_when_decision_confirms_ready(
+        self, tmp_path, monkeypatch
+    ):
+        import serein.ai.capabilities as caps_mod
+
+        monkeypatch.setattr(
+            caps_mod, "detect_gpus", lambda root: [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            caps_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy(
+                [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+            ),
+        )
+        payload = json.dumps({"version": "2.5.1+cu124", "cuda": "12.4", "hip": None})
+        runner = FakeCommandRunner({
+            "python3": _ok("python3", payload),
+            "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+        })
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["pytorch_cuda"].usable is True
+
+    def test_pytorch_cuda_usable_false_when_installed_but_driver_missing(
+        self, tmp_path, monkeypatch
+    ):
+        import serein.ai.capabilities as caps_mod
+
+        monkeypatch.setattr(
+            caps_mod, "detect_gpus", lambda root: [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            caps_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy(
+                [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+            ),
+        )
+        payload = json.dumps({"version": "2.5.1+cu124", "cuda": "12.4", "hip": None})
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["pytorch_cuda"].usable is False
 
     def test_to_dict_is_json_serializable(self):
         report = build_ai_capabilities(runner=FakeCommandRunner({}))
         assert json.dumps(report.to_dict())
+
+    # --- NVIDIA AI container usability matrix (S4R Section 25/26/29/50) --
+
+    def _nvidia_backend_monkeypatch(self, monkeypatch):
+        import serein.ai.capabilities as caps_mod
+
+        monkeypatch.setattr(
+            caps_mod, "detect_gpus", lambda root: [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            caps_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy(
+                [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+            ),
+        )
+
+    def test_ai_container_usable_false_engine_only(self, tmp_path, monkeypatch):
+        self._nvidia_backend_monkeypatch(monkeypatch)
+        runner = FakeCommandRunner({"podman": _ok("podman", "podman version 5.0.0")})
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["ai_container_runtime"].usable is False
+
+    def test_ai_container_usable_false_engine_and_toolkit_no_driver(self, tmp_path, monkeypatch):
+        self._nvidia_backend_monkeypatch(monkeypatch)
+        runner = FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.0.0"),
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+        })
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["ai_container_runtime"].usable is False
+
+    def test_ai_container_usable_false_driver_engine_toolkit_no_cdi(self, tmp_path, monkeypatch):
+        self._nvidia_backend_monkeypatch(monkeypatch)
+        runner = FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.0.0"),
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+            "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+        })
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["ai_container_runtime"].usable is False
+
+    def test_ai_container_usable_true_full_chain(self, tmp_path, monkeypatch):
+        self._nvidia_backend_monkeypatch(monkeypatch)
+        (tmp_path / "etc" / "cdi").mkdir(parents=True)
+        (tmp_path / "etc" / "cdi" / "nvidia.yaml").write_text("")
+        runner = FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.0.0"),
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+            "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+        })
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["ai_container_runtime"].usable is True
+
+    def test_ai_container_usable_true_via_cdi_list_evidence(self, tmp_path, monkeypatch):
+        # CDI evidence via the read-only `nvidia-ctk cdi list` query
+        # instead of a static spec file (S4R Section 27/28).
+        self._nvidia_backend_monkeypatch(monkeypatch)
+
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args[:3] == ["nvidia-ctk", "cdi", "list"]:
+                    return CommandResult(0, "nvidia.com/gpu=all\n", "")
+                return super().run(args, timeout)
+
+        runner = _Runner({
+            "podman": _ok("podman", "podman version 5.0.0"),
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+            "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+        })
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["ai_container_runtime"].usable is True
 
 
 class TestForbiddenActions:
@@ -875,6 +1244,16 @@ class TestPlanner:
         actions = self._actions_by_id(plan)
         assert actions["inference.ollama"].status == "APPLY"
 
+    def test_ollama_plan_never_claims_user_level_install(self, tmp_path):
+        # S4R Section 36-39/51/52: the official installer is
+        # system-level - requires_root must be true and risk must not
+        # be "low" (the pre-corrective default).
+        plan = build_ai_plan(root=tmp_path, runner=FakeCommandRunner({}))
+        actions = self._actions_by_id(plan)
+        ollama_action = actions["inference.ollama"]
+        assert ollama_action.requires_root is True
+        assert ollama_action.risk != "low"
+
     def test_ollama_noop_when_present(self, tmp_path):
         runner = FakeCommandRunner({"ollama": _ok("ollama", "ollama version is 0.4.1")})
         plan = build_ai_plan(root=tmp_path, runner=runner)
@@ -902,7 +1281,10 @@ class TestPlanner:
         actions = self._actions_by_id(plan)
         assert actions["containers.nvidia_toolkit"].status == "SKIP"
 
-    def test_nvidia_container_toolkit_apply_with_nvidia_backend(self, tmp_path, monkeypatch):
+    def test_nvidia_container_toolkit_blocked_when_driver_missing(self, tmp_path, monkeypatch):
+        # S4R Section 30: do not plan the toolkit merely because an
+        # NVIDIA backend candidate exists if the driver path is
+        # unresolved - the toolkit would not be usable without it.
         import serein.ai.planner as planner_mod
 
         monkeypatch.setattr(
@@ -915,6 +1297,25 @@ class TestPlanner:
             ),
         )
         plan = build_ai_plan(root=tmp_path, runner=FakeCommandRunner({}))
+        actions = self._actions_by_id(plan)
+        assert actions["containers.nvidia_toolkit"].status == "BLOCKED"
+
+    def test_nvidia_container_toolkit_apply_when_driver_usable(self, tmp_path, monkeypatch):
+        import serein.ai.planner as planner_mod
+
+        monkeypatch.setattr(
+            planner_mod, "detect_gpus", lambda root: [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            planner_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy(
+                [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+            ),
+        )
+        runner = FakeCommandRunner({
+            "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+        })
+        plan = build_ai_plan(root=tmp_path, runner=runner)
         actions = self._actions_by_id(plan)
         assert actions["containers.nvidia_toolkit"].status == "APPLY"
 
@@ -942,7 +1343,11 @@ class TestPlanner:
         assert len(plan.actions) == 1
         assert plan.actions[0].component == "voice"
 
-    def test_cuda_toolkit_blocked_when_hardware_present_but_no_driver(self, tmp_path, monkeypatch):
+    def test_cuda_toolkit_never_apply_by_default(self, tmp_path, monkeypatch):
+        # S4R Section 21/22/23: local CUDA Toolkit is NOT a default
+        # PyTorch prerequisite - prebuilt CUDA wheels bundle their own
+        # userspace runtime. The action stays NOOP-as-optional whether
+        # or not a driver is present.
         import serein.ai.planner as planner_mod
 
         monkeypatch.setattr(
@@ -957,7 +1362,26 @@ class TestPlanner:
         plan = build_ai_plan(root=tmp_path, runner=FakeCommandRunner({}))
         actions = self._actions_by_id(plan)
         assert actions["nvidia.driver"].status == "APPLY"
-        assert actions["nvidia.cuda_toolkit"].status == "BLOCKED"
+        assert actions["nvidia.cuda_toolkit"].status == "NOOP"
+        assert actions["nvidia.cuda_toolkit"].action != "apply"
+
+    def test_cuda_toolkit_noop_when_installed(self, tmp_path, monkeypatch):
+        import serein.ai.planner as planner_mod
+
+        monkeypatch.setattr(
+            planner_mod, "detect_gpus", lambda root: [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            planner_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy(
+                [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+            ),
+        )
+        runner = FakeCommandRunner({"nvcc": _ok("nvcc", "release 12.6, V12.6.85")})
+        plan = build_ai_plan(root=tmp_path, runner=runner)
+        actions = self._actions_by_id(plan)
+        assert actions["nvidia.cuda_toolkit"].status == "NOOP"
+        assert actions["nvidia.cuda_toolkit"].current == "installed"
 
     def test_rocm_blocked_when_support_unknown(self, tmp_path, monkeypatch):
         import serein.ai.planner as planner_mod
@@ -1047,10 +1471,16 @@ class TestPlanner:
             plan = build_ai_plan(root=tmp_path, runner=runner)
             toolkit_cap = next(c for c in report.capabilities if c.id == "cuda_toolkit")
             toolkit_action = next(a for a in plan.actions if a.id == "nvidia.cuda_toolkit")
+            # The toolkit is optional/never-APPLY by default (S4R
+            # Section 21-23), so the planner's status is always NOOP
+            # once hardware is present - but "installed" agreement is
+            # what actually matters here: the action's `current` field
+            # must agree with the capability's `installed` field.
+            assert toolkit_action.status == "NOOP"
             if toolkit_cap.installed:
-                assert toolkit_action.status == "NOOP"
+                assert toolkit_action.current == "installed"
             else:
-                assert toolkit_action.status in ("APPLY", "BLOCKED")
+                assert toolkit_action.current == "not installed (optional)"
 
     def test_to_dict_is_json_serializable(self, tmp_path):
         plan = build_ai_plan(root=tmp_path, runner=FakeCommandRunner({}))
@@ -1101,6 +1531,72 @@ class TestDoctor:
     def test_no_gpu_no_ai_stack_is_pass_not_fail(self, tmp_path):
         report = run_ai_checks(root=tmp_path, runner=FakeCommandRunner({}))
         assert all(c.status is not CheckStatus.FAIL for c in report.checks)
+
+    def test_stale_cuda_marker_warns(self, tmp_path):
+        (tmp_path / "usr" / "local" / "cuda").mkdir(parents=True)
+        report = run_ai_checks(root=tmp_path, runner=FakeCommandRunner({}))
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_cuda_toolkit_stale_marker"].status is CheckStatus.WARN
+        assert report.exit_code == 0
+
+    def test_no_marker_warning_when_toolkit_confirmed_installed(self, tmp_path):
+        (tmp_path / "usr" / "local" / "cuda").mkdir(parents=True)
+        runner = FakeCommandRunner({"nvcc": _ok("nvcc", "release 12.6, V12.6.85")})
+        report = run_ai_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_cuda_toolkit_stale_marker"].status is CheckStatus.PASS
+
+    def test_nvidia_cdi_missing_warns(self, tmp_path):
+        runner = FakeCommandRunner({
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+        })
+        report = run_ai_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_nvidia_container_cdi_missing"].status is CheckStatus.WARN
+
+    def test_nvidia_cdi_present_passes(self, tmp_path):
+        (tmp_path / "etc" / "cdi").mkdir(parents=True)
+        (tmp_path / "etc" / "cdi" / "nvidia.yaml").write_text("")
+        runner = FakeCommandRunner({
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+        })
+        report = run_ai_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_nvidia_container_cdi_missing"].status is CheckStatus.PASS
+
+    def test_pytorch_cuda_build_no_driver_warns(self, tmp_path):
+        payload = json.dumps({"version": "2.5.1+cu124", "cuda": "12.4", "hip": None})
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        report = run_ai_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_pytorch_backend_mismatch"].status is CheckStatus.WARN
+        assert report.exit_code == 0
+
+    def test_pytorch_cpu_build_with_accelerator_present_warns_not_fails(
+        self, tmp_path, monkeypatch
+    ):
+        import serein.ai.doctor as doctor_mod
+
+        monkeypatch.setattr(
+            doctor_mod, "detect_gpus", lambda root: [GPUDevice(vendor="NVIDIA", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            doctor_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy(
+                [GPUClassification("NVIDIA", "discrete", "high")], nvidia_present=True
+            ),
+        )
+        payload = json.dumps({"version": "2.5.1+cpu", "cuda": None, "hip": None})
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        report = run_ai_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_pytorch_backend_mismatch"].status is CheckStatus.WARN
+        assert report.exit_code == 0
+
+    def test_pytorch_not_installed_is_pass(self, tmp_path):
+        report = run_ai_checks(root=tmp_path, runner=FakeCommandRunner({}))
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_pytorch_backend_mismatch"].status is CheckStatus.PASS
 
     def test_json_shape_matches_shared_doctor_report(self, tmp_path):
         report = run_ai_checks(root=tmp_path, runner=FakeCommandRunner({}))
