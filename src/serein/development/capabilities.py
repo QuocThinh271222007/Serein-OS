@@ -12,7 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from serein.development.containers import container_capability_available, detect_container_status
-from serein.development.cpp import detect_cpp_status
+from serein.development.cpp import cpp_toolchain_fully_installed, detect_cpp_status
 from serein.development.editor import detect_editor_status
 from serein.development.git import detect_git_status
 from serein.development.go import detect_go_status
@@ -92,12 +92,9 @@ def build_development_capabilities(
             "Go is a standard Ubuntu package close enough to upstream's own cadence.",
         )
     )
-    cpp_all_installed = all(
-        (cpp.gcc.installed, cpp.gpp.installed, cpp.cmake.installed, cpp.ninja.installed)
-    )
     capabilities.append(
         Capability(
-            "cpp_toolchain", True, cpp_all_installed,
+            "cpp_toolchain", True, cpp_toolchain_fully_installed(cpp),
             "apt:build-essential,clang,cmake,ninja-build,gdb,lldb",
             "ubuntu-repository", "high",
             "The full C/C++ toolchain is standard Ubuntu packages.",
