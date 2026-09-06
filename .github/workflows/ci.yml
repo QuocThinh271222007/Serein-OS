@@ -110,3 +110,19 @@ jobs:
           # with no GPU should always exit 0 here.
           serein ai doctor
           serein ai doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: Cyber CLI smoke test
+        run: |
+          serein cyber status
+          serein cyber capabilities
+          serein cyber capabilities --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein cyber plan
+          serein cyber plan --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein cyber plan host
+          serein cyber plan toolbox
+          serein cyber plan vm
+          # cyber doctor never FAILs merely because no cyber tooling is
+          # installed (see docs/cyber/architecture.md) — a stock CI
+          # runner should always exit 0 here.
+          serein cyber doctor
+          serein cyber doctor --json | python -c "import json,sys; json.load(sys.stdin)"
