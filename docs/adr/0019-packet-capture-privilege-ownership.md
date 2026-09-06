@@ -22,9 +22,16 @@ brief forbids Serein from performing automatically (Section 8).
   independent of `wireshark`/`tshark`/`dumpcap` installation state.
 - The sole evidence source is `dumpcap -D` — Wireshark's own documented
   safe way to check capture rights, since it lists capture-capable
-  interfaces without capturing a single packet. Returncode 0 → `True`;
-  non-zero (permission denied) → `False`; the command not installed or
-  not runnable → `None` ("unknown"), never guessed either way.
+  interfaces without capturing a single packet. A bare nonzero exit
+  code is deliberately **not** treated as proof of permission denial
+  (S5R corrective, Section 3-4): `True` requires returncode 0 **and** a
+  non-empty parsed interface list; `False` requires the output to
+  actually contain permission-denial language (matched against several
+  known phrasings, e.g. "permission denied"/"operation not permitted"/
+  `EPERM`/`EACCES`, never a single hardcoded string); every other
+  outcome — not installed, not runnable, a successful-but-empty list,
+  or a failure that doesn't look permission-related — is `None`
+  ("unknown"), never guessed either way.
 - Real interface names/identifiers surfaced by `dumpcap -D` are never
   exposed in `status`/`capabilities` JSON output — only the boolean
   outcome and a prose reason are kept (Section 53).

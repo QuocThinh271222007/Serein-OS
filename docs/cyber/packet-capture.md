@@ -23,14 +23,30 @@ capture_permission_reason: str
 
 `dumpcap -D` lists capture-capable interfaces **without capturing a
 single packet** — this is Wireshark's own documented safe way to check
-capture rights. `_check_capture_permission()`'s logic:
+capture rights. A bare nonzero exit code is **not**, by itself, proof
+of a permission problem (S5R corrective, Section 3-4) — `dumpcap -D`
+can fail for reasons unrelated to capture rights, and even a
+*successful* run can legitimately list zero interfaces. `_check_capture_permission()`'s
+logic:
 
 | dumpcap installed | `dumpcap -D` result | `capture_permitted` |
 |---|---|---|
 | No | n/a | `None` — "nothing to evaluate" |
-| Yes | returncode 0 | `True` — permitted |
-| Yes | non-zero (permission denied) | `False` — not permitted |
+| Yes | returncode 0, output has ≥1 numbered interface line | `True` — real, non-empty evidence of permission |
+| Yes | returncode 0, output has no interface lines | `None` — succeeded but proves nothing |
+| Yes | nonzero, output contains permission-denial language | `False` — not permitted |
+| Yes | nonzero, output doesn't look permission-related | `None` — unrelated failure, unknown |
 | Yes | could not run / timed out | `None` — unknown |
+
+The permission-denial match is a small set of known phrasings
+("permission denied", "you do not have permission", "operation not
+permitted", "insufficient privileges", `EPERM`/`EACCES`), matched
+case-insensitively as substrings — never a single hardcoded exact
+string, since real `dumpcap` builds vary in wording. The interface-list
+check only ever detects *presence* of at least one line matching
+`dumpcap -D`'s stable `N. name` numbered format — it never retains or
+returns the matched line/name itself (Section 53 privacy invariant
+below).
 
 This tri-state model is exhaustively unit-tested
 (`tests/test_cyber.py::TestCapture`) and live-validated on Ubuntu 26.04
