@@ -12,6 +12,10 @@ import pytest
 from serein.desktop.doctor import run_desktop_checks
 from serein.desktop.plan import build_desktop_plan
 from serein.desktop.status import build_desktop_status
+from serein.development.capabilities import build_development_capabilities
+from serein.development.doctor import run_development_checks
+from serein.development.planner import VALID_COMPONENTS as DEV_VALID_COMPONENTS
+from serein.development.planner import build_development_plan
 from serein.doctor.checks import run_checks
 from serein.hardware.capabilities import build_capabilities
 from serein.hardware.doctor import run_hardware_checks
@@ -37,6 +41,8 @@ def _load_schema(name: str) -> dict:
         "desktop-state.schema.json",
         "hardware-plan.schema.json",
         "hardware-capabilities.schema.json",
+        "development-plan.schema.json",
+        "development-capabilities.schema.json",
     ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:
@@ -122,4 +128,29 @@ def test_hardware_capabilities_validates_against_schema(host_root) -> None:
 def test_hardware_doctor_report_validates_against_schema(host_root) -> None:
     schema = _load_schema("doctor-report.schema.json")
     report = run_hardware_checks(host_root("amd_desktop"))
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+def test_development_capabilities_validates_against_schema() -> None:
+    schema = _load_schema("development-capabilities.schema.json")
+    report = build_development_capabilities()
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+def test_development_plan_validates_against_schema() -> None:
+    schema = _load_schema("development-plan.schema.json")
+    plan = build_development_plan()
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+@pytest.mark.parametrize("component", list(DEV_VALID_COMPONENTS))
+def test_development_focused_plan_validates_against_schema(component: str) -> None:
+    schema = _load_schema("development-plan.schema.json")
+    plan = build_development_plan(component)
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+def test_development_doctor_report_validates_against_schema() -> None:
+    schema = _load_schema("doctor-report.schema.json")
+    report = run_development_checks()
     jsonschema.validate(instance=report.to_dict(), schema=schema)
