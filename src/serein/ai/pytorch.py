@@ -6,11 +6,20 @@ inside Serein's own control-plane process (S4 brief Section 60/61).
 Merely importing torch in a *child* process is an ordinary, safe,
 read-only operation (it loads shared libraries but does not touch GPU
 hardware); what this module deliberately never does is call
-``torch.cuda.is_available()`` or any other API that would actually
-initialize a CUDA/ROCm context — that can hang or crash on a broken
-driver, and reflects *runtime* usability, not the static build-variant
-question this module answers. See docs/ai/pytorch-strategy.md and
-docs/ai/known-limitations.md for this documented scope boundary.
+``torch.cuda.is_available()``/``torch.xpu.is_available()`` or any
+other API that would actually initialize a CUDA/ROCm/XPU context —
+that can hang or crash on a broken driver, and reflects *runtime*
+usability, not the static build-variant question this module answers.
+See docs/ai/pytorch-strategy.md and docs/ai/known-limitations.md for
+this documented scope boundary.
+
+Build-variant classification reads ``torch.version.cuda``/``.hip``
+(present since long before S4) plus ``torch.version.xpu`` (S4RM
+Section 11/12 — native PyTorch XPU support exposes this the same
+static way; a prior revision only checked cuda/hip, so a native XPU
+build fell through to "cpu", which is wrong: an XPU build has no
+`cuda`/`hip` version but is not a CPU-only build either). All three
+are plain string attributes read at import time — no device access.
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ _TORCH_PROBE = (
     "    'version': torch.__version__,\n"
     "    'cuda': getattr(torch.version, 'cuda', None),\n"
     "    'hip': getattr(torch.version, 'hip', None),\n"
+    "    'xpu': getattr(torch.version, 'xpu', None),\n"
     "}\n"
     "print(json.dumps(info))\n"
 )
@@ -56,11 +66,19 @@ def detect_pytorch_status(runner: CommandRunner = DEFAULT_RUNNER) -> PyTorchStat
     version = info.get("version")
     cuda_version = info.get("cuda")
     hip_version = info.get("hip")
+    xpu_version = info.get("xpu")
 
+    # Classification order: cuda, then hip (rocm), then xpu, then cpu.
+    # A build should only ever expose one of cuda/hip/xpu as non-None
+    # in practice (they are mutually exclusive PyTorch build variants),
+    # but this order is chosen defensively in case more than one is
+    # ever simultaneously non-None for some future build configuration.
     if cuda_version:
         backend, backend_version = "cuda", cuda_version
     elif hip_version:
         backend, backend_version = "rocm", hip_version
+    elif xpu_version:
+        backend, backend_version = "xpu", xpu_version
     else:
         backend, backend_version = "cpu", None
 

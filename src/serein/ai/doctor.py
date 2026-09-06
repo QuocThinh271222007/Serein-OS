@@ -153,13 +153,20 @@ def _check_container_engine_conflict(root: Path, runner: CommandRunner) -> Check
 
 
 def _check_nvidia_cdi_missing(root: Path, runner: CommandRunner) -> CheckResult:
+    """WARN keys off resolved CDI device evidence only - a static spec
+    marker existing (or not) is informational, never sufficient on its
+    own to flip this to PASS (S4RM Section 9): current NVIDIA Container
+    Toolkit releases can manage CDI state dynamically, so an unresolved
+    `nvidia-ctk cdi list` is the real signal regardless of marker state."""
     check_id, title = _NVIDIA_CDI_CHECK
     containers = detect_ai_container_status(runner=runner, root=root)
-    if containers.nvidia_container_toolkit.installed and not containers.cdi_nvidia_generated:
+    if containers.nvidia_container_toolkit.installed and not containers.cdi_nvidia_resolved:
         detail = (
-            "NVIDIA Container Toolkit is installed but no CDI integration "
-            "evidence was found (neither a spec file nor `nvidia-ctk cdi "
-            "list`) - GPU container passthrough may not be usable yet."
+            "NVIDIA Container Toolkit is installed but `nvidia-ctk cdi "
+            "list` did not resolve a real device entry - GPU container "
+            "passthrough may not be usable yet. A static CDI spec file "
+            f"{'exists' if containers.cdi_marker_present else 'does not exist'}, "
+            "but that alone is not sufficient evidence."
         )
         return CheckResult(check_id, title, CheckStatus.WARN, detail)
     return CheckResult(check_id, title, CheckStatus.PASS, "No missing CDI integration detected.")
@@ -193,8 +200,23 @@ def _check_pytorch_backend_mismatch(root: Path, runner: CommandRunner) -> CheckR
             "not confirmed true on this machine."
         )
         return CheckResult(check_id, title, CheckStatus.WARN, detail)
-    if pytorch.build_backend == "xpu" and intel.xpu_compatibility != "unknown":
-        detail = "Installed PyTorch is an XPU build with a non-default Intel compatibility state."
+    if pytorch.build_backend == "xpu" and intel.xpu_compatibility == "unknown":
+        # S4RM Section 17-19 fix: this condition was inverted. Intel
+        # xpu_compatibility is "unknown" for every Intel GPU in this
+        # pass (Serein has no live-verified compatibility evidence) -
+        # that IS the state that should surface uncertainty, not the
+        # state that should stay silent.
+        detail = (
+            "Native PyTorch XPU build is installed, but Serein has not "
+            "verified that this specific Intel GPU/runtime combination is "
+            "supported."
+        )
+        return CheckResult(check_id, title, CheckStatus.WARN, detail)
+    if pytorch.build_backend == "xpu" and intel.xpu_compatibility == "unsupported":
+        detail = (
+            "Native PyTorch XPU build is installed, but this Intel GPU has "
+            "been determined unsupported."
+        )
         return CheckResult(check_id, title, CheckStatus.WARN, detail)
     accelerator_backends = ("nvidia_cuda", "amd_rocm", "intel_gpu")
     if pytorch.build_backend == "cpu" and backend.primary in accelerator_backends:

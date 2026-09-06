@@ -75,16 +75,23 @@ same `CommandRunner` every other S3/S4 detector uses. Importing torch
 in a *child* process is an ordinary, safe operation — it loads shared
 libraries but does not by itself touch GPU hardware.
 
-## `torch.cuda.is_available()` is never called
+## `torch.cuda.is_available()`/`torch.xpu.is_available()` are never called
 
 This is the one deliberate, documented scope limitation: actually
-querying CUDA/ROCm runtime availability requires initializing a
+querying CUDA/ROCm/XPU runtime availability requires initializing a
 device context, which can hang or crash on a broken driver setup — the
 exact failure mode a read-only, bounded-timeout detector must avoid.
 `PyTorchStatus.build_backend` reports the *static build variant*
-(`torch.version.cuda`/`torch.version.hip` — plain string attributes
-read at import time, no device access) — never confirmed runtime
-usability by direct GPU access. `capabilities.py`'s `pytorch_cuda`/
+(`torch.version.cuda`/`torch.version.hip`/`torch.version.xpu` — plain
+string attributes read at import time, no device access) — never
+confirmed runtime usability by direct GPU access.
+
+**S4RM correction (Section 11-16):** the probe originally only checked
+`cuda`/`hip`, so a native PyTorch XPU build (no `cuda`/`hip` version,
+but a real `xpu` version) fell through to the `else` branch and was
+misclassified as `"cpu"`. `torch.version.xpu` is now read the same
+static way as the other two, and the classification order is
+`cuda` → `hip` (rocm) → `xpu` → `cpu`. `capabilities.py`'s `pytorch_cuda`/
 `pytorch_rocm` capabilities derive `usable` from
 `select_pytorch_backend()`'s own decision (S4R Section 41 invariant):
 `True` only when the installed build's backend matches a confirmed-

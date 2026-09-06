@@ -454,6 +454,27 @@ class TestPyTorch:
         assert status.build_backend == "rocm"
         assert status.build_backend_version == "6.1"
 
+    def test_xpu_build(self):
+        # S4RM Section 11-16 regression: a native PyTorch XPU build has
+        # no cuda/hip version but must not fall through to "cpu".
+        payload = json.dumps({
+            "version": "2.5.1+xpu", "cuda": None, "hip": None, "xpu": "2.5",
+        })
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        status = detect_pytorch_status(runner=runner)
+        assert status.build_backend == "xpu"
+        assert status.build_backend != "cpu"
+        assert status.build_backend_version == "2.5"
+
+    def test_xpu_build_missing_xpu_key_is_still_correct_for_old_payload_shape(self):
+        # A payload without the "xpu" key at all (e.g. from before this
+        # probe added it) must not raise - .get() degrades to None,
+        # same as before this fix, for a genuine CPU build.
+        payload = json.dumps({"version": "2.5.1+cpu", "cuda": None, "hip": None})
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        status = detect_pytorch_status(runner=runner)
+        assert status.build_backend == "cpu"
+
     def test_malformed_output_degrades_to_not_installed(self):
         runner = FakeCommandRunner({"python3": _ok("python3", "not json at all")})
         status = detect_pytorch_status(runner=runner)
@@ -465,6 +486,16 @@ class TestPyTorch:
         detect_pytorch_status(runner=runner)
         code = runner.calls[-1][-1]
         assert "is_available" not in code
+
+    def test_never_calls_xpu_is_available(self):
+        payload = json.dumps({
+            "version": "2.5.1+xpu", "cuda": None, "hip": None, "xpu": "2.5",
+        })
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        detect_pytorch_status(runner=runner)
+        code = runner.calls[-1][-1]
+        assert "is_available" not in code
+        assert "torch.xpu" not in code
 
 
 class TestSelectPytorchBackend:
@@ -729,15 +760,37 @@ class TestContainers:
         status = detect_ai_container_status(runner=runner)
         assert status.nvidia_container_toolkit.installed is True
 
-    def test_cdi_marker_etc(self, tmp_path):
+    def test_cdi_marker_present_but_not_resolved(self, tmp_path):
+        # S4RM Section 3-8 regression: an empty/static marker file must
+        # never, by itself, count as resolved CDI evidence.
         (tmp_path / "etc" / "cdi").mkdir(parents=True)
         (tmp_path / "etc" / "cdi" / "nvidia.yaml").write_text("")
         status = detect_ai_container_status(runner=FakeCommandRunner({}), root=tmp_path)
-        assert status.cdi_nvidia_generated is True
+        assert status.cdi_marker_present is True
+        assert status.cdi_nvidia_resolved is False
 
     def test_cdi_marker_absent(self, tmp_path):
         status = detect_ai_container_status(runner=FakeCommandRunner({}), root=tmp_path)
-        assert status.cdi_nvidia_generated is False
+        assert status.cdi_marker_present is False
+        assert status.cdi_nvidia_resolved is False
+
+    def test_cdi_resolved_via_marker_absent_but_cdi_list_succeeds(self, tmp_path):
+        # A resolved device via `nvidia-ctk cdi list` is sufficient
+        # evidence even with no static marker file at all - the toolkit
+        # may manage CDI state dynamically (S4RM Section 6).
+        runner = FakeCommandRunner({
+            "nvidia-ctk": CommandResult(0, "nvidia.com/gpu=all\n", ""),
+        })
+
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args[:3] == ["nvidia-ctk", "cdi", "list"]:
+                    return CommandResult(0, "nvidia.com/gpu=all\n", "")
+                return super().run(args, timeout)
+
+        status = detect_ai_container_status(runner=_Runner(runner._responses), root=tmp_path)
+        assert status.cdi_marker_present is False
+        assert status.cdi_nvidia_resolved is True
 
     def test_never_creates_a_container(self):
         runner = FakeCommandRunner({"podman": _ok("podman", "podman version 5.0.0")})
@@ -1056,11 +1109,34 @@ class TestCapabilities:
         by_id = {c.id: c for c in report.capabilities}
         assert by_id["ai_container_runtime"].usable is False
 
-    def test_ai_container_usable_true_full_chain(self, tmp_path, monkeypatch):
+    def test_ai_container_usable_false_marker_present_but_not_resolved(self, tmp_path, monkeypatch):
+        # S4RM Section 3-5/8 regression: an empty/static marker file's
+        # mere existence must never, by itself, make the capability
+        # usable - only a resolved `nvidia-ctk cdi list` device does.
         self._nvidia_backend_monkeypatch(monkeypatch)
         (tmp_path / "etc" / "cdi").mkdir(parents=True)
         (tmp_path / "etc" / "cdi" / "nvidia.yaml").write_text("")
         runner = FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.0.0"),
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+            "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
+        })
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["ai_container_runtime"].usable is False
+
+    def test_ai_container_usable_true_full_chain_with_resolved_cdi(self, tmp_path, monkeypatch):
+        self._nvidia_backend_monkeypatch(monkeypatch)
+        (tmp_path / "etc" / "cdi").mkdir(parents=True)
+        (tmp_path / "etc" / "cdi" / "nvidia.yaml").write_text("")
+
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args[:3] == ["nvidia-ctk", "cdi", "list"]:
+                    return CommandResult(0, "nvidia.com/gpu=all\n", "")
+                return super().run(args, timeout)
+
+        runner = _Runner({
             "podman": _ok("podman", "podman version 5.0.0"),
             "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
             "nvidia-smi": _ok("nvidia-smi", "Driver Version: 580.65.06  CUDA Version: 13.0"),
@@ -1554,10 +1630,26 @@ class TestDoctor:
         by_id = {c.id: c for c in report.checks}
         assert by_id["ai_nvidia_container_cdi_missing"].status is CheckStatus.WARN
 
-    def test_nvidia_cdi_present_passes(self, tmp_path):
+    def test_nvidia_cdi_marker_only_still_warns(self, tmp_path):
+        # S4RM Section 9 regression: an unresolved static marker alone
+        # must not flip this check to PASS.
         (tmp_path / "etc" / "cdi").mkdir(parents=True)
         (tmp_path / "etc" / "cdi" / "nvidia.yaml").write_text("")
         runner = FakeCommandRunner({
+            "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
+        })
+        report = run_ai_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_nvidia_container_cdi_missing"].status is CheckStatus.WARN
+
+    def test_nvidia_cdi_resolved_passes(self, tmp_path):
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args[:3] == ["nvidia-ctk", "cdi", "list"]:
+                    return CommandResult(0, "nvidia.com/gpu=all\n", "")
+                return super().run(args, timeout)
+
+        runner = _Runner({
             "nvidia-ctk": _ok("nvidia-ctk", "NVIDIA Container Toolkit 1.17.0"),
         })
         report = run_ai_checks(root=tmp_path, runner=runner)
@@ -1592,6 +1684,49 @@ class TestDoctor:
         by_id = {c.id: c for c in report.checks}
         assert by_id["ai_pytorch_backend_mismatch"].status is CheckStatus.WARN
         assert report.exit_code == 0
+
+    def test_pytorch_xpu_build_with_unknown_compatibility_warns(self, tmp_path, monkeypatch):
+        # S4RM Section 17-19/33 regression: the pre-corrective condition
+        # was inverted (it warned when compatibility was NOT unknown,
+        # i.e. essentially never, since "unknown" is the only value
+        # Intel GPUs ever get in this pass). An installed XPU build with
+        # unresolved compatibility is exactly the state that should
+        # surface uncertainty.
+        import serein.ai.doctor as doctor_mod
+
+        monkeypatch.setattr(
+            doctor_mod, "detect_gpus", lambda root: [GPUDevice(vendor="Intel", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            doctor_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy([GPUClassification("Intel", "discrete", "high")]),
+        )
+        payload = json.dumps({
+            "version": "2.5.1+xpu", "cuda": None, "hip": None, "xpu": "2.5",
+        })
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        report = run_ai_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["ai_pytorch_backend_mismatch"].status is CheckStatus.WARN
+        assert report.exit_code == 0
+
+    def test_pytorch_xpu_build_never_reported_as_cpu_capability(self, tmp_path, monkeypatch):
+        import serein.ai.capabilities as caps_mod
+
+        monkeypatch.setattr(
+            caps_mod, "detect_gpus", lambda root: [GPUDevice(vendor="Intel", kind="discrete")]
+        )
+        monkeypatch.setattr(
+            caps_mod, "detect_gpu_policy",
+            lambda root, gpus: _gpu_policy([GPUClassification("Intel", "discrete", "high")]),
+        )
+        payload = json.dumps({
+            "version": "2.5.1+xpu", "cuda": None, "hip": None, "xpu": "2.5",
+        })
+        runner = FakeCommandRunner({"python3": _ok("python3", payload)})
+        report = build_ai_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["pytorch_cpu"].installed is False
 
     def test_pytorch_not_installed_is_pass(self, tmp_path):
         report = run_ai_checks(root=tmp_path, runner=FakeCommandRunner({}))

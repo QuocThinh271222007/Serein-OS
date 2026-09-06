@@ -51,6 +51,15 @@ as a result — Intel GPU presence always yields `BLOCKED` (S4R
 Section 8/34/35), the same conservative treatment ROCm gets when
 framework compatibility can't be confirmed.
 
+**S4RM correction (Section 17-19):** the doctor's `ai_pytorch_backend_mismatch`
+check originally warned only when `xpu_compatibility != "unknown"` —
+which is backwards, since `"unknown"` is the *only* value this pass
+ever sets. An installed XPU build with unresolved compatibility is
+exactly the state that should surface uncertainty, so the check now
+`WARN`s when `build_backend == "xpu"` and compatibility is `"unknown"`
+(or the reserved `"unsupported"` value, for a future pass that gains
+real negative evidence) — not the reverse.
+
 ## What this module never does
 
 No oneAPI/OpenVINO/XPU package installation, no compute-tooling

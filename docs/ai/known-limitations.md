@@ -137,6 +137,17 @@ honesty caveat in docs/ai/intel-strategy.md rather than cited to a
 live 2026 source. Treat that one claim as directionally reasonable,
 not independently re-verified this pass.
 
+**S4RM addendum:** the same applies to this final micro-corrective —
+`torch.version.xpu` as PyTorch's static XPU build-metadata attribute
+(mirroring the long-standing `torch.version.cuda`/`.hip` pattern) is a
+reasonable inference from PyTorch's own consistent API design, not a
+live-fetched 2026 source citation. If PyTorch's actual attribute name
+or shape ever differs from this, `detect_pytorch_status()`'s `.get()`
+calls degrade safely (a missing/differently-named key is read as
+`None`, same as any other absent field) rather than raising - so a
+wrong guess here fails safe (falls back to reporting `"cpu"`, the
+prior behavior) rather than crashing or fabricating a value.
+
 ## No distributed-training platform
 
 S4 supports detecting a PyTorch training-capable environment and
