@@ -40,8 +40,10 @@ below is unambiguously Ubuntu's own.
   the profile manifest) plus the full package-existence and
   dependency-closure evidence, including the `wireshark` GUI-vs-`tshark`
   CLI dependency-weight finding that shaped the host-tooling decision,
-  and the `qemu-system-x86_64`/`libvirt` binary-name-vs-package-name
-  correction in the VM planner.
+  the `qemu-system-x86_64`/`libvirt` binary-name-vs-package-name
+  correction in the VM planner, and (S5R corrective) the apt-vs-upstream
+  currency comparison behind `ffuf`/`gobuster`/`sqlmap`/`mitmproxy`'s
+  final source decisions (Finding 5).
 - `known-blockers.md` — what packet-capture, KVM-nested, and
   wireless-hardware runtime evidence remains unavailable in this
   environment and why, and what that does/doesn't mean for S5's

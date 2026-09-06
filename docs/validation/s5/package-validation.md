@@ -135,9 +135,33 @@ internal dependency conflicts on Ubuntu 26.04.
 `hydra` (9.6-3), `aircrack-ng` (1:1.7+git20230807.4bf83f1a-2ubuntu2),
 `sqlmap` (1.10.4-1), `gobuster` (3.8.2-1), `ffuf` (2.1.0-1build1),
 `mitmproxy` (8.1.1-4), `distrobox` (1.8.2.4-1), `podman`
-(5.7.0+ds2-3build1) — all real, current Ubuntu 26.04 packages. None
-were installed on the validation host's baseline; each stays
-`recommended_tier = "toolbox"`.
+(5.7.0+ds2-3build1) — all real Ubuntu 26.04 packages. None were
+installed on the validation host's baseline; each stays
+`recommended_tier = "toolbox"`. See Finding 5 for the specific
+apt-vs-upstream currency comparison behind `sqlmap`/`gobuster`/`ffuf`/
+`mitmproxy`'s final `source_type` decisions (S5R corrective).
+
+## Finding 5 — apt vs. upstream currency for ffuf/gobuster/sqlmap/mitmproxy (S5R corrective)
+
+An earlier pass had classified `ffuf`/`gobuster`/`sqlmap` as
+`official-upstream-binary` even though a real Ubuntu package exists for
+all three — a genuine inconsistency between this document's own
+findings and `tools.py`'s manifest. Re-verified against each project's
+current upstream release (2026-09-07):
+
+| Tool | Ubuntu 26.04 apt | Current upstream | Gap | Decision |
+|---|---|---|---|---|
+| `ffuf` | `2.1.0-1build1` | `v2.2.1` | one minor release | apt (close enough - Section 26) |
+| `gobuster` | `3.8.2-1` | `v3.8.2` | none - exact match | apt |
+| `sqlmap` | `1.10.4-1` | `1.10` (last tag; developed continuously on `master` since) | Ubuntu's snapshot is at least as current as the last tag | apt (no better-defined upstream release to prefer) |
+| `mitmproxy` | `8.1.1-4` | `12.2.3` | 4 major versions | **uv** (apt is genuinely stale here - the one case where upstream/uv wins) |
+
+`ffuf`, `gobuster`, and `sqlmap` were switched from
+`official-upstream-binary`/`None` to `ubuntu-repository`/their real
+package name in `tools.py`. `mitmproxy` stays `python-package-index`
+(`uv`-managed) - the only one of the four where Ubuntu's package is
+significantly behind upstream, which is a documented, evidence-based
+exception (Section 24), not inertia.
 
 ## Confirmed genuinely absent from Ubuntu's archive
 

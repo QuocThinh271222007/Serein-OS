@@ -52,16 +52,27 @@ installing/using *that specific tool* actually does.
 ## Live-validated source strategy
 
 For every non-apt tool, `tools.py` records the real official source
-rather than a convenient shortcut:
+rather than a convenient shortcut. The choice is never "Ubuntu apt by
+inertia" or "upstream by inertia" — each tool's `tools.py` `reason`
+field cites the actual version comparison behind the decision (S5R
+Section 24-26):
 
-| Tool | source_type | Real source |
+| Tool | source_type | Real source / rationale |
 |---|---|---|
-| `ghidra` | `official-upstream-binary` | GitHub Releases, `NationalSecurityAgency/ghidra` |
-| `metasploit-framework` | `official-upstream-repository` | Rapid7's own apt-like installer |
-| `mitmproxy` | `ubuntu-repository` (apt) or `uv` (Python env) | apt package confirmed live; toolbox-preferred install uses `uv`, never system Python |
+| `ghidra` | `official-upstream-binary` | GitHub Releases, `NationalSecurityAgency/ghidra` (no Ubuntu package exists at all) |
+| `metasploit-framework` | `official-upstream-repository` | Rapid7's own apt-like installer (no Ubuntu package exists at all) |
+| `mitmproxy` | `python-package-index` (`uv`-managed) | Ubuntu 26.04 package (`8.1.1-4`) is significantly stale vs. upstream's current `12.2.3` (live-confirmed, 4-major-version gap) — apt is available but deliberately not used |
+| `ffuf` | `ubuntu-repository` | Ubuntu 26.04's `2.1.0-1build1` is one minor release behind upstream's current `2.2.1` (live-confirmed) — close enough to prefer apt over a Go-binary install |
+| `gobuster` | `ubuntu-repository` | Ubuntu 26.04's `3.8.2-1` exactly matches upstream's current `v3.8.2` tag (live-confirmed) — apt preferred |
+| `sqlmap` | `ubuntu-repository` | Ubuntu 26.04's `1.10.4-1` (live-confirmed); upstream has no frequent tagged release beyond `1.10` and develops continuously on `master` — Ubuntu's packaged snapshot is preferred over an ad hoc git-clone install |
 | `burpsuite` | `optional` | user-managed GUI download, no automated installer or license acceptance |
 
-No unofficial `curl | sh` scripts, no random PPAs, and no third-party
-repacks are used when an official source already exists — every
-`source_type` value is one of a small, fixed, documented set
-(`_VALID_SOURCE_TYPES` in `doctor.py`), never invented ad hoc per tool.
+This table, `tools.py`'s per-tool `reason` field, and
+`docs/validation/s5/package-validation.md`'s live version evidence are
+kept in agreement — a tool is never described as "upstream-only" here
+while validation shows a real, current Ubuntu package exists without a
+documented reason for skipping it. No unofficial `curl | sh` scripts,
+no random PPAs, and no third-party repacks are used when an official
+source already exists — every `source_type` value is one of a small,
+fixed, documented set (`_VALID_SOURCE_TYPES` in `doctor.py`), never
+invented ad hoc per tool.
