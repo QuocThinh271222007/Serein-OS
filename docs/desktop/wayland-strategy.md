@@ -18,6 +18,12 @@ by the Kubuntu team. Serein's package manifest (`package-strategy.md`)
 follows that same default: X11 session support is not part of the
 baseline desktop package set.
 
+**Validated in S1R:** installing the full 17-package Serein desktop set
+(both simulated and for real, in a disposable Ubuntu 26.04 VM — see
+`docs/validation/s1r/package-validation.md`) does not pull in
+`plasma-session-x11` as a transitive dependency of anything. The policy
+holds in practice, not just in the package list as authored.
+
 ## Fallback policy
 
 A user or a later phase may still install `plasma-session-x11` — Serein

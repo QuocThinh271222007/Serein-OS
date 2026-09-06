@@ -2,45 +2,43 @@
 
 Explicit per the S1 requirement not to overstate what has been validated.
 
-## Not live-tested
+## Resolved by S1R (live validation pass)
 
-Nothing in this phase has been applied to, or observed running on, a real
-Ubuntu 26.04 + KDE Plasma 6.6 machine. Specifically not verified against a
-live system:
+The items below were originally listed here as untested and have since
+been verified against a real Ubuntu 26.04 + Plasma 6.6 environment (a
+disposable, isolated WSL2 instance — see `docs/validation/s1r/`):
 
-- That the exact package list in `desktop/packages.py` installs cleanly
-  and pulls in every transitive dependency needed for a working session
-  (no live `apt-cache`/`apt install --dry-run` access from this
-  development environment — see `package-strategy.md`).
-- That the `/etc/xdg/kdeglobals`/`/etc/xdg/kwinrc` fragments produce the
-  intended visual/behavioral result when actually read by a running
-  Plasma session.
-- That the `org.serein.desktop` Look-and-Feel KPackage's `metadata.json`
-  shape exactly matches what Plasma 6.6's KPackage loader expects (the
-  structure used here follows the documented KPackage JSON-metadata
-  convention, but was not validated by loading it into a real
-  `plasmashell`).
-- That the SDDM `.conf.d` drop-in is honored in the exact precedence
-  order assumed, on Ubuntu's packaged SDDM build specifically.
-- Real screen-resolution/HiDPI/multi-monitor behavior of the panel layout
-  — Plasma's own dynamic layout is relied on for this (per
-  `docs/desktop/architecture.md`), but that reliance itself is untested
-  here.
+- Package existence and dependency closure for the full 17-package set
+  (`docs/validation/s1r/package-validation.md`) — one real defect was
+  found and fixed (`breeze-gtk` → `breeze-gtk-theme`).
+- `/etc/xdg/kdeglobals`/`/etc/xdg/kwinrc` ownership (confirmed unowned by
+  any package, before and after a real full install) and KConfig
+  cascading precedence, empirically (`docs/validation/s1r/
+  config-ownership-validation.md`).
+- The `org.serein.desktop` Look-and-Feel KPackage's `metadata.json`,
+  installed and inspected with the real `kpackagetool6` — accepted with
+  no errors — and its panel layout script, proven to actually execute and
+  produce the intended bottom-panel widget order on a real, running
+  `plasmashell` (`docs/validation/s1r/plasma-runtime-validation.md`).
+- The SDDM `.conf.d` drop-in mechanism and its precedence, confirmed
+  against the real `sddm` package's own man page and Kubuntu's own
+  shipped drop-ins (`docs/validation/s1r/sddm-validation.md`).
 
-A live-VM (or Kubuntu 26.04 test image) validation pass is the
-recommended next step before any of this ships to a real installer
-(S7), and is called out as `LIVE_UBUNTU_PLASMA_VALIDATION=BLOCKED` in the
-S1 completion report for exactly this reason.
+**Still not live-tested** (see `docs/validation/s1r/known-blockers.md` for
+why, in detail): SDDM's actual interactive login/authentication flow (no
+VT/DRM device in WSL2), real-display HiDPI scaling, and multi-monitor
+behavior. None of these are known defects — they are gaps in what this
+validation environment could exercise, not evidence something is broken.
+
+A live-VM (or Kubuntu 26.04 test image) validation pass with a real or
+virtual GPU display remains the recommended next step for those three
+specific items before any of this ships to a real installer (S7).
 
 ## Package dependency closure
 
-The desktop package groups in `package-strategy.md` are based on stable,
-long-standing KDE/Debian package names, cross-checked against current
-release notes and the Debian package tracker — but not against a
-resolved `apt` dependency graph for Ubuntu 26.04 specifically. It is
-possible the actual minimum-viable set needs one or two additions
-(discovered only by installing on real hardware/VM) — this is an
-accepted, documented risk rather than a hidden one.
+Resolved by S1R — see above and `docs/validation/s1r/
+package-validation.md` for exact versions and the simulated/real
+transaction results.
 
 ## Config-marker granularity
 

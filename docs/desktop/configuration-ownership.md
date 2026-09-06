@@ -4,6 +4,15 @@ This is the critical requirement from the S1 brief: Serein must never
 silently reset a user's personal KDE preferences on upgrade, and must be
 able to state clearly which values it owns.
 
+**Validated against a real system in S1R**
+(`docs/validation/s1r/config-ownership-validation.md`): `/etc/xdg/
+kdeglobals` and `/etc/xdg/kwinrc` are confirmed unowned by any package in
+the Ubuntu 26.04 archive (checked both archive-wide and against a real,
+fully-installed system with `dpkg-query -S`), and the cascading precedence
+described below was reproduced empirically with `kreadconfig6` and two
+real Linux user accounts, plus a real `plasmashell` session for the
+Look-and-Feel layout mechanism specifically.
+
 ## The mechanism: `/etc/xdg` as a defaults layer, never `~/.config` writes
 
 KDE's config stack (KConfig) reads `XDG_CONFIG_DIRS` (defaulting to
