@@ -89,3 +89,154 @@ class HardwareReport:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# --- S2: hardware policy model -------------------------------------------
+#
+# Everything below augments the S0 report above rather than replacing it:
+# `serein hardware probe` and HardwareReport/SCHEMA_VERSION are unchanged,
+# and every S2 detector below is read-only, taking the same injectable
+# ``root`` as the S0 probes. See docs/hardware/architecture.md.
+
+CAPABILITIES_SCHEMA_VERSION = 1
+PLAN_SCHEMA_VERSION = 1
+
+
+@dataclass
+class CPUPolicyInfo:
+    cpufreq_present: bool = False
+    driver: str | None = None  # e.g. "amd-pstate-epp", "intel_pstate", "acpi-cpufreq"
+    governor: str | None = None
+    available_governors: list[str] = field(default_factory=list)
+    epp_current: str | None = None
+    epp_available: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SwapDevice:
+    name: str | None = None
+    kind: str | None = None  # "zram" | "partition" | "file"
+    size_bytes: int | None = None
+    priority: int | None = None
+
+
+@dataclass
+class ZramDevice:
+    name: str | None = None
+    disksize_bytes: int | None = None
+    comp_algorithm: str | None = None  # the active algorithm, if determinable
+
+
+@dataclass
+class MemoryPolicyInfo:
+    swap_devices: list[SwapDevice] = field(default_factory=list)
+    zram_devices: list[ZramDevice] = field(default_factory=list)
+    zram_generator_config_present: bool = False
+
+
+@dataclass
+class StorageSchedulerInfo:
+    name: str | None = None
+    current_scheduler: str | None = None
+    available_schedulers: list[str] = field(default_factory=list)
+
+
+@dataclass
+class StoragePolicyInfo:
+    devices: list[StorageSchedulerInfo] = field(default_factory=list)
+
+
+@dataclass
+class BatteryStatus:
+    name: str | None = None
+    capacity_percent: int | None = None
+    status: str | None = None  # "Charging" | "Discharging" | "Full" | "Unknown" | None
+
+
+@dataclass
+class PowerPolicyInfo:
+    ppd_present: bool = False  # power-profiles-daemon service/binary detected
+    batteries: list[BatteryStatus] = field(default_factory=list)
+
+
+@dataclass
+class GPUPolicyInfo:
+    hybrid: bool = False
+    nvidia_present: bool = False
+    nvidia_kernel_module_loaded: bool = False
+    amdgpu_kernel_module_loaded: bool = False
+    integrated_count: int = 0
+    discrete_count: int = 0
+
+
+@dataclass
+class ThermalZoneInfo:
+    zone_type: str | None = None
+    temp_celsius: float | None = None
+
+
+@dataclass
+class ThermalInfo:
+    zones: list[ThermalZoneInfo] = field(default_factory=list)
+    hwmon_present: bool = False
+
+
+@dataclass
+class Capability:
+    id: str
+    available: bool | None  # None = genuinely unknown/ambiguous, not False
+    mechanism: str | None
+    confidence: str  # "high" | "medium" | "low"
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CapabilitiesReport:
+    schema_version: int
+    capabilities: list[Capability]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "capabilities": [c.to_dict() for c in self.capabilities],
+        }
+
+
+@dataclass
+class PlanAction:
+    id: str
+    component: str
+    action: str
+    target: str | None
+    current: str | None
+    reason: str
+    confidence: str  # "high" | "medium" | "low"
+    requires_root: bool
+    reversible: bool
+    risk: str  # "none" | "low" | "medium" | "high"
+    verification: str
+    status: str  # "APPLY" | "NOOP" | "SKIP" | "BLOCKED"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class HardwarePlan:
+    schema_version: int
+    profile_id: str
+    profile_available: bool
+    unavailable_reason: str | None
+    actions: list[PlanAction]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "profile_id": self.profile_id,
+            "profile_available": self.profile_available,
+            "unavailable_reason": self.unavailable_reason,
+            "actions": [a.to_dict() for a in self.actions],
+        }
