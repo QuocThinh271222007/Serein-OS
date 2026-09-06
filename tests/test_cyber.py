@@ -32,10 +32,11 @@ from serein.cyber.tools import (
     TOOLBOX_PASSWORD_AUDIT_TOOLS,
     all_tools,
     default_apt_packages,
+    default_host_tools,
     host_tools,
     toolbox_tools,
 )
-from serein.cyber.virtualization import detect_vm_status
+from serein.cyber.virtualization import detect_vm_status, evaluate_vm_readiness
 from serein.development.runner import CommandResult
 from serein.doctor.models import CheckStatus
 
@@ -135,6 +136,59 @@ class TestCapture:
 
         status = detect_capture_status(runner=_Runner(runner._responses))
         assert status.capture_permitted is False
+
+    @pytest.mark.parametrize("phrasing", [
+        "permission denied",
+        "You don't have permission to capture on device eth0",
+        "You do not have permission to open device",
+        "Operation not permitted",
+        "insufficient privileges to capture",
+        "EPERM",
+        "EACCES",
+    ])
+    def test_dumpcap_permission_denied_matches_several_phrasings(self, phrasing):
+        # Robust pattern matching (S5R Section 4/7) - never a single
+        # hardcoded exact string.
+        runner = FakeCommandRunner({"dumpcap": _ok("dumpcap", "Dumpcap 4.2.0")})
+
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args == ["dumpcap", "-D"]:
+                    return _fail(stderr=phrasing)
+                return super().run(args, timeout)
+
+        status = detect_capture_status(runner=_Runner(runner._responses))
+        assert status.capture_permitted is False
+
+    def test_dumpcap_succeeds_but_empty_interface_list_is_unknown(self):
+        # A nonzero exit code is not the only way to fail to prove
+        # permission - a *successful* run with no listed interfaces
+        # proves nothing either (S5R Section 4).
+        runner = FakeCommandRunner({"dumpcap": _ok("dumpcap", "Dumpcap 4.2.0")})
+
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args == ["dumpcap", "-D"]:
+                    return _ok("dumpcap", "")
+                return super().run(args, timeout)
+
+        status = detect_capture_status(runner=_Runner(runner._responses))
+        assert status.capture_permitted is None
+
+    def test_dumpcap_nonzero_unrelated_error_is_unknown(self):
+        # A bare nonzero exit code must NOT be equated with permission
+        # denial (S5R Section 3) - an unrelated runtime error is
+        # "unknown", never "denied".
+        runner = FakeCommandRunner({"dumpcap": _ok("dumpcap", "Dumpcap 4.2.0")})
+
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args == ["dumpcap", "-D"]:
+                    return _fail(returncode=2, stderr="dumpcap: unrecognized option")
+                return super().run(args, timeout)
+
+        status = detect_capture_status(runner=_Runner(runner._responses))
+        assert status.capture_permitted is None
 
     def test_dumpcap_present_permission_unknown_when_check_fails(self):
         # Version probe (`dumpcap -v`) succeeds but no response is
@@ -320,6 +374,85 @@ class TestVM:
             assert "create" not in call
 
 
+def _kvm_ready_root(tmp_path, module_loaded=True):
+    (tmp_path / "dev").mkdir()
+    (tmp_path / "dev" / "kvm").write_text("")
+    if module_loaded:
+        (tmp_path / "proc").mkdir()
+        (tmp_path / "proc" / "modules").write_text("kvm 1064960 0 - Live 0x0\n")
+    return tmp_path
+
+
+class TestVMReadiness:
+    """The single canonical VM-readiness verdict (S5R Section 17-18/22)
+    that capabilities.py/planner.py/doctor.py all consume identically."""
+
+    def test_no_kvm_device_is_blocked_no_hardware(self, tmp_path):
+        vm = detect_vm_status(runner=FakeCommandRunner({}), root=tmp_path)
+        readiness = evaluate_vm_readiness(vm)
+        assert readiness.status == "blocked_no_hardware"
+        assert readiness.usable is False
+
+    def test_device_present_module_missing_is_blocked(self, tmp_path):
+        _kvm_ready_root(tmp_path, module_loaded=False)
+        vm = detect_vm_status(runner=FakeCommandRunner({}), root=tmp_path)
+        readiness = evaluate_vm_readiness(vm)
+        assert readiness.status == "blocked_module_missing"
+        assert readiness.usable is False
+
+    def test_user_access_false_is_blocked_no_access(self, tmp_path, monkeypatch):
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: False)
+        vm = detect_vm_status(runner=FakeCommandRunner({}), root=tmp_path)
+        readiness = evaluate_vm_readiness(vm)
+        assert readiness.status == "blocked_no_access"
+        assert readiness.usable is False
+
+    def test_user_access_unknown_is_blocked_not_ready(self, tmp_path, monkeypatch):
+        # os.access raising -> VMCapabilityInfo.user_access is None.
+        def _raise(*a, **kw):
+            raise OSError("no such concept on this platform")
+
+        monkeypatch.setattr("os.access", _raise)
+        _kvm_ready_root(tmp_path)
+        vm = detect_vm_status(runner=FakeCommandRunner({}), root=tmp_path)
+        assert vm.user_access is None
+        readiness = evaluate_vm_readiness(vm)
+        assert readiness.status == "blocked_access_unknown"
+        assert readiness.usable is False
+
+    def test_access_ready_qemu_missing_is_needs_qemu(self, tmp_path, monkeypatch):
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        vm = detect_vm_status(runner=FakeCommandRunner({}), root=tmp_path)
+        readiness = evaluate_vm_readiness(vm)
+        assert readiness.status == "needs_qemu"
+        assert readiness.usable is False
+
+    def test_qemu_ready_libvirt_missing_is_needs_libvirt(self, tmp_path, monkeypatch):
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        runner = FakeCommandRunner({
+            "qemu-system-x86_64": _ok("qemu-system-x86_64", "QEMU emulator version 8.2.2"),
+        })
+        vm = detect_vm_status(runner=runner, root=tmp_path)
+        readiness = evaluate_vm_readiness(vm)
+        assert readiness.status == "needs_libvirt"
+        assert readiness.usable is False
+
+    def test_full_chain_is_ready(self, tmp_path, monkeypatch):
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        runner = FakeCommandRunner({
+            "qemu-system-x86_64": _ok("qemu-system-x86_64", "QEMU emulator version 8.2.2"),
+            "virsh": _ok("virsh", "10.0.0"),
+        })
+        vm = detect_vm_status(runner=runner, root=tmp_path)
+        readiness = evaluate_vm_readiness(vm)
+        assert readiness.status == "ready"
+        assert readiness.usable is True
+
+
 class TestTools:
     def test_no_duplicate_ids(self):
         tools = all_tools()
@@ -398,6 +531,127 @@ class TestTools:
         assert ghidra.source_type != "ubuntu-repository"
 
 
+class TestHostDefaultInstall:
+    """recommended_tier == "host" is a *tier* (appropriate to have on a
+    host if chosen), not a claim about Serein's *default* install set
+    (S5R Section 10-15) - Wireshark GUI is the concrete example."""
+
+    def test_wireshark_is_host_tier_but_not_default_install(self):
+        wireshark = next(t for t in all_tools() if t.id == "wireshark")
+        assert wireshark.recommended_tier == "host"
+        assert wireshark.default_install is False
+
+    def test_tshark_is_host_tier_and_default_install(self):
+        tshark = next(t for t in all_tools() if t.id == "tshark")
+        assert tshark.recommended_tier == "host"
+        assert tshark.default_install is True
+
+    def test_default_apt_packages_excludes_wireshark(self):
+        assert "wireshark" not in default_apt_packages()
+
+    def test_default_host_tools_excludes_wireshark(self):
+        ids = {t.id for t in default_host_tools()}
+        assert "wireshark" not in ids
+        assert "tshark" in ids
+
+    def test_default_host_tools_is_strict_subset_of_host_tools(self):
+        default_ids = {t.id for t in default_host_tools()}
+        host_ids = {t.id for t in host_tools()}
+        assert default_ids <= host_ids
+        assert default_ids < host_ids  # strictly smaller (wireshark excluded)
+
+    def test_profile_default_package_list_excludes_wireshark(self):
+        import json as _json
+        from pathlib import Path
+
+        manifest_path = (
+            Path(__file__).resolve().parents[1]
+            / "profiles" / "cyber" / "cyber.profile.json"
+        )
+        data = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert "wireshark" not in data["packages"]
+
+    def test_profile_default_packages_match_canonical_default_plus_s2(self):
+        import json as _json
+        from pathlib import Path
+
+        manifest_path = (
+            Path(__file__).resolve().parents[1]
+            / "profiles" / "cyber" / "cyber.profile.json"
+        )
+        data = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        s2_packages = {"power-profiles-daemon", "systemd-zram-generator"}
+        expected = set(default_apt_packages()) | s2_packages
+        assert set(data["packages"]) == expected
+
+    def test_host_baseline_noop_when_default_tools_installed_wireshark_missing(self, tmp_path):
+        responses = {
+            "nmap": _ok("nmap", "Nmap version 7.95"),
+            "tcpdump": _ok("tcpdump", "tcpdump version 4.99.5"),
+            "dig": _ok("dig", "DiS 9.18.0"),
+            "whois": _ok("whois", "whois 5.5.0"),
+            "openssl": _ok("openssl", "OpenSSL 3.2.0"),
+            "socat": _ok("socat", "socat 1.7.4"),
+            "nc": _ok("nc", "OpenBSD netcat"),
+            "mtr": _ok("mtr", "mtr 0.95"),
+            "ethtool": _ok("ethtool", "ethtool 6.7"),
+            ("dumpcap", "-v"): _ok("dumpcap", "Dumpcap 4.2.0"),
+            "tshark": _ok("tshark", "TShark 4.2.0"),
+            # wireshark deliberately absent
+            "file": _ok("file", "file-5.46"),
+            "objdump": _ok("objdump", "GNU objdump 2.42"),
+            "exiftool": _ok("exiftool", "13.00"),
+        }
+        plan = build_cyber_plan(root=tmp_path, runner=FakeCommandRunner(responses))
+        actions = {a.id: a for a in plan.actions}
+        assert actions["host.baseline"].status == "NOOP"
+
+    def test_optional_wireshark_installed_does_not_change_baseline_state(self, tmp_path):
+        # Installing the optional Wireshark GUI on top of an otherwise
+        # incomplete host must not itself flip host.baseline to NOOP -
+        # only the default-install set matters for that status.
+        plan_without = build_cyber_plan(root=tmp_path, runner=FakeCommandRunner({}))
+        wireshark_runner = FakeCommandRunner({"wireshark": _ok("wireshark", "Wireshark 4.2.0")})
+        plan_with_wireshark_only = build_cyber_plan(root=tmp_path, runner=wireshark_runner)
+        actions_without = {a.id: a for a in plan_without.actions}
+        actions_with = {a.id: a for a in plan_with_wireshark_only.actions}
+        assert actions_without["host.baseline"].status == "APPLY"
+        assert actions_with["host.baseline"].status == "APPLY"
+
+
+class TestSourceMetadata:
+    """S5R Section 24-30/41: source_type reflects a deliberate,
+    documented, version-evidence-based decision, not inertia in either
+    direction."""
+
+    def test_ffuf_source_is_ubuntu_repository(self):
+        ffuf = next(t for t in all_tools() if t.id == "ffuf")
+        assert ffuf.source_type == "ubuntu-repository"
+        assert ffuf.package == "ffuf"
+
+    def test_gobuster_source_is_ubuntu_repository(self):
+        gobuster = next(t for t in all_tools() if t.id == "gobuster")
+        assert gobuster.source_type == "ubuntu-repository"
+        assert gobuster.package == "gobuster"
+
+    def test_sqlmap_source_is_ubuntu_repository(self):
+        sqlmap = next(t for t in all_tools() if t.id == "sqlmap")
+        assert sqlmap.source_type == "ubuntu-repository"
+        assert sqlmap.package == "sqlmap"
+
+    def test_mitmproxy_source_stays_python_package_index(self):
+        # The one deliberate exception: Ubuntu's apt package is
+        # significantly stale against upstream (8.1.1 vs 12.2.3).
+        mitmproxy = next(t for t in all_tools() if t.id == "mitmproxy")
+        assert mitmproxy.source_type == "python-package-index"
+
+    def test_ffuf_gobuster_sqlmap_still_toolbox_tier(self):
+        # Source choice must never change tier classification.
+        for tool_id in ("ffuf", "gobuster", "sqlmap"):
+            tool = next(t for t in all_tools() if t.id == tool_id)
+            assert tool.recommended_tier == "toolbox"
+
+
 class TestCapabilities:
     def test_schema_version(self):
         report = build_cyber_capabilities(runner=FakeCommandRunner({}))
@@ -448,6 +702,26 @@ class TestCapabilities:
         report = build_cyber_capabilities(runner=runner)
         by_id = {c.id: c for c in report.capabilities}
         assert by_id["wireless_tooling"].usable is not True
+
+    def test_container_toolbox_usable_is_always_none(self, tmp_path):
+        # S5R Section 31-34: binary presence never proves rootless
+        # runtime usability - usable stays None even when both the
+        # engine and Distrobox are installed, since S5 never runs/
+        # creates a container merely to prove it.
+        runner = FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.7.0"),
+            "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+        })
+        report = build_cyber_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["container_toolbox"].installed is True
+        assert by_id["container_toolbox"].usable is None
+
+    def test_container_toolbox_installed_false_when_absent(self, tmp_path):
+        report = build_cyber_capabilities(root=tmp_path, runner=FakeCommandRunner({}))
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["container_toolbox"].installed is False
+        assert by_id["container_toolbox"].usable is None
 
     def test_to_dict_is_json_serializable(self):
         report = build_cyber_capabilities(runner=FakeCommandRunner({}))
@@ -642,22 +916,56 @@ class TestPlanner:
         actions = self._actions_by_id(plan)
         assert actions["vm.prerequisites"].status == "BLOCKED"
 
-    def test_vm_prerequisites_apply_with_kvm_present(self, tmp_path):
+    def test_vm_prerequisites_blocked_when_module_not_loaded(self, tmp_path):
+        # Device present but module not loaded and/or access unproven -
+        # Serein must never say "prerequisites can be used" here
+        # (S5R Section 19): this is still BLOCKED, not APPLY.
         (tmp_path / "dev").mkdir()
         (tmp_path / "dev" / "kvm").write_text("")
         plan = build_cyber_plan(root=tmp_path, runner=FakeCommandRunner({}))
         actions = self._actions_by_id(plan)
+        assert actions["vm.prerequisites"].status == "BLOCKED"
+
+    def test_vm_prerequisites_blocked_when_user_access_false(self, tmp_path, monkeypatch):
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: False)
+        plan = build_cyber_plan(root=tmp_path, runner=FakeCommandRunner({}))
+        actions = self._actions_by_id(plan)
+        assert actions["vm.prerequisites"].status == "BLOCKED"
+
+    def test_vm_prerequisites_apply_with_hardware_and_access_ready(self, tmp_path, monkeypatch):
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        plan = build_cyber_plan(root=tmp_path, runner=FakeCommandRunner({}))
+        actions = self._actions_by_id(plan)
         assert actions["vm.prerequisites"].status == "APPLY"
 
-    def test_vm_prerequisites_noop_when_all_present(self, tmp_path):
-        (tmp_path / "dev").mkdir()
-        (tmp_path / "dev" / "kvm").write_text("")
+    def test_vm_prerequisites_noop_when_all_present(self, tmp_path, monkeypatch):
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
         runner = FakeCommandRunner({
             "qemu-system-x86_64": _ok("qemu-system-x86_64", "QEMU emulator version 8.2.2"),
             "virsh": _ok("virsh", "10.0.0"),
         })
         plan = build_cyber_plan(root=tmp_path, runner=runner)
         actions = self._actions_by_id(plan)
+        assert actions["vm.prerequisites"].status == "NOOP"
+
+    def test_vm_capability_usable_implies_prerequisites_noop(self, tmp_path, monkeypatch):
+        # S5R Section 22/43 invariant: vm_isolation.usable == True must
+        # always imply vm.prerequisites.status == NOOP, since both
+        # derive from the same evaluate_vm_readiness() verdict.
+        _kvm_ready_root(tmp_path)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        runner = FakeCommandRunner({
+            "qemu-system-x86_64": _ok("qemu-system-x86_64", "QEMU emulator version 8.2.2"),
+            "virsh": _ok("virsh", "10.0.0"),
+        })
+        capabilities = build_cyber_capabilities(root=tmp_path, runner=runner)
+        by_cap_id = {c.id: c for c in capabilities.capabilities}
+        plan = build_cyber_plan(root=tmp_path, runner=runner)
+        actions = self._actions_by_id(plan)
+        assert by_cap_id["vm_isolation"].usable is True
         assert actions["vm.prerequisites"].status == "NOOP"
 
     def test_vm_isolation_policy_always_present_and_noop(self, tmp_path):
@@ -704,6 +1012,57 @@ class TestDoctor:
         report = run_cyber_checks(root=tmp_path, runner=runner)
         by_id = {c.id: c for c in report.checks}
         assert by_id["cyber_capture_backend_consistency"].status is CheckStatus.PASS
+
+    def test_capture_permission_denied_warns(self, tmp_path):
+        runner = FakeCommandRunner({"dumpcap": _ok("dumpcap", "Dumpcap 4.2.0")})
+
+        class _Runner(FakeCommandRunner):
+            def run(self, args, timeout=3.0):
+                if args == ["dumpcap", "-D"]:
+                    return _fail()
+                return super().run(args, timeout)
+
+        report = run_cyber_checks(root=tmp_path, runner=_Runner(runner._responses))
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["cyber_capture_backend_consistency"].status is CheckStatus.WARN
+        assert report.exit_code == 0
+
+    def test_capture_permission_unknown_is_not_warn(self, tmp_path):
+        # Unknown must never be reported as though it were a denial.
+        runner = FakeCommandRunner({("dumpcap", "-v"): _ok("dumpcap", "Dumpcap 4.2.0")})
+        report = run_cyber_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["cyber_capture_backend_consistency"].status is CheckStatus.PASS
+        assert "permission denied" not in by_id["cyber_capture_backend_consistency"].detail.lower()
+
+    def test_vm_readiness_skips_without_hardware(self, tmp_path):
+        report = run_cyber_checks(root=tmp_path, runner=FakeCommandRunner({}))
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["cyber_vm_readiness"].status is CheckStatus.SKIP
+
+    def test_vm_readiness_warns_on_no_access(self, tmp_path, monkeypatch):
+        (tmp_path / "dev").mkdir()
+        (tmp_path / "dev" / "kvm").write_text("")
+        (tmp_path / "proc").mkdir()
+        (tmp_path / "proc" / "modules").write_text("kvm 1064960 0 - Live 0x0\n")
+        monkeypatch.setattr("os.access", lambda *a, **kw: False)
+        report = run_cyber_checks(root=tmp_path, runner=FakeCommandRunner({}))
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["cyber_vm_readiness"].status is CheckStatus.WARN
+
+    def test_vm_readiness_passes_on_full_chain(self, tmp_path, monkeypatch):
+        (tmp_path / "dev").mkdir()
+        (tmp_path / "dev" / "kvm").write_text("")
+        (tmp_path / "proc").mkdir()
+        (tmp_path / "proc" / "modules").write_text("kvm 1064960 0 - Live 0x0\n")
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        runner = FakeCommandRunner({
+            "qemu-system-x86_64": _ok("qemu-system-x86_64", "QEMU emulator version 8.2.2"),
+            "virsh": _ok("virsh", "10.0.0"),
+        })
+        report = run_cyber_checks(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["cyber_vm_readiness"].status is CheckStatus.PASS
 
     def test_container_engine_conflict_warns(self, tmp_path):
         runner = FakeCommandRunner({
