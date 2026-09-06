@@ -19,6 +19,12 @@ from serein.desktop.config import RESOURCES, missing_resources
 from serein.desktop.doctor import run_desktop_checks
 from serein.desktop.plan import build_desktop_plan
 from serein.desktop.status import build_desktop_status
+from serein.development.capabilities import build_development_capabilities
+from serein.development.doctor import run_development_checks
+from serein.development.models import ToolStatus
+from serein.development.planner import VALID_COMPONENTS as DEV_VALID_COMPONENTS
+from serein.development.planner import build_development_plan
+from serein.development.status import build_development_status
 from serein.doctor.checks import run_checks
 from serein.doctor.models import CheckStatus, DoctorReport
 from serein.hardware._util import DEFAULT_ROOT
@@ -45,6 +51,20 @@ _CAPABILITY_LABELS = {
     "nvidia_compute_gpu": "NVIDIA compute GPU",
     "gpu_switching": "GPU switching",
     "thermal_telemetry": "Thermal telemetry",
+}
+
+_DEV_CAPABILITY_LABELS = {
+    "git_cli": "Git",
+    "github_cli": "GitHub CLI",
+    "python_uv": "Python (uv)",
+    "node_runtime": "Node runtime (fnm)",
+    "pnpm": "pnpm",
+    "rustup": "Rust (rustup)",
+    "go_toolchain": "Go toolchain",
+    "cpp_toolchain": "C/C++ toolchain",
+    "zed_editor": "Zed editor",
+    "container_engine": "Container engine",
+    "distrobox": "Distrobox",
 }
 
 
@@ -271,6 +291,111 @@ def _cmd_hardware_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _tool_line(label: str, status: ToolStatus) -> str:
+    value = status.version if status.installed else "missing"
+    return f"  {label:<14} {value}"
+
+
+def _cmd_dev_status(_args: argparse.Namespace) -> int:
+    status = build_development_status()
+    print("SEREIN DEVELOPMENT")
+    print()
+    print(f"Profile        {status.profile_id} ({status.profile_status})")
+    print()
+    print("Git")
+    print(_tool_line("git", status.git.git))
+    print(_tool_line("git-lfs", status.git.git_lfs))
+    print(_tool_line("gh", status.git.gh))
+    print()
+    print("Editor")
+    print(_tool_line("Zed", status.editor.zed))
+    print()
+    print("Python")
+    print(_tool_line("system", status.python.system_python))
+    print(_tool_line("uv", status.python.uv))
+    print(f"  pyenv present  {'yes' if status.python.pyenv_present else 'no'}")
+    print(f"  conda present  {'yes' if status.python.conda_present else 'no'}")
+    print()
+    print("Node")
+    print(_tool_line("fnm", status.node.fnm))
+    print(_tool_line("mise", status.node.mise))
+    print(f"  nvm present    {'yes' if status.node.nvm_present else 'no'}")
+    print(_tool_line("node", status.node.node))
+    print(_tool_line("pnpm", status.node.pnpm))
+    print(_tool_line("npm", status.node.npm))
+    print()
+    print("Rust")
+    print(_tool_line("rustup", status.rust.rustup))
+    print(_tool_line("rustc", status.rust.rustc))
+    print(_tool_line("cargo", status.rust.cargo))
+    print()
+    print("Go")
+    print(_tool_line("go", status.go.go))
+    print()
+    print("C/C++")
+    print(_tool_line("gcc", status.cpp.gcc))
+    print(_tool_line("g++", status.cpp.gpp))
+    print(_tool_line("clang", status.cpp.clang))
+    print(_tool_line("cmake", status.cpp.cmake))
+    print(_tool_line("ninja", status.cpp.ninja))
+    print(_tool_line("gdb", status.cpp.gdb))
+    print(_tool_line("lldb", status.cpp.lldb))
+    print()
+    print("Containers")
+    print(_tool_line("podman", status.containers.podman))
+    print(_tool_line("docker", status.containers.docker))
+    print(_tool_line("distrobox", status.containers.distrobox))
+    return 0
+
+
+def _cmd_dev_doctor(args: argparse.Namespace) -> int:
+    report = run_development_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN DEVELOPMENT DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_dev_capabilities(args: argparse.Namespace) -> int:
+    report = build_development_capabilities()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN DEVELOPMENT CAPABILITIES")
+    print()
+    for capability in report.capabilities:
+        label = _DEV_CAPABILITY_LABELS.get(capability.id, capability.id)
+        print(f"{label:<24}{_yes_no_unknown(capability.available)}")
+    return 0
+
+
+def _cmd_dev_plan(args: argparse.Namespace) -> int:
+    plan = build_development_plan(getattr(args, "component", None))
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    header = "SEREIN DEVELOPMENT PLAN"
+    if getattr(args, "component", None):
+        header += f" - {args.component}"
+    print(header)
+    print()
+    for step in plan.actions:
+        target = f" -> {step.target}" if step.target else ""
+        current = f" (current: {step.current})" if step.current else ""
+        print(f"  [{step.status:<7}] {step.component}.{step.action}: {step.tool}{target}{current}")
+        print(f"            reason: {step.reason}")
+        print(
+            f"            risk: {step.risk} | reversible: {'yes' if step.reversible else 'no'} | "
+            f"requires_root: {'yes' if step.requires_root else 'no'} | source: {step.source}"
+        )
+        print(f"            verify: {step.verification}")
+    return 0
+
+
 def _cmd_profile_list(args: argparse.Namespace) -> int:
     profiles = list_profiles()
     if args.json:
@@ -408,6 +533,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     hardware_plan_parser.set_defaults(func=_cmd_hardware_plan)
+
+    dev_parser = subparsers.add_parser("dev", help="Development workstation")
+    dev_subparsers = dev_parser.add_subparsers(dest="dev_command", required=True)
+
+    dev_subparsers.add_parser("status", help="Show development toolchain state").set_defaults(
+        func=_cmd_dev_status
+    )
+
+    dev_doctor_parser = dev_subparsers.add_parser(
+        "doctor", help="Run development-level diagnostics"
+    )
+    dev_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    dev_doctor_parser.set_defaults(func=_cmd_dev_doctor)
+
+    dev_capabilities_parser = dev_subparsers.add_parser(
+        "capabilities", help="Show which development stacks Serein can provision"
+    )
+    dev_capabilities_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    dev_capabilities_parser.set_defaults(func=_cmd_dev_capabilities)
+
+    dev_plan_parser = dev_subparsers.add_parser(
+        "plan", help="Show the development workstation plan"
+    )
+    dev_plan_parser.add_argument(
+        "component", nargs="?", choices=DEV_VALID_COMPONENTS, default=None,
+        help="Show only actions for this component (e.g. python, node, rust)",
+    )
+    dev_plan_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    dev_plan_parser.set_defaults(func=_cmd_dev_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)

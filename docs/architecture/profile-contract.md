@@ -24,7 +24,7 @@ path that would actually apply a profile) is not implemented. Reporting an
 inactive profile as active would violate the "no fake PASS output" rule
 that also governs `doctor`.
 
-## Current scope (as of S2)
+## Current scope (as of S3)
 
 - `core` (S0): `profiles/core/core.profile.json`. Describes the
   unmodified host — empty `packages`/`services`/etc. — and exists to
@@ -50,6 +50,23 @@ that also governs `doctor`.
   `hardware_conditions: ["battery_present"]`: on a battery-less host,
   `serein hardware plan battery` reports `profile_available: false`
   with a stated reason rather than pretending the profile applies.
+- `dev` (S3): `profiles/dev/dev.profile.json` (version `0.2.0`). Unlike
+  `balanced`/`ai`/`battery`/`cyber`, which still carry only their S2
+  hardware resource-policy layer, `dev` was extended in S3 into a
+  combined hardware-policy **and** software-workload manifest — still
+  **one** canonical profile, not two competing manifests. Its
+  `packages` field is the union of S2's hardware packages
+  (`power-profiles-daemon`, `systemd-zram-generator`) and S3's default
+  apt package set (`serein.development.packages.default_apt_packages()`,
+  33 packages); its `configuration_units` field adds S3's
+  `zed-settings-template`/`git-recommended-config` template resources
+  alongside S2's `zram-generator-defaults`; its `verification_checks`
+  field adds S3's six `development_*` doctor check ids alongside S2's
+  ten hardware checks. See `docs/development/architecture.md` for what
+  "implemented" means for this profile's software layer specifically —
+  detection, capability modeling, and `serein dev plan` all work end to
+  end, but there is still no Apply mechanism, same as the hardware
+  layer.
 - `DECLARED_ONLY_PROFILES` (`src/serein/profiles/registry.py`) is empty
   as of S2 — every roadmap profile now has a manifest. It remains the
   mechanism a future phase (e.g. S6's veil/privacy profile) will use

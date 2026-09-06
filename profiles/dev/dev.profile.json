@@ -2,20 +2,55 @@
   "schema_version": 1,
   "id": "dev",
   "name": "Development",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "status": "implemented",
-  "description": "Hardware resource policy biased for sustained mixed workloads (coding, compilation, containers) without permanently forcing a performance governor. This is the resource-policy layer only: the S3 development toolchain (editors, language toolchains, container runtimes) is separate, unimplemented future work. See docs/hardware/architecture.md.",
+  "description": "Combines the S2 hardware resource policy (sustained mixed workloads, no forced performance governor) with the S3 development-workstation software layer: a curated Ubuntu package set plus user-level tool detection/planning for Git/GitHub, Python (uv), Node (fnm/pnpm), Rust (rustup), Go, C/C++, Zed, and containers (Podman/Distrobox). No package is installed and no user config is written by this repository - see docs/development/architecture.md and docs/development/installation-plan.md for what 'implemented' means here.",
   "dependencies": [
     "core"
   ],
   "conflicts": [],
   "packages": [
+    "7zip",
+    "bat",
+    "btop",
+    "build-essential",
+    "clang",
+    "cmake",
+    "curl",
+    "distrobox",
+    "eza",
+    "fd-find",
+    "fzf",
+    "g++",
+    "gcc",
+    "gdb",
+    "gh",
+    "git",
+    "git-lfs",
+    "gnupg",
+    "golang-go",
+    "jq",
+    "lldb",
+    "ninja-build",
+    "openssh-client",
+    "pkg-config",
+    "podman",
     "power-profiles-daemon",
-    "systemd-zram-generator"
+    "ripgrep",
+    "rsync",
+    "strace",
+    "systemd-zram-generator",
+    "tree",
+    "unzip",
+    "wget",
+    "zip",
+    "zoxide"
   ],
   "services": [],
   "configuration_units": [
-    "zram-generator-defaults"
+    "zram-generator-defaults",
+    "zed-settings-template",
+    "git-recommended-config"
   ],
   "hardware_conditions": [],
   "verification_checks": [
@@ -28,10 +63,16 @@
     "hardware_gpu_topology_confidence",
     "hardware_profile_plan_generation",
     "hardware_virtualization_guard",
-    "hardware_required_resources"
+    "hardware_required_resources",
+    "development_profile_integrity",
+    "development_package_manifest",
+    "development_required_resources",
+    "development_plan_generation",
+    "development_node_manager_conflict",
+    "development_container_engine_conflict"
   ],
   "rollback": {
     "supported": false,
-    "notes": "No Apply mechanism exists yet in S2; serein hardware plan is read-only. See docs/hardware/architecture.md for what a future Apply step would need."
+    "notes": "No Apply mechanism exists yet in S2/S3; serein hardware plan and serein dev plan are both read-only. See docs/hardware/architecture.md and docs/development/architecture.md for what a future Apply step would need."
   }
 }

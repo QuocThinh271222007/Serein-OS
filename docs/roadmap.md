@@ -24,7 +24,7 @@ and a deterministic installation plan. See
 for why KDE Plasma. No package installation or configuration write to any
 host happens yet — see `docs/desktop/installation-plan.md`.
 
-## S2 — Hardware *(this repository, in progress)*
+## S2 — Hardware *(complete, merged to main)*
 
 Hardware capability modeling (`serein hardware capabilities`) and
 resource-policy planning (`serein hardware plan <profile>`) for CPU
@@ -42,12 +42,26 @@ this phase (the application/tooling layers these profiles will eventually
 carry — S3 dev tools, S4 AI runtime, S5 security tooling — remain
 entirely separate, unimplemented future work).
 
-## S3 — Development
+## S3 — Development *(this repository, in progress)*
 
-Editor/IDE integration (e.g. Zed), language toolchains, Git configuration,
-and container tooling for software development workflows. The `dev`
-profile's hardware resource-policy layer was implemented in S2; the
-actual toolchain/application layer this phase adds is unimplemented.
+Editor/IDE integration (Zed), language toolchains (Python via uv, Node
+via fnm/pnpm, Rust via rustup, Go, C/C++), Git/GitHub CLI, and container
+tooling (Podman/Distrobox) for software development workflows. The
+`dev` profile's hardware resource-policy layer was implemented in S2;
+this phase extends that same profile into a real workload profile
+(packages, toolchain source strategy, configuration templates,
+verification checks) and adds `serein dev status` (read-only tool
+detection), `serein dev capabilities [--json]` (which stacks Serein can
+safely provision, and from where), `serein dev doctor [--json]`
+(profile/manifest/plan integrity, conflict detection), and
+`serein dev plan [component] [--json]` (a deterministic,
+evidence-based install plan — `APPLY`/`NOOP`/`SKIP`/`BLOCKED` per
+action, never executed). See [`docs/development/`](development/architecture.md)
+for the full design and [ADR-0009](adr/0009-python-environment-management.md)
+through [ADR-0012](adr/0012-primary-editor-integration.md). No package
+install, no `~/.gitconfig`/`~/.config/zed` write, and no Apply
+mechanism exists yet — see `docs/development/architecture.md` for
+exactly what "implemented" means at this phase.
 
 ## S4 — AI
 

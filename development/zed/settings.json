@@ -1,0 +1,16 @@
+{
+  "theme": {
+    "mode": "dark",
+    "dark": "One Dark"
+  },
+  "buffer_font_size": 14,
+  "ui_font_size": 14,
+  "format_on_save": "on",
+  "terminal": {
+    "shell": "system",
+    "line_height": "standard"
+  },
+  "tabs": {
+    "git_status": true
+  }
+}
