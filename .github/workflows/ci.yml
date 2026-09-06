@@ -73,3 +73,23 @@ jobs:
           # same reasoning as the desktop doctor step above.
           serein hardware doctor
           serein hardware doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: Development CLI smoke test
+        run: |
+          serein dev status
+          serein dev capabilities
+          serein dev capabilities --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein dev plan
+          serein dev plan --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein dev plan python
+          serein dev plan node
+          serein dev plan rust
+          serein dev plan go
+          serein dev plan cpp
+          serein dev plan containers
+          serein dev plan editor
+          # dev doctor never FAILs merely because a tool isn't installed
+          # (see docs/development/architecture.md) — a stock CI runner
+          # should always exit 0 here.
+          serein dev doctor
+          serein dev doctor --json | python -c "import json,sys; json.load(sys.stdin)"
