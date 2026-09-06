@@ -15,6 +15,21 @@ starts, stops, or restarts the service, and never queries Ollama's
 private model inventory (no `ollama list`/`ollama ps` call anywhere in
 this codebase).
 
+**S4R ownership correction (Section 36-39):** the official installer is
+**system-level, not user-level**. It places the binary under
+`/usr/local/bin` (root-owned), creates a system `ollama` user/group,
+and registers a systemd service — all of which require root. An
+earlier revision modeled this as `requires_root=false, risk="low"`,
+which understated it; `packages.py`'s `ollama` `ToolDefinition` and
+`planner.py`'s `inference.ollama` action now both carry
+`requires_root=true, risk="medium"`, and the action's reason documents
+that reversal is possible but multi-step (removing the service,
+binary, and system user — not a plain file deletion). A future Apply
+must not pipe `curl | sh` as its final mechanism: download and verify
+the installer/artifact first, then execute in a controlled,
+explicit system-mutation step, recording the service/user/group
+changes it made (see docs/ai/security.md).
+
 ## llama.cpp — lightweight, transparent, portable baseline
 
 No official Ubuntu package — source build or a GitHub Releases

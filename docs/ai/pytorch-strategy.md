@@ -10,17 +10,54 @@ See ADR-0014 for the full decision record. Summary:
   tooling directly rather than introducing a second Python package
   manager (S4 brief Section 58).
 - **Installed via PyTorch's own per-backend index URL**
-  (`download.pytorch.org/whl/<cuXXX|rocmX.Y|cpu>`), never plain PyPI
-  for a GPU build — this is PyTorch's own documented recommended
-  mechanism, not a Serein invention.
-- **Exactly one backend variant is planned per environment**, chosen
-  from the classified AI backend (`nvidia_cuda`→cuda,
-  `amd_rocm`→rocm, everything else→cpu) — never multiple variants
-  installed side by side.
+  (`download.pytorch.org/whl/<cuXXX|rocmX.Y|cpu>` for CUDA/ROCm/CPU,
+  PyTorch's native XPU wheel for Intel — never Intel Extension for
+  PyTorch, see docs/ai/intel-strategy.md), never plain PyPI for a GPU
+  build — this is PyTorch's own documented recommended mechanism, not
+  a Serein invention.
+- **Backend selection is runtime-gated, never hardware-candidate-only
+  (S4R correction, Section 4-9).** A hardware backend candidate
+  (`backend.primary`) alone is never sufficient to select an
+  accelerator-specific PyTorch build — see "Runtime-gated backend
+  selection" below.
 - **No hardcoded version pin.** `packages.py`'s `torch` `ToolDefinition`
   documents the index-URL mechanism, not a specific version; a future
   Apply step resolves the exact compatible-current version/index at
   that time.
+
+## Runtime-gated backend selection (S4R correction)
+
+The pre-corrective planner derived the PyTorch build target directly
+from `backend.primary` (the hardware candidate) — meaning an NVIDIA
+machine with no working driver, or an AMD machine with unconfirmed
+ROCm support, would still get `python.pytorch = APPLY` targeting an
+accelerator build that had no real chance of working. This is fixed by
+`pytorch.select_pytorch_backend()` — the single shared decision
+consumed identically by `planner.py`, `capabilities.py`, and
+`status.py`, so they can never derive incompatible conclusions (the
+same discipline S2RM/S3R established for their own subsystems):
+
+| Backend candidate | Runtime evidence                          | `target` | `status`  |
+|--------------------|--------------------------------------------|----------|-----------|
+| none (`cpu`)        | n/a                                          | `cpu`    | `APPLY`   |
+| `unknown` vendor     | n/a                                           | `cpu`    | `APPLY`   |
+| `nvidia_cuda`        | working driver proven (`nvidia-smi` responds) | `cuda`   | `APPLY`   |
+| `nvidia_cuda`        | driver NOT proven                             | `cuda`   | `BLOCKED` |
+| `amd_rocm`           | `rocminfo` confirms no GPU agent               | `cpu`    | `APPLY`   |
+| `amd_rocm`           | `rocminfo` enumerates a GPU agent OR unknown    | `rocm`   | `BLOCKED` |
+| `intel_gpu`          | always (XPU compatibility unverified)          | `xpu`    | `BLOCKED` |
+
+`status="BLOCKED"` means Serein does not silently fall back to a CPU
+build (that would hide a real, resolvable blocker — e.g. "install the
+NVIDIA driver" — from the user) and does not guess an unproven
+accelerator build either. Other AI actions (Ollama, llama.cpp) remain
+independently plannable regardless, so a `BLOCKED` `python.pytorch`
+action never blocks the whole AI profile. See
+`models.PyTorchBackendDecision` and `pytorch.select_pytorch_backend`'s
+docstrings for the full reasoning, and docs/ai/amd-rocm-strategy.md /
+docs/ai/intel-strategy.md for why ROCm/XPU essentially never reach
+`APPLY` in this pass (no reliable framework-compatibility source
+exists for either).
 
 ## Detection: subprocess probe, never an in-process import
 
@@ -47,10 +84,17 @@ exact failure mode a read-only, bounded-timeout detector must avoid.
 `PyTorchStatus.build_backend` reports the *static build variant*
 (`torch.version.cuda`/`torch.version.hip` — plain string attributes
 read at import time, no device access) — never confirmed runtime
-usability. `capabilities.py`'s `pytorch_cuda`/`pytorch_rocm`
-capabilities always report `usable=None` for this reason; only
-`pytorch_cpu` can report `usable=True`, since a CPU build has no
-external runtime dependency beyond the interpreter itself.
+usability by direct GPU access. `capabilities.py`'s `pytorch_cuda`/
+`pytorch_rocm` capabilities derive `usable` from
+`select_pytorch_backend()`'s own decision (S4R Section 41 invariant):
+`True` only when the installed build's backend matches a confirmed-
+ready decision (e.g. a CUDA build with a proven driver), `False` when
+installed but the decision doesn't confirm readiness (e.g. a CUDA
+build with no working driver — a real, useful mismatch signal, also
+surfaced by the doctor's `ai_pytorch_backend_mismatch` check), and
+`None` only when nothing is installed at all. `pytorch_cpu` can report
+`usable=True` directly, since a CPU build has no external runtime
+dependency beyond the interpreter itself.
 
 ## Detection scope: whatever `python3` resolves to on PATH
 

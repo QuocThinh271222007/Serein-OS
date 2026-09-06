@@ -1,12 +1,32 @@
 # Intel GPU Strategy
 
-Deliberately the thinnest vendor module in S4. As of this writing,
-Intel's AI compute stack (PyTorch's XPU backend, Intel Extension for
-PyTorch, OpenVINO) is real but materially less mature and less
-uniformly packaged across distributions than CUDA or ROCm — Serein has
-not verified an end-to-end working path on Ubuntu 26.04 for any of it,
-and S4 declines to encode compatibility claims it cannot back with
-evidence (same principle as amd-rocm-strategy.md).
+Deliberately the thinnest vendor module in S4. Serein has not verified
+an end-to-end working path on Ubuntu 26.04 for any part of Intel's AI
+compute stack, and declines to encode compatibility claims it cannot
+back with evidence (same principle as amd-rocm-strategy.md).
+
+## Forward path: native PyTorch XPU, not Intel Extension for PyTorch (S4R correction)
+
+An earlier revision pointed toward `intel-extension-for-pytorch`
+(IPEX) as Serein's Intel tooling recommendation. This has been
+corrected (S4R Section 31-33): IPEX is the older, separate-package
+mechanism for Intel GPU support, and Intel's own trajectory has been
+to upstream XPU support natively into PyTorch itself (`torch.xpu`,
+selected via PyTorch's own XPU wheel/index the same way the CUDA/ROCm
+variants are — see docs/ai/pytorch-strategy.md and `packages.py`'s
+`torch` entry). Serein's manifest therefore carries **no separate
+Intel tool entry at all** — XPU is represented purely as one more
+`select_pytorch_backend()` target, not a distinct package to install.
+IPEX is not part of Serein's manifest and is not recommended.
+
+**Honest sourcing note:** this correction reflects the documented
+trajectory of PyTorch's own XPU integration as known at the time of
+this pass, not a live-verified 2026 source citation — no live web
+research was performed for this specific corrective (see
+docs/validation/s4/known-blockers.md). Treat the "IPEX is
+superseded/not recommended" framing as directionally correct but
+worth re-confirming against PyTorch's own current release notes before
+this policy is ever used to justify an Apply action.
 
 ## What is detected
 
@@ -19,21 +39,17 @@ never treated as equivalent compute targets (S4 brief Section 39): a
 solo Arc GPU and a solo iGPU produce different `kind` values, and the
 Arc's presence never gets attributed to the iGPU or vice versa.
 
-## Maturity label, not a boolean claim
+## Compatibility label, not a boolean claim
 
-`IntelAIStatus.compute_stack_maturity` is a free-form string
-("unknown" | "unverified") rather than a boolean "supported" — S4 does
-not claim Intel AI compute either works or doesn't; it explicitly
-declines to make that claim without live verification (see
+`IntelAIStatus.xpu_compatibility` is a free-form string ("unknown" is
+the only value this pass ever sets) rather than a boolean "supported"
+— S4 does not claim Intel AI compute either works or doesn't; it
+explicitly declines to make that claim without live verification (see
 docs/validation/s4/known-blockers.md for what would be needed).
-
-## Optional tooling only
-
-`packages.py`'s `intel-extension-for-pytorch` entry is optional and
-not part of any default plan action — `serein ai plan` currently has
-no Intel-specific action at all (see docs/ai/known-limitations.md).
-This is intentional: S4 declined to write a plan action recommending a
-tool stack it cannot verify, rather than guess.
+`select_pytorch_backend()` never returns `target="xpu", status="APPLY"`
+as a result — Intel GPU presence always yields `BLOCKED` (S4R
+Section 8/34/35), the same conservative treatment ROCm gets when
+framework compatibility can't be confirmed.
 
 ## What this module never does
 

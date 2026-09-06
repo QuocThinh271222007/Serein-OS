@@ -59,3 +59,24 @@ plane must stay lightweight and not require heavy runtime dependencies
 - The subprocess-import approach adds real latency (torch import is
   not instant) to `serein ai status`/`capabilities`/`plan` when
   PyTorch is actually installed — an accepted trade-off for safety.
+
+## S4R addendum: runtime-gated backend selection
+
+A defect found in the S4R corrective pass: the *planner* derived the
+target backend for a fresh PyTorch install directly from the hardware
+candidate (`backend.primary`) alone, with no gating on whether that
+backend's runtime was actually usable — an NVIDIA machine with no
+working driver still got `python.pytorch = APPLY` targeting a CUDA
+build. This decision was never wrong at the *detection* layer (this
+ADR's original scope, still accurate), only at the *planning* layer,
+which this ADR did not originally cover.
+
+Fixed by `pytorch.select_pytorch_backend()` — one shared decision
+function consumed identically by `planner.py`, `capabilities.py`, and
+`status.py` (the S2RM/S3R discipline, applied here). See
+docs/ai/pytorch-strategy.md's "Runtime-gated backend selection"
+section for the full state table. `capabilities.py`'s
+`pytorch_cuda`/`pytorch_rocm` `usable` field is no longer
+unconditionally `None` — it is derived from this same decision,
+producing a real `False` for a genuine mismatch (e.g. a CUDA build
+installed with no proven driver).

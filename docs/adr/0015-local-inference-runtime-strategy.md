@@ -60,3 +60,26 @@ S3's existing engine detection instead (see docs/ai/container-strategy.md).
 - `serein ai plan containers` reuses S3's exact Podman-default policy
   unchanged, plus an independent NVIDIA Container Toolkit action gated
   on an actual NVIDIA backend candidate being present.
+
+## S4R addendum: Ollama ownership, and stronger container usability
+
+Two defects found in the S4R corrective pass, both understating real
+risk/requirements:
+
+- **Ollama's official installer is system-level, not user-level.** It
+  writes to `/usr/local/bin` (root-owned), creates a system `ollama`
+  user/group, and registers a systemd service. `requires_root=false,
+  risk="low"` was wrong; both `packages.py` and the
+  `inference.ollama` plan action now carry `requires_root=true,
+  risk="medium"`, with the reason text documenting that reversal is
+  possible but multi-step. See docs/ai/inference-strategy.md.
+- **NVIDIA AI-container "usable" required too little evidence.**
+  `container engine + toolkit installed` was treated as sufficient;
+  it now additionally requires a proven working driver AND real CDI
+  integration evidence (a spec file or a `nvidia-ctk cdi list`
+  read-only query) before `usable=true`. The
+  `containers.nvidia_toolkit` plan action is also now `BLOCKED` (not
+  `APPLY`) when the driver path is unresolved, mirroring the same
+  "prove runtime before provisioning software" discipline
+  ADR-0014's addendum applies to PyTorch. See
+  docs/ai/container-strategy.md.

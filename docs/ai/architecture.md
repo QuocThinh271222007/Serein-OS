@@ -56,10 +56,12 @@ src/serein/ai/
 ├── intel.py        Intel GPU topology + honest maturity label
 ├── python_env.py   importlib.metadata-based Python-AI-package probes
 ├── pytorch.py      PyTorch build-variant detection (subprocess import,
-│                   never torch.cuda.is_available())
-├── inference.py    Ollama + llama.cpp detection
+│                   never torch.cuda.is_available()) + select_pytorch_backend(),
+│                   the one shared runtime-gated backend decision
+│                   consumed by planner/capabilities/status alike
+├── inference.py    Ollama (system-level installer) + llama.cpp detection
 ├── containers.py   reuses S3's container detection + NVIDIA Container
-│                   Toolkit/CDI marker
+│                   Toolkit/CDI evidence (spec file or `nvidia-ctk cdi list`)
 ├── storage.py      HF_HOME/OLLAMA_MODELS convention reporting, never
 │                   a new unified data root
 ├── packages.py     the declarative tool/source manifest (reuses S3's

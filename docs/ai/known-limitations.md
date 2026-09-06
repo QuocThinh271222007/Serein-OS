@@ -30,29 +30,52 @@ dev-tool binaries S3 detects.
 
 Documented at length in docs/ai/pytorch-strategy.md: S4 reports the
 *static build variant* of an installed PyTorch (cuda/rocm/cpu), never
-confirmed runtime usability, because verifying it safely would require
-initializing a device context — exactly the kind of operation that can
-hang on a broken driver, which a bounded, read-only detector must
-avoid. `pytorch_cuda`/`pytorch_rocm` capabilities always report
-`usable=None` for this reason.
+confirmed runtime GPU-access usability, because verifying it safely
+would require initializing a device context — exactly the kind of
+operation that can hang on a broken driver, which a bounded, read-only
+detector must avoid. `pytorch_cuda`/`pytorch_rocm` capabilities derive
+`usable` from `select_pytorch_backend()`'s own runtime-gated decision
+instead (S4R correction) — `True` only when the decision confirms
+readiness (e.g. a proven driver for a CUDA build), `False` for a real,
+useful mismatch (e.g. a CUDA build installed with no working driver),
+`None` only when nothing is installed. This is a meaningfully stronger
+signal than the pre-corrective always-`None` behavior, but it is still
+never based on an actual `torch.cuda.is_available()` call.
 
-## Intel AI compute stack is unverified end-to-end
+## Intel AI compute stack is unverified end-to-end; ROCm/XPU PyTorch selection is intentionally always BLOCKED
 
 `intel.py` reports hardware presence/topology only; no compute-tooling
 detection exists, and `serein ai plan` currently has no Intel-specific
-action at all. This reflects genuine current uncertainty about the
-stack's maturity/packaging on Ubuntu 26.04 (docs/ai/intel-strategy.md),
-not an oversight — S4 declined to encode an unverified plan rather than
-guess.
+plan action at all (XPU is represented purely as a `select_pytorch_backend()`
+target, not a separate action — see docs/ai/intel-strategy.md). This
+reflects genuine current uncertainty about the stack's maturity/
+packaging on Ubuntu 26.04, not an oversight.
+
+Both ROCm and XPU PyTorch selection are, by design, essentially
+**always** `BLOCKED` rather than `APPLY` in this pass (S4R Section 7/8/13,
+Option C: "unknown is acceptable, false certainty is not") — Serein has
+no reliable, non-stale source of PyTorch-ROCm or PyTorch-XPU
+framework-level compatibility data to encode, so it never claims either
+is ready for a fresh install, even when ROCm's own runtime enumerates a
+GPU agent. This is more conservative than the S4R brief's own test
+matrix implicitly hints at (Section 48/49 describe a "proven compatible
+fixture" scenario) — that scenario was deliberately not implemented,
+since fabricating a compatibility-confirmation mechanism Serein
+genuinely doesn't have would contradict the corrective's own Option C
+guidance. A future pass with a real, maintained compatibility source
+could relax this.
 
 ## ROCm support is fundamentally per-machine, not per-model
 
-`amd.py`'s design means Serein can only ever confirm ROCm support
-*after* ROCm's own tooling is already installed — there is no way to
-know in advance for a genuinely clean AMD machine (see
+`amd.py`'s design means Serein can only ever confirm ROCm *runtime
+enumeration* (real evidence ROCm/HSA recognizes the hardware) *after*
+ROCm's own tooling is already installed — there is no way to know in
+advance for a genuinely clean AMD machine (see
 docs/ai/amd-rocm-strategy.md). This is a deliberate, honest limitation:
 the alternative (a GPU-ID support table) goes stale immediately and was
-explicitly rejected.
+explicitly rejected. Separately, and even when that runtime enumeration
+succeeds, PyTorch's own framework-level compatibility remains a
+distinct, always-unresolved question (see the section above).
 
 ## Live validation is Tier B (package/metadata only)
 
@@ -96,6 +119,23 @@ status` on this host correctly reports a working NVIDIA driver
 honest behavior**, not a bug: the driver signal and the hardware-topology
 signal come from genuinely different evidence sources, and S4 does not
 paper over the discrepancy by picking one arbitrarily.
+
+## S4R corrective was not accompanied by fresh live web research
+
+The S4R corrective brief (Section 60) asked for current 2026 sources
+to be re-verified for PyTorch CUDA/XPU install mechanisms, IPEX
+EOL/current status, AMD ROCm compatibility, NVIDIA Container Toolkit
+CDI behavior, and Ollama's installer behavior. This pass did **not**
+perform live web research for these — the semantic/architectural
+corrections (runtime gating, ROCm's three-question model, the CUDA
+Toolkit detection fix, Ollama's ownership model, IPEX's removal from
+the manifest) are all sound on their own reasoning and were verified
+against this session's own live Ubuntu 26.04 package evidence
+(docs/validation/s4/), but the *specific claim* "IPEX is being
+superseded by native PyTorch XPU support" is stated with an explicit
+honesty caveat in docs/ai/intel-strategy.md rather than cited to a
+live 2026 source. Treat that one claim as directionally reasonable,
+not independently re-verified this pass.
 
 ## No distributed-training platform
 

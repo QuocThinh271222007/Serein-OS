@@ -10,30 +10,58 @@ and Serein has no reliable way to map a raw PCI device ID to a
 human-readable model name/architecture without one anyway (S4 brief
 Section 91).
 
-## The evidence-based alternative
+## The evidence-based alternative: three separate questions (S4R correction)
 
-`RocmSupportInfo.supported` is derived **exclusively** from ROCm's own
-runtime tooling actually running, never from vendor ID:
+An earlier revision collapsed three genuinely different questions into
+one `supported: bool | None` field, which overstated its own evidence
+(Section 11/12 of the S4R corrective). `RocmSupportInfo` now
+distinguishes them explicitly:
 
-| State                                              | `supported` | confidence |
-|------------------------------------------------------|-------------|------------|
-| `rocminfo` not installed                              | `None`      | low        |
-| `rocminfo` installed, enumerates a `Device Type: GPU`  | `True`      | high       |
-| `rocminfo` installed, reports no GPU agent             | `False`     | high       |
+1. **Is the ROCm runtime installed at all?** (`runtime_installed` — the
+   `rocminfo` binary exists.)
+2. **Does that runtime enumerate a GPU agent?** (`gpu_enumerated` —
+   `rocminfo`'s own output reports a `Device Type: GPU` entry.) This is
+   real, local evidence ROCm/HSA recognizes the hardware.
+3. **Is PyTorch's own ROCm-wheel/MIOpen/framework-level compatibility
+   established** for this exact GPU/framework combination? **This
+   module does not answer that question at all.** `gpu_enumerated=True`
+   is real hardware-runtime evidence, but it is explicitly never read
+   as proof of framework-level compatibility — that gate lives in
+   `pytorch.select_pytorch_backend` (see docs/ai/pytorch-strategy.md),
+   which stays conservative (`BLOCKED`) even when ROCm enumerates the
+   GPU, because no reliable, non-stale source of PyTorch-ROCm
+   compatibility data exists for Serein to encode (S4R Section 13,
+   Option C: "unknown is acceptable, false certainty is not").
 
-Because `supported` can only ever be non-`None` when `rocminfo` is
-already installed, the planner's `amd.rocm` action collapses to two
-reachable states once AMD hardware is present: `rocminfo` already
-installed → `NOOP` (regardless of what it reports — an
-installed-but-unsupported combination is the doctor's
+| State                                                  | `runtime_installed` | `gpu_enumerated` | confidence |
+|-----------------------------------------------------------|----------------------|-------------------|------------|
+| `rocminfo` not installed                                   | `False`              | `None`            | low        |
+| `rocminfo` installed, enumerates a `Device Type: GPU`       | `True`               | `True`            | high       |
+| `rocminfo` installed, reports no GPU agent                  | `True`               | `False`           | high       |
+
+Because `gpu_enumerated` can only ever be non-`None` when `rocminfo` is
+already installed, the planner's `amd.rocm` action (which only governs
+the ROCm *runtime* itself, not whether PyTorch should target it)
+collapses to two reachable states once AMD hardware is present:
+`rocminfo` already installed → `NOOP` (regardless of what it reports —
+an installed-but-unsupported combination is the doctor's
 `ai_rocm_unsupported_hardware` check's job to `WARN` about, not
-something reinstalling ROCm would fix), or `rocminfo` absent → `BLOCKED`
-("support unknown, Serein does not guess from vendor ID alone"). See
-`planner.py::_rocm_action`'s docstring for the full reasoning — this
-was a real defect caught and fixed during S4 development (two branches
-referencing `supported is False`/`supported is True` in the pre-install
-path were unreachable dead code, since reaching either always implied
-`rocminfo` was already installed).
+something reinstalling ROCm would fix), or `rocminfo` absent →
+`BLOCKED` ("support unknown, Serein does not guess from vendor ID
+alone"). See `planner.py::_rocm_action`'s docstring for the full
+reasoning.
+
+## PyTorch ROCm selection is separately, always conservative
+
+Even when `gpu_enumerated=True` (ROCm's own runtime confirms it
+recognizes the GPU), `select_pytorch_backend()` still returns
+`target="rocm", status="BLOCKED"` — never `APPLY`. This is a
+deliberate policy choice (S4R Section 7/13), not an oversight: hardware
+recognition by ROCm's own runtime is not the same claim as "PyTorch's
+ROCm wheel is known to work on this exact GPU," and Serein has no
+stable source for the latter to encode. A future pass with a verified
+compatibility source could relax this; until then, `rocm` never
+reaches `APPLY` for a fresh PyTorch install, by design.
 
 ## Install source (verified live, corrected from initial assumption)
 

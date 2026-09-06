@@ -27,10 +27,14 @@ independent layer on top, never a reason to switch engines.
 re-probing) and adds:
 
 - `nvidia_container_toolkit` — an `nvidia-ctk --version` probe.
-- `cdi_nvidia_generated` — whether a real CDI spec file exists at
-  `/etc/cdi/nvidia.yaml` or `/var/run/cdi/nvidia.yaml` (existence
-  only, contents never read; Serein never runs
-  `nvidia-ctk cdi generate` itself).
+- `cdi_nvidia_generated` — CDI integration evidence from **two**
+  read-only sources (S4R Section 27/28 correction — current NVIDIA
+  Container Toolkit releases can generate/manage CDI specs
+  automatically, so a static file is not the only valid signal): a
+  real spec file at `/etc/cdi/nvidia.yaml`/`/var/run/cdi/nvidia.yaml`
+  (existence only, contents never read), OR a successful, read-only
+  `nvidia-ctk cdi list` reporting a real `nvidia.com/gpu` device entry.
+  Serein never runs `nvidia-ctk cdi generate` itself.
 
 ## Planning
 
@@ -38,6 +42,17 @@ re-probing) and adds:
 backend candidate was actually classified (Section 43 — planning
 NVIDIA Container Toolkit on a machine with no NVIDIA GPU at all would
 be nonsensical) and the environment isn't itself a nested container.
+
+**S4R correction (Section 25/26/29/30):** the action is also `BLOCKED`
+(not `APPLY`) when an NVIDIA backend candidate exists but the driver
+hasn't been proven working yet — the toolkit would not be usable
+without a driver, so provisioning it first would be premature.
+Correspondingly, `capabilities.py`'s `ai_container_runtime` capability
+now requires the **full evidence chain** for `usable=true`: a working
+driver, a container engine, the NVIDIA Container Toolkit, AND real CDI
+integration evidence — engine+toolkit alone is no longer sufficient
+(the pre-corrective behavior understated what "usable" should mean).
+
 `containers.engine`'s action mirrors S3's exactly: `NOOP` if either
 engine is already present (never a forced choice between them),
 `APPLY` podman otherwise, `SKIP` inside a nested container.
