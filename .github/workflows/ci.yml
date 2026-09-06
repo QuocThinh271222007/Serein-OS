@@ -93,3 +93,20 @@ jobs:
           # should always exit 0 here.
           serein dev doctor
           serein dev doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: AI CLI smoke test
+        run: |
+          serein ai status
+          serein ai capabilities
+          serein ai capabilities --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein ai plan
+          serein ai plan --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein ai plan pytorch
+          serein ai plan inference
+          serein ai plan containers
+          serein ai plan voice
+          # ai doctor never FAILs merely because no GPU/AI stack is
+          # installed (see docs/ai/architecture.md) — a stock CI runner
+          # with no GPU should always exit 0 here.
+          serein ai doctor
+          serein ai doctor --json | python -c "import json,sys; json.load(sys.stdin)"

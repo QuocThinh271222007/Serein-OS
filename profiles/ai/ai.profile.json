@@ -2,14 +2,15 @@
   "schema_version": 1,
   "id": "ai",
   "name": "AI Workstation",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "status": "implemented",
-  "description": "Hardware resource policy for compute-heavy local AI workloads: CPU energy preference biased toward 'performance' when on AC power or on a desktop, GPU topology reporting (compute-capable GPU presence, without requiring one), and the same evidence-based memory/storage policy as other profiles. This is resource policy only \u2014 CUDA/ROCm/PyTorch/Ollama installation is S4 scope and is not touched here. A host with no discrete GPU is still a valid 'ai' profile target (CPU-only inference). See docs/hardware/architecture.md.",
+  "description": "Combines the S2 hardware resource policy (CPU energy preference biased toward performance, GPU topology reporting, evidence-based memory/storage policy) with the S4 AI-workstation software layer: hardware-backend classification (NVIDIA/AMD/Intel/CPU), NVIDIA driver/CUDA-Toolkit/container-toolkit detection, ROCm runtime-evidence-based support checking, PyTorch/Transformers-baseline/inference-runtime (Ollama, llama.cpp) detection, and deterministic AI planning. No driver, CUDA, ROCm, or Python package is installed and no model is downloaded by this repository - see docs/ai/architecture.md and docs/ai/known-limitations.md for what 'implemented' means here.",
   "dependencies": [
     "core"
   ],
   "conflicts": [],
   "packages": [
+    "ffmpeg",
     "power-profiles-daemon",
     "systemd-zram-generator"
   ],
@@ -28,10 +29,17 @@
     "hardware_gpu_topology_confidence",
     "hardware_profile_plan_generation",
     "hardware_virtualization_guard",
-    "hardware_required_resources"
+    "hardware_required_resources",
+    "ai_profile_integrity",
+    "ai_package_manifest",
+    "ai_plan_generation",
+    "ai_backend_consistency",
+    "ai_cuda_toolkit_conflict",
+    "ai_rocm_unsupported_hardware",
+    "ai_container_engine_conflict"
   ],
   "rollback": {
     "supported": false,
-    "notes": "No Apply mechanism exists yet in S2; serein hardware plan is read-only. See docs/hardware/architecture.md for what a future Apply step would need."
+    "notes": "No Apply mechanism exists yet in S2/S4; serein hardware plan and serein ai plan are both read-only. See docs/hardware/architecture.md and docs/ai/architecture.md for what a future Apply step would need."
   }
 }

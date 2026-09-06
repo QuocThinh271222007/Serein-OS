@@ -9,6 +9,10 @@ from pathlib import Path
 import jsonschema
 import pytest
 
+from serein.ai.capabilities import build_ai_capabilities
+from serein.ai.doctor import run_ai_checks
+from serein.ai.planner import VALID_COMPONENTS as AI_VALID_COMPONENTS
+from serein.ai.planner import build_ai_plan
 from serein.desktop.doctor import run_desktop_checks
 from serein.desktop.plan import build_desktop_plan
 from serein.desktop.status import build_desktop_status
@@ -43,6 +47,8 @@ def _load_schema(name: str) -> dict:
         "hardware-capabilities.schema.json",
         "development-plan.schema.json",
         "development-capabilities.schema.json",
+        "ai-plan.schema.json",
+        "ai-capabilities.schema.json",
     ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:
@@ -153,4 +159,29 @@ def test_development_focused_plan_validates_against_schema(component: str) -> No
 def test_development_doctor_report_validates_against_schema() -> None:
     schema = _load_schema("doctor-report.schema.json")
     report = run_development_checks()
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+def test_ai_capabilities_validates_against_schema() -> None:
+    schema = _load_schema("ai-capabilities.schema.json")
+    report = build_ai_capabilities()
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+def test_ai_plan_validates_against_schema() -> None:
+    schema = _load_schema("ai-plan.schema.json")
+    plan = build_ai_plan()
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+@pytest.mark.parametrize("component", list(AI_VALID_COMPONENTS))
+def test_ai_focused_plan_validates_against_schema(component: str) -> None:
+    schema = _load_schema("ai-plan.schema.json")
+    plan = build_ai_plan(component)
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+def test_ai_doctor_report_validates_against_schema() -> None:
+    schema = _load_schema("doctor-report.schema.json")
+    report = run_ai_checks()
     jsonschema.validate(instance=report.to_dict(), schema=schema)
