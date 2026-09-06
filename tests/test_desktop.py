@@ -187,6 +187,26 @@ class TestDesktopDoctor:
         assert by_id["desktop_sddm_availability"].status is CheckStatus.FAIL
         assert report.exit_code == 1
 
+    def test_target_ubuntu_version_is_pass(self, host_root):
+        report = run_desktop_checks(host_root("amd_desktop"), env={})
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["desktop_os_compatibility"].status is CheckStatus.PASS
+
+    def test_other_ubuntu_version_is_warn(self, host_root):
+        report = run_desktop_checks(host_root("ubuntu_2404"), env={})
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["desktop_os_compatibility"].status is CheckStatus.WARN
+
+    def test_non_ubuntu_linux_is_warn(self, host_root):
+        report = run_desktop_checks(host_root("non_ubuntu_linux"), env={})
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["desktop_os_compatibility"].status is CheckStatus.WARN
+
+    def test_missing_os_data_is_warn(self, host_root):
+        report = run_desktop_checks(host_root("missing_data"), env={})
+        by_id = {c.id: c for c in report.checks}
+        assert by_id["desktop_os_compatibility"].status is CheckStatus.WARN
+
     def test_wayland_session_pass_x11_warn_none_skip(self, host_root):
         root = host_root("amd_desktop")
         wayland = run_desktop_checks(root, env={"XDG_SESSION_TYPE": "wayland"})

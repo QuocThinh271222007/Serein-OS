@@ -14,12 +14,10 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from serein.desktop.detect import detect_availability, detect_config_state, detect_session
-from serein.desktop.models import SCHEMA_VERSION, DesktopStatusReport
+from serein.desktop.models import SCHEMA_VERSION, TARGET_UBUNTU_VERSION, DesktopStatusReport
 from serein.hardware._util import DEFAULT_ROOT
 from serein.hardware.os_release import read_os_release
 from serein.profiles.registry import list_profiles
-
-_TARGET_UBUNTU_VERSION = "26.04"
 
 
 def _os_compatibility(root: Path) -> str:
@@ -28,7 +26,7 @@ def _os_compatibility(root: Path) -> str:
         return "unknown (no /etc/os-release found)"
     if not os_info.is_ubuntu:
         return f"unsupported ({os_info.pretty_name or os_info.id})"
-    if os_info.version_id == _TARGET_UBUNTU_VERSION:
+    if os_info.version_id == TARGET_UBUNTU_VERSION:
         return "supported"
     return f"untested (Ubuntu {os_info.version_id or 'unknown'})"
 

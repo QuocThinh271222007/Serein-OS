@@ -22,6 +22,7 @@ from pathlib import Path
 
 from serein.desktop.config import RESOURCES, missing_resources
 from serein.desktop.detect import detect_availability, detect_config_state, detect_session
+from serein.desktop.models import TARGET_UBUNTU_VERSION
 from serein.doctor.models import SCHEMA_VERSION, CheckResult, CheckStatus, DoctorReport
 from serein.hardware._util import DEFAULT_ROOT, is_real_root
 from serein.hardware.os_release import read_os_release
@@ -63,10 +64,16 @@ def _check_os_compatibility(root: Path, _env: Mapping[str, str]) -> CheckResult:
     if not os_info.id:
         detail = "No /etc/os-release found; compatibility unknown."
         return CheckResult(check_id, title, CheckStatus.WARN, detail)
-    if os_info.is_ubuntu:
-        detail = f"Ubuntu {os_info.version_id or 'unknown version'} detected."
+    if not os_info.is_ubuntu:
+        detail = f"Non-Ubuntu OS detected ({os_info.pretty_name or os_info.id}); untested."
+        return CheckResult(check_id, title, CheckStatus.WARN, detail)
+    if os_info.version_id == TARGET_UBUNTU_VERSION:
+        detail = f"Ubuntu {TARGET_UBUNTU_VERSION} detected (Serein Desktop's target release)."
         return CheckResult(check_id, title, CheckStatus.PASS, detail)
-    detail = f"Non-Ubuntu OS detected ({os_info.pretty_name or os_info.id}); untested."
+    detail = (
+        f"Ubuntu {os_info.version_id or 'unknown version'} detected; "
+        f"Serein Desktop targets {TARGET_UBUNTU_VERSION} and this release is untested."
+    )
     return CheckResult(check_id, title, CheckStatus.WARN, detail)
 
 

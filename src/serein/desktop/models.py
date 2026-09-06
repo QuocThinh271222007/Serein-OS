@@ -20,6 +20,12 @@ SCHEMA_VERSION = 1
 #: about.
 DESKTOP_CONFIG_VERSION = 1
 
+#: The one Ubuntu release Serein Desktop actively targets. Shared by
+#: ``status.py`` (os_compatibility string) and ``doctor.py`` (PASS/WARN
+#: semantics) so the two surfaces can never silently disagree about which
+#: release is "supported" — see docs/validation/s1r/known-blockers.md.
+TARGET_UBUNTU_VERSION = "26.04"
+
 
 @dataclass
 class DesktopAvailability:
