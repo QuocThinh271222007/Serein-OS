@@ -1,0 +1,15 @@
+{
+    "KPackageStructure": "Plasma/LookAndFeel",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Serein OS project"
+            }
+        ],
+        "Description": "Serein's default quiet, dark, workstation-oriented panel layout and color scheme, layered on upstream Breeze.",
+        "Icon": "preferences-desktop-theme",
+        "Id": "org.serein.desktop",
+        "Name": "Serein Dark",
+        "Version": "0.1.0"
+    }
+}

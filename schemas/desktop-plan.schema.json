@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/desktop-plan.schema.json",
+  "title": "Serein Desktop Installation Plan",
+  "description": "Output of `serein desktop plan --json`. Deterministic; describes intended future action, not something that has been applied.",
+  "type": "object",
+  "required": ["schema_version", "packages", "system_configuration", "user_configuration", "verification"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "packages": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "system_configuration": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/planStep" }
+    },
+    "user_configuration": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/planStep" }
+    },
+    "verification": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  },
+  "$defs": {
+    "planStep": {
+      "type": "object",
+      "required": ["category", "action", "detail"],
+      "additionalProperties": false,
+      "properties": {
+        "category": { "type": "string", "enum": ["system", "user"] },
+        "action": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    }
+  }
+}

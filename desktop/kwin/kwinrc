@@ -1,0 +1,27 @@
+# Serein KWin distribution defaults.
+#
+# Ships as /etc/xdg/kwinrc (installed by a future Apply step; not applied
+# by S1). Per docs/desktop/configuration-ownership.md, this is a
+# lower-priority layer beneath each user's ~/.config/kwinrc: any key a
+# user has already set, or sets from System Settings, always wins.
+#
+# Conservative, workstation-oriented defaults only — no exotic scripts,
+# no compositor safety mechanisms disabled, no unsupported latency tweaks.
+
+[Compositing]
+AnimationSpeed=3
+Enabled=true
+WindowsBlockCompositing=true
+
+[Desktops]
+Number=4
+Rows=1
+Desktop_1_Name=Main
+Desktop_2_Name=Work
+Desktop_3_Name=Auxiliary
+Desktop_4_Name=Temporary
+
+[Windows]
+BorderlessMaximizedWindows=false
+FocusPolicy=ClickToFocus
+RollOverDesktops=false
