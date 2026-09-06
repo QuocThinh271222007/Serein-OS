@@ -442,7 +442,7 @@ def _cmd_ai_status(_args: argparse.Namespace) -> int:
     print("AMD")
     print(f"  hardware       {'yes' if status.amd.hardware_present else 'no'}")
     print(_tool_line("rocminfo", status.amd.rocminfo))
-    print(f"  ROCm support   {_yes_no_unknown(status.amd.rocm_support.supported)}")
+    print(f"  GPU enumerated {_yes_no_unknown(status.amd.rocm_support.gpu_enumerated)}")
     print()
     print("Intel")
     print(f"  hardware       {'yes' if status.intel.hardware_present else 'no'}")
@@ -451,6 +451,9 @@ def _cmd_ai_status(_args: argparse.Namespace) -> int:
     print("PyTorch")
     print(_tool_line("torch", status.pytorch.installed))
     print(f"  backend        {status.pytorch.build_backend or 'n/a'}")
+    decision = status.pytorch_decision
+    print(f"  plan target    {decision.target} ({decision.status.lower()})")
+    print(f"  plan reason    {decision.reason}")
     print()
     print("Python AI packages")
     print(_tool_line("transformers", status.python_packages.transformers))

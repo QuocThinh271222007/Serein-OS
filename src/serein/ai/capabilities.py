@@ -26,7 +26,7 @@ from serein.ai.models import (
 from serein.ai.models import AICapability as Capability
 from serein.ai.nvidia import detect_nvidia_status
 from serein.ai.python_env import detect_python_ai_packages
-from serein.ai.pytorch import detect_pytorch_status
+from serein.ai.pytorch import detect_pytorch_status, select_pytorch_backend
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.hardware._util import DEFAULT_ROOT
 from serein.hardware.gpu import detect_gpus
@@ -102,20 +102,27 @@ def build_ai_capabilities(
             )
         )
 
+    marker_only = nvidia.cuda_toolkit_marker_present and not nvidia.cuda_toolkit_installed
     capabilities.append(
         Capability(
             "cuda_toolkit", True, nvidia.cuda_toolkit_installed,
             nvidia.cuda_toolkit_installed if nvidia.hardware_present else None,
-            "nvcc / /usr/local/cuda marker", "ubuntu-repository", "high",
-            "Detected independently of the driver's CUDA version - see "
-            "docs/ai/nvidia-strategy.md.",
+            "nvcc / dpkg cuda-toolkit package state", "ubuntu-repository", "high",
+            (
+                "A /usr/local/cuda marker exists but is not, by itself, "
+                "proof of installation (nvcc/dpkg found nothing) - possibly "
+                "stale or incomplete." if marker_only else
+                "Detected independently of the driver's CUDA version, via "
+                "nvcc or real dpkg package state - never a bare "
+                "/usr/local/cuda marker alone. See docs/ai/nvidia-strategy.md."
+            ),
         )
     )
 
     capabilities.append(
         Capability(
-            "rocm_runtime", amd.hardware_present, amd.rocminfo.installed,
-            amd.rocm_support.supported, "rocminfo", "ubuntu-repository",
+            "rocm_runtime", amd.hardware_present, amd.rocm_support.runtime_installed,
+            amd.rocm_support.gpu_enumerated, "rocminfo", "ubuntu-repository",
             amd.rocm_support.confidence, amd.rocm_support.reason,
         )
     )
@@ -123,11 +130,15 @@ def build_ai_capabilities(
     capabilities.append(
         Capability(
             "intel_gpu_runtime", intel.hardware_present, False, None, None, None, "low",
-            "Intel AI compute stack maturity not currently verified end-to-end "
-            "by Serein - see docs/ai/intel-strategy.md."
+            "PyTorch's native XPU backend compatibility for this hardware is "
+            "not currently verified by Serein (Intel Extension for PyTorch "
+            "is not Serein's recommended path) - see "
+            "docs/ai/intel-strategy.md."
             if intel.hardware_present else "No Intel GPU detected.",
         )
     )
+
+    pytorch_decision = select_pytorch_backend(backend, nvidia, amd, intel)
 
     capabilities.append(
         Capability(
@@ -138,24 +149,34 @@ def build_ai_capabilities(
         )
     )
 
+    # Section 41 invariant: usable is only ever True for a build variant
+    # that matches select_pytorch_backend()'s own confirmed-ready decision
+    # - never derived independently of it.
     nvidia_backend_present = any(c.backend == "nvidia_cuda" for c in backend.candidates)
+    cuda_installed = pytorch.installed.installed and pytorch.build_backend == "cuda"
+    cuda_ready = pytorch_decision.target == "cuda" and pytorch_decision.status == "APPLY"
     capabilities.append(
         Capability(
-            "pytorch_cuda", nvidia_backend_present,
-            pytorch.installed.installed and pytorch.build_backend == "cuda", None,
+            "pytorch_cuda", nvidia_backend_present, cuda_installed,
+            (True if (cuda_installed and cuda_ready) else (False if cuda_installed else None)),
             "python-package-index index URL", "python-package-index", "medium",
             "torch.cuda.is_available() is never called by Serein (S4 brief "
-            "Section 8/61); only the static build variant is reported.",
+            "Section 8/61); usable reflects select_pytorch_backend()'s "
+            "runtime-gated decision, never the hardware candidate alone.",
         )
     )
 
     amd_backend_present = any(c.backend == "amd_rocm" for c in backend.candidates)
+    rocm_installed = pytorch.installed.installed and pytorch.build_backend == "rocm"
+    rocm_ready = pytorch_decision.target == "rocm" and pytorch_decision.status == "APPLY"
     capabilities.append(
         Capability(
-            "pytorch_rocm", amd_backend_present,
-            pytorch.installed.installed and pytorch.build_backend == "rocm", None,
+            "pytorch_rocm", amd_backend_present, rocm_installed,
+            (True if (rocm_installed and rocm_ready) else (False if rocm_installed else None)),
             "python-package-index index URL", "python-package-index", "medium",
-            "Runtime usability not verified, same reasoning as pytorch_cuda.",
+            "ROCm GPU enumeration alone never implies PyTorch-ROCm "
+            "framework compatibility; usable reflects "
+            "select_pytorch_backend()'s conservative decision.",
         )
     )
 
@@ -219,18 +240,42 @@ def build_ai_capabilities(
 
     container_installed = containers.podman.installed or containers.docker.installed
     if nvidia_backend_present:
-        ai_container_usable = container_installed and containers.nvidia_container_toolkit.installed
-        reason = (
-            "GPU container passthrough requires both a container engine and "
-            "the NVIDIA Container Toolkit (current CDI-based mechanism)."
+        # Full GPU-container usability requires every link in the chain:
+        # a working driver, a container engine, the NVIDIA Container
+        # Toolkit, and real CDI integration evidence - engine+toolkit
+        # alone is not sufficient (S4R Section 25/26/29).
+        driver_ready = nvidia.driver_version is not None
+        toolkit_installed = containers.nvidia_container_toolkit.installed
+        cdi_evidenced = containers.cdi_nvidia_generated
+        ai_container_usable = (
+            driver_ready and container_installed and toolkit_installed and cdi_evidenced
         )
+        if not driver_ready:
+            reason = (
+                "NVIDIA driver not confirmed working; GPU container "
+                "passthrough cannot be usable without it."
+            )
+        elif not container_installed:
+            reason = "No container engine installed."
+        elif not toolkit_installed:
+            reason = "NVIDIA Container Toolkit not installed."
+        elif not cdi_evidenced:
+            reason = (
+                "No CDI integration evidence found (neither a spec file "
+                "nor `nvidia-ctk cdi list`)."
+            )
+        else:
+            reason = (
+                "Driver, container engine, NVIDIA Container Toolkit, and "
+                "CDI integration all confirmed."
+            )
     else:
         ai_container_usable = container_installed
         reason = "No NVIDIA backend candidate; a plain container engine suffices."
     capabilities.append(
         Capability(
             "ai_container_runtime", True, container_installed, ai_container_usable,
-            "podman/docker + nvidia-ctk", "ubuntu-repository", "medium", reason,
+            "podman/docker + nvidia-ctk + CDI", "ubuntu-repository", "medium", reason,
         )
     )
 

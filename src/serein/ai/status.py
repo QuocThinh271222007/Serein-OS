@@ -20,7 +20,7 @@ from serein.ai.intel import detect_intel_status
 from serein.ai.models import AIStatusReport
 from serein.ai.nvidia import detect_nvidia_status
 from serein.ai.python_env import detect_python_ai_packages
-from serein.ai.pytorch import detect_pytorch_status
+from serein.ai.pytorch import detect_pytorch_status, select_pytorch_backend
 from serein.ai.storage import build_ai_storage_info
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.hardware._util import DEFAULT_ROOT
@@ -39,15 +39,21 @@ def build_ai_status(
     gpu_policy = detect_gpu_policy(root, gpus)
     backend = classify_backend(gpus, gpu_policy)
 
+    nvidia = detect_nvidia_status(gpu_policy, runner=runner, root=root)
+    amd = detect_amd_status(gpu_policy, runner=runner)
+    intel = detect_intel_status(gpu_policy)
+    pytorch = detect_pytorch_status(runner=runner)
+
     return AIStatusReport(
         schema_version=1,
         profile_id="ai",
         profile_status=ai_profile.status if ai_profile else "declared",
         backend=backend,
-        nvidia=detect_nvidia_status(gpu_policy, runner=runner, root=root),
-        amd=detect_amd_status(gpu_policy, runner=runner),
-        intel=detect_intel_status(gpu_policy),
-        pytorch=detect_pytorch_status(runner=runner),
+        nvidia=nvidia,
+        amd=amd,
+        intel=intel,
+        pytorch=pytorch,
+        pytorch_decision=select_pytorch_backend(backend, nvidia, amd, intel),
         python_packages=detect_python_ai_packages(runner=runner),
         inference=detect_inference_status(runner=runner),
         containers=detect_ai_container_status(runner=runner, root=root),
