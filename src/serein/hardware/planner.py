@@ -21,7 +21,7 @@ from pathlib import Path
 from serein.hardware._util import DEFAULT_ROOT
 from serein.hardware.cpu_policy import detect_cpu_policy
 from serein.hardware.gpu_policy import detect_gpu_policy
-from serein.hardware.memory_policy import detect_memory_policy
+from serein.hardware.memory_policy import detect_memory_policy, detect_zram_capability
 from serein.hardware.models import (
     PLAN_SCHEMA_VERSION,
     CPUPolicyInfo,
@@ -150,10 +150,15 @@ def _power_profile_action(profile_id: str, power_policy: PowerPolicyInfo) -> Pla
 
 
 def _zram_action(
-    ram_bytes: int | None, memory_policy: MemoryPolicyInfo, environment: EnvironmentInfo
+    root: Path,
+    ram_bytes: int | None,
+    memory_policy: MemoryPolicyInfo,
+    environment: EnvironmentInfo,
 ) -> PlanAction:
     action_id, component, action = "memory.zram", "memory", "configure_zram"
 
+    # A. An active device wins over everything, including virtualization -
+    # observed state is stronger evidence than any guard.
     if memory_policy.zram_devices:
         detail = (
             f"An active ZRAM device already exists ({memory_policy.zram_devices[0].name}); "
@@ -164,6 +169,7 @@ def _zram_action(
             "high", False, True, "none",
             "cat /sys/block/zram0/comp_algorithm", "NOOP",
         )
+    # B. A real, meaningful config source is equally strong evidence.
     if memory_policy.zram_generator_config_sources:
         sources = ", ".join(memory_policy.zram_generator_config_sources)
         note = " (multiple sources - precedence not resolved by Serein)" if (
@@ -175,6 +181,8 @@ def _zram_action(
             "high", False, True, "none",
             "cat /sys/block/zram0/comp_algorithm", "NOOP",
         )
+    # C. WSL/container: Serein does not own the host kernel/block-device
+    # policy, regardless of what sysfs might otherwise suggest.
     if _virtualized(environment):
         return PlanAction(
             action_id, component, action, None, "not configured",
@@ -184,10 +192,24 @@ def _zram_action(
             "proposing configuration here would never take effect.",
             "high", False, True, "none", "n/a", "SKIP",
         )
+    # D. Sizing cannot be computed safely without RAM size.
     if ram_bytes is None:
         return PlanAction(
             action_id, component, action, _ZRAM_TARGET_DESCRIPTION, "not configured",
             "RAM size could not be determined; ZRAM cannot be sized safely without it.",
+            "low", False, True, "none", "n/a", "BLOCKED",
+        )
+    # E/F. Gate on the exact same capability serein.hardware.capabilities
+    # reports - a planner must never propose APPLY for a mechanism the
+    # capability model says is unavailable (S2R micro-corrective).
+    capability = detect_zram_capability(root, environment, memory_policy)
+    if not capability.available:
+        return PlanAction(
+            action_id, component, action, _ZRAM_TARGET_DESCRIPTION, "not configured",
+            "ZRAM support could not be confirmed on this host; no zram-control "
+            "interface, loaded zram module, or existing ZRAM device was detected. "
+            "Serein will not propose configuration without evidence that the "
+            "mechanism is available.",
             "low", False, True, "none", "n/a", "BLOCKED",
         )
     return PlanAction(
@@ -305,7 +327,7 @@ def build_hardware_plan(profile_id: str, root: Path = DEFAULT_ROOT) -> HardwareP
     actions = [
         _cpu_action(profile_id, cpu_policy, hw.environment, hw.power),
         _power_profile_action(profile_id, power_policy),
-        _zram_action(hw.memory.total_bytes, memory_policy, hw.environment),
+        _zram_action(root, hw.memory.total_bytes, memory_policy, hw.environment),
         *_storage_actions(storage_policy, hw.environment),
         _gpu_action(profile_id, gpu_policy),
     ]

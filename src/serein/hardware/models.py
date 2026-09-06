@@ -141,6 +141,19 @@ class MemoryPolicyInfo:
     zram_generator_config_ambiguous: bool = False
 
 
+@dataclass(frozen=True)
+class ZramCapability:
+    """The single source of truth for "can Serein manage ZRAM here" —
+    shared by ``capabilities.py`` (reports it directly) and
+    ``planner.py`` (gates ``memory.zram`` on it), so the two can never
+    diverge. See ``memory_policy.detect_zram_capability``."""
+
+    available: bool
+    confidence: str  # "high" | "medium" | "low"
+    mechanism: str
+    reason: str
+
+
 @dataclass
 class StorageSchedulerInfo:
     name: str | None = None

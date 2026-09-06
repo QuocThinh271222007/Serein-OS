@@ -87,6 +87,14 @@ model S1 established for the desktop layer:
 - **Plan** answers "given a workload profile, what would Serein actually
   propose" — evidence-based, never guessed.
 
+**Capability/planner consistency (S2R micro-corrective):** a planner
+must never propose `APPLY` for a mechanism the capability model reports
+as unavailable. Where a capability and a plan action both exist for the
+same mechanism, they now share one detection function rather than each
+independently deriving an answer — `memory.zram`'s ZRAM capability check
+is the first (and, as of this pass, only) mechanism where this was
+enforced; see `docs/hardware/memory-policy.md`.
+
 ## Why every profile always generates a plan, never crashes
 
 `planner.build_hardware_plan()` never raises for a supported profile id —

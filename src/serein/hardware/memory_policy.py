@@ -15,6 +15,12 @@ files) is no longer a false positive for "already configured". Search
 paths and precedence are exactly as documented in the real, installed
 ``zram-generator.conf(5)`` (verified against systemd-zram-generator
 1.2.1-2 on Ubuntu 26.04 — see ``docs/validation/s2r/zram-validation.md``).
+
+S2R micro-corrective: ``detect_zram_capability`` is the single source of
+truth for "can Serein manage ZRAM here" — both ``capabilities.py`` and
+``planner.py`` call this one function instead of each independently
+deciding, closing a real gap where the planner could propose ``APPLY``
+for a machine the capability model had already said couldn't support it.
 """
 
 from __future__ import annotations
@@ -23,7 +29,17 @@ import re
 from pathlib import Path
 
 from serein.hardware._util import read_int, read_text
-from serein.hardware.models import MemoryPolicyInfo, SwapDevice, ZramDevice
+from serein.hardware.models import (
+    EnvironmentInfo,
+    MemoryPolicyInfo,
+    SwapDevice,
+    ZramCapability,
+    ZramDevice,
+)
+
+_ZRAM_CAPABILITY_MECHANISM = (
+    "sysfs:/sys/class/zram-control (kernel), systemd-zram-generator (config mechanism)"
+)
 
 # Real search paths and precedence order, per the installed
 # zram-generator.conf(5) SYNOPSIS: the base conf file is read first (and
@@ -137,4 +153,68 @@ def detect_memory_policy(root: Path) -> MemoryPolicyInfo:
         zram_devices=_detect_zram_devices(root),
         zram_generator_config_sources=config_sources,
         zram_generator_config_ambiguous=len(config_sources) > 1,
+    )
+
+
+def _zram_kernel_support(root: Path, existing_zram_devices: list[ZramDevice]) -> bool:
+    """Real, checkable evidence that the kernel can create zram devices
+    on demand - not an assumption. ``/sys/class/zram-control`` is the
+    kernel's own hot-add/hot-remove control interface (present once the
+    zram module is loaded or built in); a "zram" line in /proc/modules,
+    or an already-existing /sys/block/zram* device, are equally valid
+    independent signals."""
+    if (root / "sys" / "class" / "zram-control").is_dir():
+        return True
+    if existing_zram_devices:
+        return True
+    modules_text = read_text(root / "proc" / "modules")
+    if modules_text:
+        for line in modules_text.splitlines():
+            fields = line.split()
+            if fields and fields[0] == "zram":
+                return True
+    return False
+
+
+def detect_zram_capability(
+    root: Path, environment: EnvironmentInfo, memory_policy: MemoryPolicyInfo
+) -> ZramCapability:
+    """The single source of truth for "can Serein manage ZRAM here" —
+    call this from both ``capabilities.py`` and ``planner.py`` rather
+    than deriving the answer independently in each. Never returns
+    ``available=True`` under WSL/a container: verified live
+    (docs/validation/s2r/zram-validation.md) that systemd-zram-generator's
+    own generator declines to run there."""
+    if environment.virtualization == "wsl" or environment.is_container:
+        label = "WSL" if environment.virtualization == "wsl" else "container"
+        return ZramCapability(
+            available=False,
+            confidence="high",
+            mechanism="systemd-zram-generator",
+            reason=(
+                f"Running under {label}: systemd-zram-generator's own generator "
+                "declines to create devices when systemd-detect-virt reports a "
+                "container context (verified behavior, includes WSL2)."
+            ),
+        )
+
+    if _zram_kernel_support(root, memory_policy.zram_devices):
+        return ZramCapability(
+            available=True,
+            confidence="high",
+            mechanism=_ZRAM_CAPABILITY_MECHANISM,
+            reason=(
+                "The kernel's zram-control hot-add interface (or an existing zram "
+                "device/module) confirms zram support is present."
+            ),
+        )
+
+    return ZramCapability(
+        available=False,
+        confidence="medium",
+        mechanism=_ZRAM_CAPABILITY_MECHANISM,
+        reason=(
+            "No zram-control interface, loaded zram module, or existing zram "
+            "device was found; kernel support could not be confirmed."
+        ),
     )

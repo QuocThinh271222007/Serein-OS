@@ -3,6 +3,19 @@
 Explicit per the same "don't overstate what's validated" discipline S1,
 S1R, and S2 established.
 
+## Resolved by the S2R micro-corrective
+
+A review found `serein hardware capabilities` could report
+`zram_configurable = false` while `serein hardware plan` still returned
+`memory.zram = APPLY` for the same machine state — the planner and the
+capability model each independently decided whether ZRAM was supported.
+Fixed by introducing one shared function
+(`memory_policy.detect_zram_capability`) both now call; a bare-metal
+host with no proof of kernel ZRAM support now correctly receives
+`BLOCKED`, never `APPLY`. This is the only mechanism this consistency
+fix was applied to (RAM was the only mechanism found with the gap) —
+see `docs/validation/s2r/zram-validation.md`.
+
 ## Resolved by S2R (live validation)
 
 The items below were flagged as unverified in S2 and have since been

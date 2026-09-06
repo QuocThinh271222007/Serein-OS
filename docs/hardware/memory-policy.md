@@ -133,12 +133,29 @@ the plan's behavior — see `docs/validation/s2r/zram-validation.md`.
 `planner._zram_action()` checks, in order: an existing active `/sys/
 block/zram*` device (strongest evidence) → any real config source found
 above → whether the current environment is WSL/a container (see below)
-→ RAM size availability. If either of the first two is present, the
-action is `NOOP`, explicitly stating Serein will not layer a second,
-competing implementation. `serein hardware doctor`'s
-`hardware_existing_zram` check mirrors this: `PASS` if found, `WARN` if
-ambiguous (multiple sources), `SKIP` if genuinely unconfigured — never
-`FAIL` for simply not having ZRAM yet.
+→ RAM size availability → whether ZRAM support itself is proven (see
+below). If either of the first two is present, the action is `NOOP`,
+explicitly stating Serein will not layer a second, competing
+implementation. `serein hardware doctor`'s `hardware_existing_zram`
+check mirrors this: `PASS` if found, `WARN` if ambiguous (multiple
+sources), `SKIP` if genuinely unconfigured — never `FAIL` for simply
+not having ZRAM yet.
+
+## Capability-gated planning (S2R micro-corrective)
+
+**ZRAM planning is capability-gated: Serein does not propose
+configuration unless kernel support is positively detected.**
+`memory_policy.detect_zram_capability()` is the single shared function
+both `serein hardware capabilities` (`zram_configurable`) and
+`serein hardware plan`'s `memory.zram` action call — the same evidence
+(`/sys/class/zram-control`, a loaded `zram` module, or an existing
+device), the same virtualization guard, one source of truth. A bare-metal
+host with RAM known, no existing implementation, and no proof of kernel
+ZRAM support now correctly reports `memory.zram = BLOCKED` (*"ZRAM
+support could not be confirmed on this host..."*), not `APPLY` — fixing
+a real inconsistency where the planner could previously propose `APPLY`
+for a machine the capability model had already said couldn't support it.
+See `docs/validation/s2r/zram-validation.md`.
 
 ## Virtualization: a verified, not assumed, guard
 

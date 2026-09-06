@@ -130,3 +130,20 @@ S2R_ZRAM_PACKAGE_VALIDATED=true
 S2R_ZRAM_CONFIG_PARSE_VALIDATED=true   (via --setup-device; full `generate` path BLOCKED under WSL - see known-blockers.md)
 S2R_ZRAM_TARGET_OWNERSHIP_VALIDATED=true
 ```
+
+## S2RM addendum — capability/planner consistency
+
+A follow-up review (S2RM) found that, independent of the corrections
+above, `serein hardware capabilities` and `serein hardware plan` could
+disagree about the same machine: capabilities could report
+`zram_configurable = false` while the planner still returned
+`memory.zram = APPLY`, since each independently derived its own answer
+from the same underlying evidence. Fixed by extracting one shared
+function, `memory_policy.detect_zram_capability()`, that both now call
+— see `docs/hardware/memory-policy.md`'s "Capability-gated planning"
+section for the corrected decision order and
+`tests/test_hardware_policy.py::TestZramCapabilityPlannerInvariant` for
+the regression coverage (checked across every fixture scenario and all
+five profiles). This was a code-consistency defect, not a new upstream
+fact requiring live validation — no additional live evidence was needed
+beyond what `detect_zram_capability`'s existing logic already used.
