@@ -84,16 +84,15 @@ AMD_TOOLS: tuple[ToolDefinition, ...] = (
 )
 
 # --- Intel -----------------------------------------------------------------
-
-INTEL_TOOLS_OPTIONAL: tuple[ToolDefinition, ...] = (
-    ToolDefinition(
-        "intel-extension-for-pytorch", "Intel Extension for PyTorch",
-        AI_PYTHON_PACKAGE_SOURCE, "intel-extension-for-pytorch", False,
-        "Optional: Intel's own PyPI package extending PyTorch with XPU "
-        "support. Maturity not currently verified end-to-end by Serein - "
-        "see docs/ai/intel-strategy.md. Not part of the default plan.",
-    ),
-)
+#
+# No separate Intel tool entry: Serein's forward path is native PyTorch
+# XPU support (an `xpu` build variant of the same `torch` package below,
+# selected the same way the cuda/rocm variants are - see
+# PYTORCH_TOOLS and docs/ai/intel-strategy.md). Intel Extension for
+# PyTorch (IPEX) is the older, separate-package mechanism being
+# superseded as XPU support upstreams into PyTorch itself, and is
+# deliberately not represented as a recommended Serein tool (S4R
+# Section 32/33).
 
 # --- Python AI environment (Transformers baseline) ------------------------
 
@@ -152,10 +151,13 @@ PYTORCH_TOOLS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
         "torch", "PyTorch", AI_PYTHON_PACKAGE_SOURCE, "torch", False,
         "Installed via `uv` from PyTorch's own per-backend index URL "
-        "(download.pytorch.org/whl/<cuXXX|rocmX.Y|cpu>), never plain PyPI "
-        "for a GPU build and never into system Python. Exactly one backend "
-        "variant is planned, chosen from the classified AI backend - see "
-        "docs/ai/pytorch-strategy.md and ADR-0014.",
+        "(download.pytorch.org/whl/<cuXXX|rocmX.Y|cpu>) for CUDA/ROCm/CPU "
+        "builds, or PyTorch's native XPU wheel for Intel (never Intel "
+        "Extension for PyTorch - see docs/ai/intel-strategy.md), never "
+        "plain PyPI for a GPU build and never into system Python. Exactly "
+        "one backend variant is planned, chosen only after runtime "
+        "readiness is confirmed (never from the hardware candidate alone) "
+        "- see docs/ai/pytorch-strategy.md and ADR-0014.",
     ),
 )
 
@@ -163,10 +165,16 @@ PYTORCH_TOOLS: tuple[ToolDefinition, ...] = (
 
 INFERENCE_TOOLS: tuple[ToolDefinition, ...] = (
     ToolDefinition(
-        "ollama", "Ollama", "official-upstream-binary", None, False,
-        "Official installer script (ollama.com/install.sh) - user-level, "
-        "no Ubuntu package/apt repo currently exists. Not executed by S4 - "
-        "see docs/ai/inference-strategy.md.",
+        "ollama", "Ollama", "official-upstream-binary", None, True,
+        "Official installer script (ollama.com/install.sh) - no Ubuntu "
+        "package/apt repo currently exists. This is SYSTEM-level, not "
+        "user-level: it installs the binary under /usr/local/bin (root-"
+        "owned), creates a system `ollama` user/group, and registers a "
+        "systemd service - all of which require root. Not executed by S4; "
+        "a future Apply must represent this as requires_root=true with a "
+        "documented, multi-step reversal (remove the service, binary, and "
+        "system user), never as a quiet user-level install - see "
+        "docs/ai/inference-strategy.md.",
     ),
     ToolDefinition(
         "llama.cpp", "llama.cpp", "official-upstream-binary", None, False,
@@ -199,7 +207,6 @@ ALL_GROUPS: tuple[tuple[str, tuple[ToolDefinition, ...]], ...] = (
     ("base", BASE_AI_TOOLS),
     ("nvidia", NVIDIA_TOOLS),
     ("amd", AMD_TOOLS),
-    ("intel-optional", INTEL_TOOLS_OPTIONAL),
     ("python-ai", PYTHON_AI_BASE_TOOLS),
     ("python-ai-optional", PYTHON_AI_OPTIONAL_TOOLS),
     ("pytorch", PYTORCH_TOOLS),
