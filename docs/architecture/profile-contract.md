@@ -24,7 +24,7 @@ path that would actually apply a profile) is not implemented. Reporting an
 inactive profile as active would violate the "no fake PASS output" rule
 that also governs `doctor`.
 
-## Current scope (as of S1)
+## Current scope (as of S2)
 
 - `core` (S0): `profiles/core/core.profile.json`. Describes the
   unmodified host — empty `packages`/`services`/etc. — and exists to
@@ -34,14 +34,27 @@ that also governs `doctor`.
   `configuration_units`, and `verification_checks` — see
   `docs/desktop/architecture.md`. Still performs no installation; see
   `docs/desktop/installation-plan.md` for what "implemented" means here.
-- `balanced`, `dev`, `ai`, `battery`, `cyber` are `declared` only
-  (`src/serein/profiles/registry.py:DECLARED_ONLY_PROFILES`). They carry a
-  name and description so the roadmap is visible in `profile list`, and
-  nothing else.
-- `desktop` became `implemented` in S1 (`profiles/desktop/desktop.profile.json`
-  — see `docs/desktop/architecture.md`). The veil/privacy profile is
-  **not** declared yet; it belongs to S6 and should be added when that
-  phase starts, not before.
+- `balanced`, `dev`, `ai`, `battery`, `cyber` (S2):
+  `profiles/<id>/<id>.profile.json`. Each carries a real hardware
+  resource-policy manifest (`packages: ["power-profiles-daemon",
+  "systemd-zram-generator"]`, a shared `zram-generator-defaults`
+  configuration unit, and the `hardware/*` doctor checks as
+  `verification_checks`) — see `docs/hardware/architecture.md`.
+  **"implemented" here means the hardware resource-policy layer is
+  real** (detection, capability modeling, and `serein hardware plan`
+  all work end to end); the application/tooling layer each of these
+  profiles will eventually also carry (S3 dev toolchain, S4 AI runtime,
+  S5 security tooling) remains entirely separate, unimplemented future
+  work — a profile being `implemented` is not a claim that its whole
+  eventual scope exists. `battery` additionally declares
+  `hardware_conditions: ["battery_present"]`: on a battery-less host,
+  `serein hardware plan battery` reports `profile_available: false`
+  with a stated reason rather than pretending the profile applies.
+- `DECLARED_ONLY_PROFILES` (`src/serein/profiles/registry.py`) is empty
+  as of S2 — every roadmap profile now has a manifest. It remains the
+  mechanism a future phase (e.g. S6's veil/privacy profile) will use
+  before it has a manifest of its own; the veil/privacy profile is
+  **not** declared yet and should be added when S6 starts, not before.
 
 ## Manifest fields
 
