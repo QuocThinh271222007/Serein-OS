@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from serein.hardware._util import DEFAULT_ROOT
+from serein.hardware._util import DEFAULT_ROOT, read_text
 from serein.hardware.cpu_policy import detect_cpu_policy
 from serein.hardware.gpu_policy import detect_gpu_policy
 from serein.hardware.memory_policy import detect_memory_policy
@@ -23,15 +23,38 @@ from serein.hardware.models import (
     CapabilitiesReport,
     Capability,
     EnvironmentInfo,
+    ZramDevice,
 )
 from serein.hardware.power_policy import detect_power_policy
 from serein.hardware.probe import probe_hardware
 from serein.hardware.storage_policy import detect_storage_policy
 from serein.hardware.thermal import detect_thermal
 
+_ZRAM_GENERATOR_BINARY = ("usr", "lib", "systemd", "system-generators", "zram-generator")
+
 
 def _virtualized(environment: EnvironmentInfo) -> bool:
     return environment.virtualization == "wsl" or environment.is_container
+
+
+def _zram_kernel_support(root: Path, existing_zram_devices: list[ZramDevice]) -> bool:
+    """Real, checkable evidence that the kernel can create zram devices
+    on demand - not an assumption. ``/sys/class/zram-control`` is the
+    kernel's own hot-add/hot-remove control interface (present once the
+    zram module is loaded or built in); a "zram" line in /proc/modules,
+    or an already-existing /sys/block/zram* device, are equally valid
+    independent signals."""
+    if (root / "sys" / "class" / "zram-control").is_dir():
+        return True
+    if existing_zram_devices:
+        return True
+    modules_text = read_text(root / "proc" / "modules")
+    if modules_text:
+        for line in modules_text.splitlines():
+            fields = line.split()
+            if fields and fields[0] == "zram":
+                return True
+    return False
 
 
 def build_capabilities(root: Path = DEFAULT_ROOT) -> CapabilitiesReport:
@@ -100,16 +123,40 @@ def build_capabilities(root: Path = DEFAULT_ROOT) -> CapabilitiesReport:
             )
         )
 
-    capabilities.append(
-        Capability(
-            "zram_configurable",
-            True,
-            "systemd-zram-generator (kernel zram module)",
-            "high",
-            "ZRAM is a guest-visible kernel feature independent of hardware ownership; "
-            "always considered configurable in principle.",
+    # S2R correction: this was unconditionally True, which overclaimed
+    # control in containers/WSL and asserted a write path that had never
+    # actually been checked for. Live validation (docs/validation/s2r/
+    # zram-validation.md) confirmed systemd-zram-generator's own
+    # generator refuses to create devices under container-detected
+    # virtualization (which includes WSL2) - so "false" here for those
+    # environments is now a verified fact, not a guess.
+    if virtualized:
+        capabilities.append(
+            Capability(
+                "zram_configurable",
+                False,
+                "systemd-zram-generator",
+                "high",
+                f"Running under {virt_label}: systemd-zram-generator's own generator "
+                "declines to create devices when systemd-detect-virt reports a "
+                "container context (verified behavior, includes WSL2).",
+            )
         )
-    )
+    else:
+        kernel_support = _zram_kernel_support(root, memory_policy.zram_devices)
+        capabilities.append(
+            Capability(
+                "zram_configurable",
+                kernel_support,
+                "sysfs:/sys/class/zram-control (kernel), systemd-zram-generator (config mechanism)",
+                "high" if kernel_support else "medium",
+                "The kernel's zram-control hot-add interface (or an existing zram "
+                "device/module) confirms zram support is present."
+                if kernel_support
+                else "No zram-control interface, loaded zram module, or existing zram "
+                "device was found; kernel support could not be confirmed.",
+            )
+        )
 
     has_swap = bool(memory_policy.swap_devices or memory_policy.zram_devices)
     capabilities.append(

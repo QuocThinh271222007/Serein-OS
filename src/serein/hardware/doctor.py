@@ -15,6 +15,7 @@ from pathlib import Path
 
 from serein.doctor.models import SCHEMA_VERSION, CheckResult, CheckStatus, DoctorReport
 from serein.hardware._util import DEFAULT_ROOT
+from serein.hardware.gpu_policy import detect_gpu_policy
 from serein.hardware.memory_policy import detect_memory_policy
 from serein.hardware.planner import VALID_PROFILES, build_hardware_plan
 from serein.hardware.power_policy import detect_power_policy
@@ -27,6 +28,7 @@ _MEMORY_CHECK = ("hardware_memory_detection", "Memory detection")
 _STORAGE_CHECK = ("hardware_storage_detection", "Storage detection")
 _POWER_CHECK = ("hardware_power_consistency", "Power-source consistency")
 _ZRAM_CHECK = ("hardware_existing_zram", "Existing ZRAM detection")
+_GPU_TOPOLOGY_CHECK = ("hardware_gpu_topology_confidence", "GPU topology confidence")
 _PLAN_CHECK = ("hardware_profile_plan_generation", "Hardware profile plan generation")
 _VIRT_GUARD_CHECK = ("hardware_virtualization_guard", "Virtualization guard consistency")
 _RESOURCES_CHECK = ("hardware_required_resources", "Hardware policy resources present")
@@ -92,11 +94,32 @@ def _check_power_consistency(root: Path) -> CheckResult:
 def _check_existing_zram(root: Path) -> CheckResult:
     check_id, title = _ZRAM_CHECK
     memory_policy = detect_memory_policy(root)
-    if memory_policy.zram_devices or memory_policy.zram_generator_config_present:
+    if memory_policy.zram_generator_config_ambiguous:
+        sources = ", ".join(memory_policy.zram_generator_config_sources)
+        detail = f"Multiple ZRAM configuration sources found ({sources}); treating conservatively."
+        return CheckResult(check_id, title, CheckStatus.WARN, detail)
+    if memory_policy.zram_devices or memory_policy.zram_generator_config_sources:
         detail = "Existing ZRAM implementation detected; Serein will not propose a second one."
         return CheckResult(check_id, title, CheckStatus.PASS, detail)
     detail = "No ZRAM configured yet."
     return CheckResult(check_id, title, CheckStatus.SKIP, detail)
+
+
+def _check_gpu_topology_confidence(root: Path) -> CheckResult:
+    check_id, title = _GPU_TOPOLOGY_CHECK
+    hw = probe_hardware(root)
+    if not hw.gpu:
+        detail = "No GPU detected."
+        return CheckResult(check_id, title, CheckStatus.SKIP, detail)
+    gpu_policy = detect_gpu_policy(root, hw.gpu)
+    if gpu_policy.hybrid is None:
+        detail = (
+            f"{len(hw.gpu)} GPU(s) detected but topology could not be confidently "
+            "resolved (no PCI ID database is consulted by design)."
+        )
+        return CheckResult(check_id, title, CheckStatus.WARN, detail)
+    detail = f"GPU topology resolved with {gpu_policy.hybrid_confidence} confidence."
+    return CheckResult(check_id, title, CheckStatus.PASS, detail)
 
 
 def _check_plan_generation(root: Path) -> CheckResult:
@@ -144,6 +167,7 @@ _ALL_CHECKS = (
     _check_storage_detection,
     _check_power_consistency,
     _check_existing_zram,
+    _check_gpu_topology_confidence,
     _check_plan_generation,
     _check_virtualization_guard,
     _check_required_resources,

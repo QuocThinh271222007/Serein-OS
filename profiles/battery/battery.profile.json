@@ -4,13 +4,22 @@
   "name": "Battery Saver",
   "version": "0.1.0",
   "status": "implemented",
-  "description": "Hardware resource policy for power-constrained laptops: CPU energy preference biased toward 'balance_power'/'power', power-profiles-daemon mapped to its own 'power-saver' profile, and (informational only, no forced GPU switching) a preference note for integrated graphics on hybrid systems. Only available on hosts with a detected battery — 'serein hardware plan battery' reports profile_available=false with a stated reason on a desktop, it never pretends the profile applies. See docs/hardware/power-policy.md.",
-  "dependencies": ["core"],
+  "description": "Hardware resource policy for power-constrained laptops: CPU energy preference biased toward 'balance_power'/'power', power-profiles-daemon mapped to its own 'power-saver' profile, and (informational only, no forced GPU switching) a preference note for integrated graphics on hybrid systems. Only available on hosts with a detected battery \u2014 'serein hardware plan battery' reports profile_available=false with a stated reason on a desktop, it never pretends the profile applies. See docs/hardware/power-policy.md.",
+  "dependencies": [
+    "core"
+  ],
   "conflicts": [],
-  "packages": ["power-profiles-daemon", "systemd-zram-generator"],
+  "packages": [
+    "power-profiles-daemon",
+    "systemd-zram-generator"
+  ],
   "services": [],
-  "configuration_units": ["zram-generator-defaults"],
-  "hardware_conditions": ["battery_present"],
+  "configuration_units": [
+    "zram-generator-defaults"
+  ],
+  "hardware_conditions": [
+    "battery_present"
+  ],
   "verification_checks": [
     "hardware_report_integrity",
     "hardware_cpu_topology",
@@ -18,6 +27,7 @@
     "hardware_storage_detection",
     "hardware_power_consistency",
     "hardware_existing_zram",
+    "hardware_gpu_topology_confidence",
     "hardware_profile_plan_generation",
     "hardware_virtualization_guard",
     "hardware_required_resources"

@@ -131,7 +131,14 @@ class ZramDevice:
 class MemoryPolicyInfo:
     swap_devices: list[SwapDevice] = field(default_factory=list)
     zram_devices: list[ZramDevice] = field(default_factory=list)
-    zram_generator_config_present: bool = False
+    #: Exact config-file paths found to actually declare a [zramN]
+    #: section (not just "a directory exists") — see memory_policy.py.
+    #: Empty means genuinely unconfigured.
+    zram_generator_config_sources: list[str] = field(default_factory=list)
+    #: True when more than one real source was found — Serein does not
+    #: attempt to resolve final precedence, it just avoids proposing a
+    #: second, competing configuration on top of an already-ambiguous one.
+    zram_generator_config_ambiguous: bool = False
 
 
 @dataclass
@@ -159,12 +166,30 @@ class PowerPolicyInfo:
     batteries: list[BatteryStatus] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class GPUClassification:
+    """A single device's confidence-scored classification — distinct
+    from GPUDevice.kind (S0, schema-locked, structural-evidence-only):
+    this may also weigh the boot_vga heuristic. See gpu_policy.py."""
+
+    vendor: str | None
+    kind: str  # "integrated" | "discrete" | "unknown"
+    confidence: str  # "high" | "medium" | "low"
+
+
 @dataclass
 class GPUPolicyInfo:
-    hybrid: bool = False
+    #: True/False only when topology evidence is sufficient; None means
+    #: genuinely unresolved (e.g. multiple GPUs, at least one unknown) -
+    #: never guessed.
+    hybrid: bool | None = False
+    hybrid_confidence: str = "high"  # "high" | "medium" | "low"
+    classifications: list[GPUClassification] = field(default_factory=list)
     nvidia_present: bool = False
     nvidia_kernel_module_loaded: bool = False
     amdgpu_kernel_module_loaded: bool = False
+    #: Counts only devices classified with sufficient confidence
+    #: (kind != "unknown") - an "unknown" device contributes to neither.
     integrated_count: int = 0
     discrete_count: int = 0
 

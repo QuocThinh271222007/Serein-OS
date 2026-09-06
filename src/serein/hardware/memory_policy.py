@@ -6,19 +6,39 @@ ZRAM) uniformly; a device is classified as ``"zram"`` by name rather than
 by trusting its reported ``Type`` column, since the kernel reports ZRAM
 swap as a plain ``partition`` like any other block-device swap. See
 ``docs/hardware/memory-policy.md`` for the sizing policy this feeds.
+
+S2R correction: config-source detection now scans every real
+``systemd-zram-generator`` search path and requires an actual ``[zramN]``
+section header before treating a file as configuration — an empty
+``zram-generator.conf.d/`` directory (or one containing only unrelated
+files) is no longer a false positive for "already configured". Search
+paths and precedence are exactly as documented in the real, installed
+``zram-generator.conf(5)`` (verified against systemd-zram-generator
+1.2.1-2 on Ubuntu 26.04 — see ``docs/validation/s2r/zram-validation.md``).
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from serein.hardware._util import read_int, read_text
 from serein.hardware.models import MemoryPolicyInfo, SwapDevice, ZramDevice
 
-_ZRAM_GENERATOR_PATHS = (
-    ("etc", "systemd", "zram-generator.conf"),
-    ("etc", "systemd", "zram-generator.conf.d"),
+# Real search paths and precedence order, per the installed
+# zram-generator.conf(5) SYNOPSIS: the base conf file is read first (and
+# has the LOWEST precedence); *.conf snippets under each conf.d directory
+# are then merged, sorted lexicographically by filename across all four
+# directories combined. Serein does not need to resolve final precedence
+# for S2R — only to avoid missing a real source or double-counting.
+_SEARCH_BASE_DIRS = (
+    "usr/lib/systemd",
+    "usr/local/lib/systemd",
+    "etc/systemd",
+    "run/systemd",
 )
+
+_ZRAM_SECTION_RE = re.compile(r"(?m)^\s*\[zram\d+\]")
 
 
 def _parse_swaps(text: str) -> list[SwapDevice]:
@@ -72,16 +92,49 @@ def _detect_zram_devices(root: Path) -> list[ZramDevice]:
     return devices
 
 
-def _zram_generator_config_present(root: Path) -> bool:
-    return any(root.joinpath(*parts).exists() for parts in _ZRAM_GENERATOR_PATHS)
+def _has_zram_section(text: str) -> bool:
+    """A file existing is not configuration — it must actually declare a
+    ``[zramN]`` section. An empty file, a fully-commented-out file, or an
+    empty ``conf.d`` directory are all "no configuration", not "ambiguous
+    configuration" or "configured"."""
+    return bool(_ZRAM_SECTION_RE.search(text))
+
+
+def _scan_zram_generator_config(root: Path) -> list[str]:
+    """Every real, meaningful config source found, as display paths
+    (e.g. ``/etc/systemd/zram-generator.conf.d/90-serein.conf``) — not a
+    single boolean. Empty list means genuinely unconfigured."""
+    sources: list[str] = []
+
+    for base in _SEARCH_BASE_DIRS:
+        base_conf = root / base / "zram-generator.conf"
+        text = read_text(base_conf)
+        if text and _has_zram_section(text):
+            sources.append(f"/{base}/zram-generator.conf")
+
+        confd_dir = root / base / "zram-generator.conf.d"
+        if not confd_dir.is_dir():
+            continue
+        try:
+            conf_files = sorted(p for p in confd_dir.iterdir() if p.name.endswith(".conf"))
+        except OSError:
+            continue
+        for conf_file in conf_files:
+            snippet_text = read_text(conf_file)
+            if snippet_text and _has_zram_section(snippet_text):
+                sources.append(f"/{base}/zram-generator.conf.d/{conf_file.name}")
+
+    return sources
 
 
 def detect_memory_policy(root: Path) -> MemoryPolicyInfo:
     swaps_text = read_text(root / "proc" / "swaps")
     swap_devices = _parse_swaps(swaps_text) if swaps_text else []
+    config_sources = _scan_zram_generator_config(root)
 
     return MemoryPolicyInfo(
         swap_devices=swap_devices,
         zram_devices=_detect_zram_devices(root),
-        zram_generator_config_present=_zram_generator_config_present(root),
+        zram_generator_config_sources=config_sources,
+        zram_generator_config_ambiguous=len(config_sources) > 1,
     )

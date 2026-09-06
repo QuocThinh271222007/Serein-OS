@@ -212,7 +212,7 @@ def _cmd_hardware_status(_args: argparse.Namespace) -> int:
             print(f"  {gpu.vendor or 'unknown'} ({gpu.kind or 'unknown'})")
     else:
         print("  unavailable")
-    print(f"  Hybrid        {'yes' if gpu_policy.hybrid else 'no'}")
+    print(f"  Hybrid        {_yes_no_unknown(gpu_policy.hybrid)}")
     print()
     print("Thermal")
     telemetry = "available" if (thermal.zones or thermal.hwmon_present) else "not available"

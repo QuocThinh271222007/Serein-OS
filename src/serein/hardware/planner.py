@@ -55,8 +55,9 @@ _PPD_PROFILE_MAP: dict[str, str] = {
 }
 
 _ZRAM_TARGET_DESCRIPTION = (
-    "zram-fraction=0.5, max-zram-size=4096MiB, compression-algorithm=zstd, "
-    "swap-priority=100 (see hardware/defaults/zram-generator.conf)"
+    "zram-size=min(ram/2, 4096) (upstream default, pinned explicitly), "
+    "swap-priority=100 (also upstream default), compression-algorithm left "
+    "unset (kernel default) - see hardware/defaults/zram-generator.conf"
 )
 
 
@@ -148,15 +149,40 @@ def _power_profile_action(profile_id: str, power_policy: PowerPolicyInfo) -> Pla
     )
 
 
-def _zram_action(ram_bytes: int | None, memory_policy: MemoryPolicyInfo) -> PlanAction:
+def _zram_action(
+    ram_bytes: int | None, memory_policy: MemoryPolicyInfo, environment: EnvironmentInfo
+) -> PlanAction:
     action_id, component, action = "memory.zram", "memory", "configure_zram"
-    if memory_policy.zram_devices or memory_policy.zram_generator_config_present:
+
+    if memory_policy.zram_devices:
+        detail = (
+            f"An active ZRAM device already exists ({memory_policy.zram_devices[0].name}); "
+            "Serein will not layer a second, competing implementation."
+        )
         return PlanAction(
-            action_id, component, action, None, "present",
-            "ZRAM already configured on this host; Serein will not layer a second, "
-            "competing implementation.",
+            action_id, component, action, None, "device present", detail,
             "high", False, True, "none",
             "cat /sys/block/zram0/comp_algorithm", "NOOP",
+        )
+    if memory_policy.zram_generator_config_sources:
+        sources = ", ".join(memory_policy.zram_generator_config_sources)
+        note = " (multiple sources - precedence not resolved by Serein)" if (
+            memory_policy.zram_generator_config_ambiguous
+        ) else ""
+        detail = f"Existing zram-generator configuration found at: {sources}{note}."
+        return PlanAction(
+            action_id, component, action, None, "config present", detail,
+            "high", False, True, "none",
+            "cat /sys/block/zram0/comp_algorithm", "NOOP",
+        )
+    if _virtualized(environment):
+        return PlanAction(
+            action_id, component, action, None, "not configured",
+            f"{_virt_label(environment)} environment: systemd-zram-generator itself "
+            "declines to create devices under container-detected virtualization "
+            "(verified behavior, see docs/validation/s2r/zram-validation.md) - "
+            "proposing configuration here would never take effect.",
+            "high", False, True, "none", "n/a", "SKIP",
         )
     if ram_bytes is None:
         return PlanAction(
@@ -201,20 +227,19 @@ def _storage_actions(
             ))
             continue
 
-        is_nvme = (device.name or "").startswith("nvme")
-        if is_nvme and "none" in device.available_schedulers and device.current_scheduler != "none":
-            actions.append(PlanAction(
-                action_id, component, action, "none", device.current_scheduler,
-                "NVMe multi-queue devices generally need no additional scheduler layer "
-                "on top of the hardware's own queuing (kernel block/queue-sysfs docs).",
-                "medium", True, True, "low", verify, "APPLY",
-            ))
-        else:
-            actions.append(PlanAction(
-                action_id, component, action, device.current_scheduler, device.current_scheduler,
-                "No evidence-backed reason to change this device's current scheduler.",
-                "high", False, True, "none", verify, "NOOP",
-            ))
+        # S2R correction: S2 proposed switching NVMe devices to the "none"
+        # scheduler whenever available. That was speculative tuning with
+        # no Serein-specific benchmark evidence behind it (S8 owns
+        # measurement) - removed. Every device with a real scheduler
+        # interface, on any bus, is left exactly as the kernel/upstream
+        # set it. Detection (current/available schedulers) is preserved
+        # for a future S8 benchmark pass to consume.
+        actions.append(PlanAction(
+            action_id, component, action, device.current_scheduler, device.current_scheduler,
+            "No measured Serein-specific evidence justifies replacing the current "
+            "upstream scheduler (see docs/hardware/storage-policy.md).",
+            "high", False, True, "none", verify, "NOOP",
+        ))
 
     return actions
 
@@ -234,13 +259,21 @@ def _gpu_action(profile_id: str, gpu_policy: GPUPolicyInfo) -> PlanAction:
         return PlanAction(action_id, component, action, None, None, reason,
                            "high", False, True, "none", "n/a", "NOOP")
 
-    if profile_id == "battery" and gpu_policy.hybrid:
+    if profile_id == "battery" and gpu_policy.hybrid is True:
         return PlanAction(
             action_id, component, action, None, None,
             "Hybrid graphics detected; the battery profile prefers integrated graphics "
             "where the desktop environment already supports it. Serein does not force "
             "GPU switching, unload drivers, or kill sessions in S2.",
-            "medium", False, True, "none", "n/a", "NOOP",
+            gpu_policy.hybrid_confidence, False, True, "none", "n/a", "NOOP",
+        )
+    if profile_id == "battery" and gpu_policy.hybrid is None:
+        return PlanAction(
+            action_id, component, action, None, None,
+            "Multiple GPUs detected but topology could not be confidently resolved "
+            "(no PCI ID database is consulted - see docs/hardware/gpu-policy.md); "
+            "no GPU-specific preference is expressed for this profile.",
+            "low", False, True, "none", "n/a", "NOOP",
         )
 
     return PlanAction(action_id, component, action, None, None,
@@ -272,7 +305,7 @@ def build_hardware_plan(profile_id: str, root: Path = DEFAULT_ROOT) -> HardwareP
     actions = [
         _cpu_action(profile_id, cpu_policy, hw.environment, hw.power),
         _power_profile_action(profile_id, power_policy),
-        _zram_action(hw.memory.total_bytes, memory_policy),
+        _zram_action(hw.memory.total_bytes, memory_policy, hw.environment),
         *_storage_actions(storage_policy, hw.environment),
         _gpu_action(profile_id, gpu_policy),
     ]

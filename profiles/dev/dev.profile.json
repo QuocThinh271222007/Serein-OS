@@ -5,11 +5,18 @@
   "version": "0.1.0",
   "status": "implemented",
   "description": "Hardware resource policy biased for sustained mixed workloads (coding, compilation, containers) without permanently forcing a performance governor. This is the resource-policy layer only: the S3 development toolchain (editors, language toolchains, container runtimes) is separate, unimplemented future work. See docs/hardware/architecture.md.",
-  "dependencies": ["core"],
+  "dependencies": [
+    "core"
+  ],
   "conflicts": [],
-  "packages": ["power-profiles-daemon", "systemd-zram-generator"],
+  "packages": [
+    "power-profiles-daemon",
+    "systemd-zram-generator"
+  ],
   "services": [],
-  "configuration_units": ["zram-generator-defaults"],
+  "configuration_units": [
+    "zram-generator-defaults"
+  ],
   "hardware_conditions": [],
   "verification_checks": [
     "hardware_report_integrity",
@@ -18,6 +25,7 @@
     "hardware_storage_detection",
     "hardware_power_consistency",
     "hardware_existing_zram",
+    "hardware_gpu_topology_confidence",
     "hardware_profile_plan_generation",
     "hardware_virtualization_guard",
     "hardware_required_resources"
