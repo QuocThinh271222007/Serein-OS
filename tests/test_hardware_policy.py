@@ -10,7 +10,7 @@ from serein.hardware.capabilities import build_capabilities
 from serein.hardware.cpu_policy import detect_cpu_policy
 from serein.hardware.doctor import run_hardware_checks
 from serein.hardware.gpu_policy import detect_gpu_policy
-from serein.hardware.memory_policy import detect_memory_policy
+from serein.hardware.memory_policy import detect_memory_policy, detect_zram_capability
 from serein.hardware.models import CAPABILITIES_SCHEMA_VERSION, PLAN_SCHEMA_VERSION
 from serein.hardware.planner import VALID_PROFILES, build_hardware_plan
 from serein.hardware.power_policy import detect_power_policy
@@ -282,6 +282,16 @@ class TestCapabilities:
         report = build_capabilities(host_root("amd_desktop"))
         assert json.dumps(report.to_dict())
 
+    def test_zram_configurable_true_with_zram_control_evidence(self, host_root):
+        report = build_capabilities(host_root("zram_supported_bare_metal"))
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["zram_configurable"].available is True
+
+    def test_zram_configurable_false_on_bare_metal_without_evidence(self, host_root):
+        report = build_capabilities(host_root("amd_desktop"))
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["zram_configurable"].available is False
+
 
 class TestPlanner:
     def test_deterministic(self, host_root):
@@ -339,10 +349,23 @@ class TestPlanner:
         actions = _actions_by_id(plan)
         assert actions["memory.zram"].status == "NOOP"
 
-    def test_zram_apply_when_absent(self, host_root):
-        plan = build_hardware_plan("balanced", host_root("amd_desktop"))
+    def test_zram_apply_when_capability_proven(self, host_root):
+        # S2RM: APPLY requires proven kernel capability (zram-control),
+        # not merely "no existing implementation" - see
+        # zram_supported_bare_metal fixture.
+        plan = build_hardware_plan("balanced", host_root("zram_supported_bare_metal"))
         actions = _actions_by_id(plan)
         assert actions["memory.zram"].status == "APPLY"
+
+    def test_zram_blocked_when_capability_unproven_on_bare_metal(self, host_root):
+        # S2RM: the capability/planner consistency invariant. amd_desktop
+        # is bare metal with no zram-control/module/device evidence, so
+        # zram_configurable is false - the planner must never return
+        # APPLY here, even though nothing else blocks it (no existing
+        # implementation, not virtualized, RAM known).
+        plan = build_hardware_plan("balanced", host_root("amd_desktop"))
+        actions = _actions_by_id(plan)
+        assert actions["memory.zram"].status == "BLOCKED"
 
     def test_zram_blocked_without_ram_size(self, host_root):
         plan = build_hardware_plan("balanced", host_root("missing_data"))
@@ -424,6 +447,53 @@ class TestPlanner:
     def test_to_dict_is_json_serializable(self, host_root):
         plan = build_hardware_plan("ai", host_root("nvidia_workstation"))
         assert json.dumps(plan.to_dict())
+
+
+class TestZramCapabilityPlannerInvariant:
+    """S2RM's core acceptance gate: a planner must never propose APPLY
+    for a mechanism the capability model says is unavailable. Checked
+    directly (both call the same detect_zram_capability) and indirectly
+    (via the public capabilities/plan surfaces) across every scenario
+    and all five profiles, since ZRAM manageability is a machine
+    capability, not something that should vary arbitrarily by profile."""
+
+    _SCENARIOS = (
+        "amd_desktop", "intel_laptop", "hybrid_gpu_laptop", "nvidia_workstation",
+        "kvm_vm", "unknown_cpu_vendor", "wsl_environment", "container_like",
+        "missing_data", "zram_supported_bare_metal", "zram_confd_empty",
+        "zram_confd_non_conf_only", "zram_confd_real_conf", "zram_run_config",
+        "zram_usrlib_config", "zram_multiple_sources",
+    )
+
+    def test_capability_and_planner_share_the_same_source(self, host_root):
+        for scenario in self._SCENARIOS:
+            root = host_root(scenario)
+            hw = probe_hardware(root)
+            memory_policy = detect_memory_policy(root)
+            capability = detect_zram_capability(root, hw.environment, memory_policy)
+            for profile_id in VALID_PROFILES:
+                plan = build_hardware_plan(profile_id, root)
+                if not plan.profile_available:
+                    continue  # e.g. "battery" with no battery: no actions at all
+                zram_action = _actions_by_id(plan)["memory.zram"]
+                if capability.available is not True:
+                    assert zram_action.status != "APPLY", (
+                        f"{scenario}/{profile_id}: capability.available="
+                        f"{capability.available} but plan status was APPLY"
+                    )
+
+    def test_capabilities_and_plan_agree_via_public_surfaces(self, host_root):
+        for scenario in self._SCENARIOS:
+            root = host_root(scenario)
+            cap_report = build_capabilities(root)
+            zram_cap = next(c for c in cap_report.capabilities if c.id == "zram_configurable")
+            for profile_id in VALID_PROFILES:
+                plan = build_hardware_plan(profile_id, root)
+                if not plan.profile_available:
+                    continue
+                zram_action = _actions_by_id(plan)["memory.zram"]
+                if zram_cap.available is not True:
+                    assert zram_action.status != "APPLY"
 
 
 class TestHardwareResources:
