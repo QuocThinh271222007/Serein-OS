@@ -10,7 +10,7 @@
   "packages": [
     "ark",
     "breeze",
-    "breeze-gtk",
+    "breeze-gtk-theme",
     "dolphin",
     "kinfocenter",
     "konsole",

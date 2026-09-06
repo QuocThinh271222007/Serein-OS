@@ -33,22 +33,23 @@ manifest can never silently drift from the code).
 | `login-manager` | `sddm`, `sddm-theme-breeze` | Upstream login manager with its upstream theme; configuration policy (no autologin, drop-in only) is in `configuration-ownership.md`. |
 | `applications` | `dolphin`, `konsole`, `ark` | File manager, terminal, archive integration — the minimum a workstation needs before S3 adds development tooling. |
 | `integration` | `xdg-desktop-portal-kde`, `plasma-nm`, `plasma-pa`, `print-manager`, `kinfocenter` | Desktop portals (file pickers for sandboxed/Flatpak apps), network and audio panel applets, print management, hardware info panel. Without these the panel looks complete but basic workstation actions (join Wi-Fi, change volume) don't work from the UI. |
-| `appearance` | `breeze`, `breeze-gtk`, `plasma-integration` | Upstream Breeze (light/dark) and its GTK counterpart for visual consistency with any GTK apps, plus Qt/GTK desktop integration. |
+| `appearance` | `breeze`, `breeze-gtk-theme`, `plasma-integration` | Upstream Breeze (light/dark) and its GTK counterpart for visual consistency with any GTK apps, plus Qt/GTK desktop integration. |
 
 **Deliberately excluded:** `plasma-session-x11` (matches Kubuntu 26.04's
 own default of not installing it — see `wayland-strategy.md`),
 `kubuntu-desktop` and any office/media/chat application, anything from S3
 (editors, dev toolchains), S4 (CUDA/AI), or S5 (security tooling).
 
-## What is *not* verified against a live Ubuntu 26.04 archive
+## Live validation (S1R)
 
-This development environment has no access to a real Ubuntu 26.04
-system or `apt-cache`, so exact `Depends:`/`Recommends:` relationships for
-each package above were not queried package-by-package against the live
-archive. What *is* verified (via kubuntu.org's own 26.04 release notes and
-the Debian package tracker) are: the Plasma 6.6/Frameworks 6.24 version
-baseline, the Wayland-default/X11-not-installed policy, and the specific
-package names listed in the table, which have been stable, unversioned
-KDE/Debian package names across the Plasma 5→6 transition. Confirming
-exact dependency closure is listed in `known-limitations.md` as work for
-a live-VM validation pass.
+The table above was originally drafted without access to a real Ubuntu
+26.04 archive. S1R (`docs/validation/s1r/package-validation.md`) validated
+it against a genuine Ubuntu 26.04 "resolute" archive (via an isolated
+WSL2 instance) using `apt-cache policy` for every package plus
+`apt-get install --simulate` for the full set together. One defect was
+found and fixed: `breeze-gtk` does not exist in the archive — the actual
+package is `breeze-gtk-theme`, which the table and
+`src/serein/desktop/packages.py` now both use. All 17 packages exist and
+the full set simulates cleanly with no conflicts, no removals, and no
+unexpectedly large pulls. See `docs/validation/s1r/package-validation.md`
+for exact versions and the simulated transaction summary.

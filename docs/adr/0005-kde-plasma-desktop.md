@@ -33,7 +33,7 @@ Look-and-Feel package (`docs/desktop/configuration-ownership.md`).
   session, aligning with Serein's Wayland-first goal. Widget/panel model
   supports the exact minimal layout Serein wants (`docs/desktop/
   architecture.md`) without extension hunting. Native Qt; GTK apps run
-  fine via `breeze-gtk`.
+  fine via `breeze-gtk-theme`.
 - **Against:** More moving parts than GNOME/XFCE (KWin + Plasma shell +
   KConfig layers is a bigger surface than GNOME Shell's more monolithic
   design). Requires deliberate curation to avoid the
@@ -70,7 +70,7 @@ Look-and-Feel package (`docs/desktop/configuration-ownership.md`).
   packaging — a future Plasma major-version change may require a
   `desktop_config_version` migration (`docs/desktop/
   configuration-ownership.md`).
-- GTK application theming depends on `breeze-gtk` staying maintained
+- GTK application theming depends on `breeze-gtk-theme` staying maintained
   upstream; if it doesn't, that's a concrete, measurable reason to
   revisit (Integrate → Measure → Replace), not a reason to preemptively
   hedge now.

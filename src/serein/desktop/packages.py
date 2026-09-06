@@ -52,7 +52,7 @@ PACKAGE_GROUPS: tuple[PackageGroup, ...] = (
     PackageGroup(
         name="appearance",
         description="Upstream Breeze (and its GTK counterpart) plus Qt/GTK integration.",
-        packages=("breeze", "breeze-gtk", "plasma-integration"),
+        packages=("breeze", "breeze-gtk-theme", "plasma-integration"),
     ),
 )
 
