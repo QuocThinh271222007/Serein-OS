@@ -1,0 +1,11 @@
+processor	: 0
+vendor_id	: SomeOtherVendor
+model name	: Generic Workstation CPU
+physical id	: 0
+core id		: 0
+
+processor	: 1
+vendor_id	: SomeOtherVendor
+model name	: Generic Workstation CPU
+physical id	: 0
+core id		: 1

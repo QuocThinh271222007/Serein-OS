@@ -10,6 +10,8 @@ from serein.profiles.registry import DECLARED_ONLY_PROFILES, list_profiles
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+_S2_HARDWARE_PROFILES = ("balanced", "dev", "ai", "battery", "cyber")
+
 
 class TestManifestParsing:
     def test_core_manifest_round_trips(self):
@@ -88,3 +90,34 @@ class TestRegistryIsolation:
     def test_nonexistent_directory_does_not_raise(self, tmp_path):
         profiles = list_profiles(profiles_dir=tmp_path / "does-not-exist")
         assert len(profiles) == len(DECLARED_ONLY_PROFILES)
+
+
+class TestS2HardwareProfileManifests:
+    """balanced/dev/ai/battery/cyber gained real manifests in S2 — their
+    hardware resource-policy layer, not their S3/S4/S5 application layer."""
+
+    def test_all_five_have_manifests_and_are_implemented(self):
+        profiles = {p.id: p for p in list_profiles()}
+        for profile_id in _S2_HARDWARE_PROFILES:
+            assert profiles[profile_id].status == "implemented"
+            assert profiles[profile_id].active is False
+
+    def test_all_five_round_trip_through_manifest_model(self):
+        for profile_id in _S2_HARDWARE_PROFILES:
+            path = REPO_ROOT / "profiles" / profile_id / f"{profile_id}.profile.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            manifest = ProfileManifest.from_dict(data)
+            assert manifest.id == profile_id
+            assert manifest.dependencies == ["core"]
+            assert "power-profiles-daemon" in manifest.packages
+            assert "systemd-zram-generator" in manifest.packages
+            assert manifest.rollback.supported is False
+
+    def test_only_battery_declares_a_battery_hardware_condition(self):
+        for profile_id in _S2_HARDWARE_PROFILES:
+            path = REPO_ROOT / "profiles" / profile_id / f"{profile_id}.profile.json"
+            manifest = ProfileManifest.from_dict(json.loads(path.read_text(encoding="utf-8")))
+            if profile_id == "battery":
+                assert manifest.hardware_conditions == ["battery_present"]
+            else:
+                assert manifest.hardware_conditions == []

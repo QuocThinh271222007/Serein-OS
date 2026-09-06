@@ -13,7 +13,7 @@ installer contract (design only), security/isolation principles, testing
 infrastructure, and CI. Produces working, read-only code — not a
 documentation-only skeleton.
 
-## S1 — Desktop *(this repository, in progress)*
+## S1 — Desktop *(complete, merged to main)*
 
 A lightweight, polished KDE Plasma-based desktop environment, configured
 (not forked) via Serein: a declarative package manifest, `/etc/xdg`
@@ -24,30 +24,45 @@ and a deterministic installation plan. See
 for why KDE Plasma. No package installation or configuration write to any
 host happens yet — see `docs/desktop/installation-plan.md`.
 
-## S2 — Hardware
+## S2 — Hardware *(this repository, in progress)*
 
-CPU/RAM/ZRAM/storage/GPU/power profile tuning, built on the `hardware/`
-detection module S0 establishes. No tuning is implemented in S0 — the
-probe only observes.
+Hardware capability modeling (`serein hardware capabilities`) and
+resource-policy planning (`serein hardware plan <profile>`) for CPU
+energy preference, ZRAM/swap, storage I/O schedulers, GPU topology, and
+power-profile mapping, built on the `hardware/` detection module S0
+establishes. `serein hardware probe` remains unchanged and
+backward-compatible. `balanced`, `dev`, `ai`, `battery`, and `cyber`
+gained real hardware-policy manifests in this phase — see
+[`docs/hardware/`](hardware/architecture.md) for the full design and
+[ADR-0006](adr/0006-hardware-policy-model.md) through
+[ADR-0008](adr/0008-upstream-power-management-integration.md). No
+sysfs/config write, package install, or Apply mechanism exists yet — see
+`docs/hardware/architecture.md` for exactly what "implemented" means at
+this phase (the application/tooling layers these profiles will eventually
+carry — S3 dev tools, S4 AI runtime, S5 security tooling — remain
+entirely separate, unimplemented future work).
 
 ## S3 — Development
 
 Editor/IDE integration (e.g. Zed), language toolchains, Git configuration,
-and container tooling for software development workflows. No
-implementation in S0.
+and container tooling for software development workflows. The `dev`
+profile's hardware resource-policy layer was implemented in S2; the
+actual toolchain/application layer this phase adds is unimplemented.
 
 ## S4 — AI
 
 Hardware-detection-driven local AI stack: NVIDIA/AMD/CPU-appropriate
 PyTorch, llama.cpp, Ollama, and container-based compute. Builds on the
-`gpu`/`cpu` fields in the S0 hardware report. **No CUDA or driver
-installation happens in S0.**
+`gpu`/`cpu` fields in the S0 hardware report and the `ai` profile's S2
+hardware resource-policy layer (`docs/hardware/gpu-policy.md`). **No
+CUDA or driver installation happens in S0–S2.**
 
 ## S5 — Cybersecurity
 
 Isolated security research/authorized-testing environments (container or
 VM-based), per [ADR-0004](adr/0004-workload-isolation.md). The `cyber`
-profile (declared in S0, not implemented) belongs here.
+profile's hardware resource-policy layer was implemented in S2; the
+actual isolated tooling/VM images this phase adds belong here.
 
 ## S6 — Veil / Privacy
 

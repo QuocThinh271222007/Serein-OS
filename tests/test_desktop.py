@@ -251,8 +251,11 @@ class TestDesktopProfileConsistency:
         assert self._manifest().status == "implemented"
 
     def test_desktop_is_implemented_in_registry(self):
+        # As of S2, balanced/dev/ai/battery/cyber also carry real manifests
+        # (their hardware resource-policy layer) — see
+        # src/serein/hardware/planner.py and tests/test_hardware_policy.py.
         profiles = {p.id: p for p in list_profiles()}
         assert profiles["desktop"].status == "implemented"
         assert profiles["core"].status == "implemented"
-        for declared_id in ("balanced", "battery", "dev", "ai", "cyber"):
-            assert profiles[declared_id].status == "declared"
+        for profile_id in ("balanced", "battery", "dev", "ai", "cyber"):
+            assert profiles[profile_id].status == "implemented"

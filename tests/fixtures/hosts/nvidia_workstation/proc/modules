@@ -1,0 +1,3 @@
+nvidia_uvm 1568768 0 - Live 0x0000000000000000
+nvidia_drm 90112 4 - Live 0x0000000000000000
+nvidia 62914560 2 nvidia_uvm,nvidia_drm, Live 0x0000000000000000

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/hardware-plan.schema.json",
+  "title": "Serein Hardware Plan",
+  "description": "Output of `serein hardware plan <profile> --json`.",
+  "type": "object",
+  "required": ["schema_version", "profile_id", "profile_available", "unavailable_reason", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "profile_id": { "type": "string", "enum": ["balanced", "dev", "ai", "battery", "cyber"] },
+    "profile_available": { "type": "boolean" },
+    "unavailable_reason": { "type": ["string", "null"] },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "component", "action", "target", "current", "reason",
+          "confidence", "requires_root", "reversible", "risk", "verification", "status"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "component": { "type": "string", "minLength": 1 },
+          "action": { "type": "string", "minLength": 1 },
+          "target": { "type": ["string", "null"] },
+          "current": { "type": ["string", "null"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "requires_root": { "type": "boolean" },
+          "reversible": { "type": "boolean" },
+          "risk": { "type": "string", "enum": ["none", "low", "medium", "high"] },
+          "verification": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["APPLY", "NOOP", "SKIP", "BLOCKED"] }
+        }
+      }
+    }
+  }
+}

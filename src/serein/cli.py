@@ -21,8 +21,37 @@ from serein.desktop.plan import build_desktop_plan
 from serein.desktop.status import build_desktop_status
 from serein.doctor.checks import run_checks
 from serein.doctor.models import CheckStatus, DoctorReport
+from serein.hardware._util import DEFAULT_ROOT
+from serein.hardware.capabilities import build_capabilities
+from serein.hardware.cpu_policy import detect_cpu_policy
+from serein.hardware.doctor import run_hardware_checks
+from serein.hardware.gpu_policy import detect_gpu_policy
+from serein.hardware.memory_policy import detect_memory_policy
+from serein.hardware.planner import VALID_PROFILES, build_hardware_plan
+from serein.hardware.power_policy import detect_power_policy
 from serein.hardware.probe import probe_hardware
+from serein.hardware.storage_policy import detect_storage_policy
+from serein.hardware.thermal import detect_thermal
 from serein.profiles.registry import list_profiles
+
+_CAPABILITY_LABELS = {
+    "cpu_governor_control": "CPU governor control",
+    "cpu_epp_control": "CPU EPP control",
+    "zram_configurable": "ZRAM configurable",
+    "swap_exists": "Swap exists",
+    "storage_scheduler_configurable": "Storage scheduler configurable",
+    "battery_detected": "Battery detected",
+    "power_profile_control": "Power profile control",
+    "nvidia_compute_gpu": "NVIDIA compute GPU",
+    "gpu_switching": "GPU switching",
+    "thermal_telemetry": "Thermal telemetry",
+}
+
+
+def _yes_no_unknown(value: bool | None) -> str:
+    if value is None:
+        return "unknown"
+    return "yes" if value else "no"
 
 
 def _format_bytes(n: int | None) -> str:
@@ -115,6 +144,130 @@ def _cmd_hardware_probe(args: argparse.Namespace) -> int:
         print("Storage:         unavailable")
     print(f"Battery:         {'present' if report.power.has_battery else 'not present'}")
     print(f"Virtualization:  {report.environment.virtualization}")
+    return 0
+
+
+def _cmd_hardware_status(_args: argparse.Namespace) -> int:
+    hw = probe_hardware()
+    cpu_policy = detect_cpu_policy(DEFAULT_ROOT)
+    memory_policy = detect_memory_policy(DEFAULT_ROOT)
+    storage_policy = detect_storage_policy(DEFAULT_ROOT)
+    power_policy = detect_power_policy(DEFAULT_ROOT)
+    gpu_policy = detect_gpu_policy(DEFAULT_ROOT, hw.gpu)
+    thermal = detect_thermal(DEFAULT_ROOT)
+
+    print("SEREIN HARDWARE")
+    print()
+    print("CPU")
+    cpu_label = f"{hw.cpu.vendor or 'unknown vendor'} {hw.cpu.model_name or ''}".strip()
+    print(f"  {cpu_label or 'unavailable'}")
+    print(f"  Driver        {cpu_policy.driver or 'not detected'}")
+    print(f"  Governor      {cpu_policy.governor or 'not detected'}")
+    print(f"  EPP           {cpu_policy.epp_current or 'not available'}")
+    print()
+    print("Memory")
+    print(f"  RAM           {_format_bytes(hw.memory.total_bytes)}")
+    disk_swap = [s for s in memory_policy.swap_devices if s.kind != "zram"]
+    if disk_swap:
+        total = sum(s.size_bytes or 0 for s in disk_swap)
+        print(f"  Swap          {_format_bytes(total)} ({len(disk_swap)} device(s))")
+    else:
+        print("  Swap          none")
+    if memory_policy.zram_devices:
+        zram = memory_policy.zram_devices[0]
+        algo = zram.comp_algorithm or "unknown algorithm"
+        print(f"  ZRAM          {_format_bytes(zram.disksize_bytes)} ({algo})")
+    else:
+        print("  ZRAM          not configured")
+    print()
+    print("Storage")
+    if storage_policy.devices:
+        for device in storage_policy.devices:
+            print(f"  {device.name:<12}  scheduler={device.current_scheduler or 'unknown'}")
+    else:
+        print("  unavailable")
+    print()
+    print("Power")
+    print(f"  Device        {'laptop' if hw.power.has_battery else 'desktop'}")
+    if hw.power.on_ac_power is True:
+        ac = "connected"
+    elif hw.power.on_ac_power is False:
+        ac = "not connected"
+    else:
+        ac = "unknown"
+    print(f"  AC            {ac}")
+    if power_policy.batteries:
+        for battery in power_policy.batteries:
+            if battery.capacity_percent is not None:
+                pct = f"{battery.capacity_percent}%"
+            else:
+                pct = "unknown"
+            print(f"  Battery       {pct} ({battery.status or 'unknown status'})")
+    else:
+        print("  Battery       not present")
+    print()
+    print("GPU")
+    if hw.gpu:
+        for gpu in hw.gpu:
+            print(f"  {gpu.vendor or 'unknown'} ({gpu.kind or 'unknown'})")
+    else:
+        print("  unavailable")
+    print(f"  Hybrid        {_yes_no_unknown(gpu_policy.hybrid)}")
+    print()
+    print("Thermal")
+    telemetry = "available" if (thermal.zones or thermal.hwmon_present) else "not available"
+    print(f"  sensors       {telemetry}")
+    return 0
+
+
+def _cmd_hardware_doctor(args: argparse.Namespace) -> int:
+    report = run_hardware_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN HARDWARE DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_hardware_capabilities(args: argparse.Namespace) -> int:
+    report = build_capabilities()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN HARDWARE CAPABILITIES")
+    print()
+    for capability in report.capabilities:
+        label = _CAPABILITY_LABELS.get(capability.id, capability.id)
+        print(f"{label:<32}{_yes_no_unknown(capability.available)}")
+    return 0
+
+
+def _cmd_hardware_plan(args: argparse.Namespace) -> int:
+    plan = build_hardware_plan(args.profile)
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print(f"SEREIN HARDWARE PLAN - {plan.profile_id}")
+    print()
+    if not plan.profile_available:
+        print(f"Profile available: no ({plan.unavailable_reason})")
+        return 0
+    print("Profile available: yes")
+    print()
+    print("Actions:")
+    for step in plan.actions:
+        target = f" -> {step.target}" if step.target else ""
+        current = f" (current: {step.current})" if step.current else ""
+        print(f"  [{step.status:<7}] {step.component}.{step.action}{target}{current}")
+        print(f"            reason: {step.reason}")
+        print(
+            f"            risk: {step.risk} | reversible: {'yes' if step.reversible else 'no'} | "
+            f"requires_root: {'yes' if step.requires_root else 'no'}"
+        )
+        print(f"            verify: {step.verification}")
     return 0
 
 
@@ -225,6 +378,36 @@ def build_parser() -> argparse.ArgumentParser:
     probe_parser = hardware_subparsers.add_parser("probe", help="Probe available hardware")
     probe_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     probe_parser.set_defaults(func=_cmd_hardware_probe)
+
+    hardware_status_parser = hardware_subparsers.add_parser(
+        "status", help="Show a read-only hardware policy summary"
+    )
+    hardware_status_parser.set_defaults(func=_cmd_hardware_status)
+
+    hardware_doctor_parser = hardware_subparsers.add_parser(
+        "doctor", help="Run hardware-level diagnostics"
+    )
+    hardware_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    hardware_doctor_parser.set_defaults(func=_cmd_hardware_doctor)
+
+    hardware_capabilities_parser = hardware_subparsers.add_parser(
+        "capabilities", help="Show what Serein can safely control on this host"
+    )
+    hardware_capabilities_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    hardware_capabilities_parser.set_defaults(func=_cmd_hardware_capabilities)
+
+    hardware_plan_parser = hardware_subparsers.add_parser(
+        "plan", help="Show the hardware resource-policy plan for a profile"
+    )
+    hardware_plan_parser.add_argument("profile", choices=VALID_PROFILES)
+    hardware_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    hardware_plan_parser.set_defaults(func=_cmd_hardware_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)

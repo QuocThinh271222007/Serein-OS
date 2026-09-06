@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "id": "dev",
+  "name": "Development",
+  "version": "0.1.0",
+  "status": "implemented",
+  "description": "Hardware resource policy biased for sustained mixed workloads (coding, compilation, containers) without permanently forcing a performance governor. This is the resource-policy layer only: the S3 development toolchain (editors, language toolchains, container runtimes) is separate, unimplemented future work. See docs/hardware/architecture.md.",
+  "dependencies": [
+    "core"
+  ],
+  "conflicts": [],
+  "packages": [
+    "power-profiles-daemon",
+    "systemd-zram-generator"
+  ],
+  "services": [],
+  "configuration_units": [
+    "zram-generator-defaults"
+  ],
+  "hardware_conditions": [],
+  "verification_checks": [
+    "hardware_report_integrity",
+    "hardware_cpu_topology",
+    "hardware_memory_detection",
+    "hardware_storage_detection",
+    "hardware_power_consistency",
+    "hardware_existing_zram",
+    "hardware_gpu_topology_confidence",
+    "hardware_profile_plan_generation",
+    "hardware_virtualization_guard",
+    "hardware_required_resources"
+  ],
+  "rollback": {
+    "supported": false,
+    "notes": "No Apply mechanism exists yet in S2; serein hardware plan is read-only. See docs/hardware/architecture.md for what a future Apply step would need."
+  }
+}

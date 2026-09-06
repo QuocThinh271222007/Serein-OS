@@ -78,27 +78,51 @@ class TestMemory:
 
 
 class TestGPU:
-    def test_amd_desktop_single_discrete_amd_gpu(self, host_root):
+    # S2R correction: vendor alone is no longer sufficient evidence for
+    # integrated-vs-discrete (AMD and Intel both ship both kinds). A solo
+    # Intel/AMD GPU with no PCI class/boot_vga evidence now honestly
+    # reports "unknown" rather than a guessed kind - see
+    # docs/hardware/gpu-policy.md and docs/validation/s2r/gpu-corrective.md.
+    # The confidence-scored classification used for capabilities/planning
+    # (which also weighs boot_vga) is tested in test_hardware_policy.py.
+    def test_amd_desktop_solo_gpu_is_unknown_without_class_evidence(self, host_root):
         gpus = detect_gpus(host_root("amd_desktop"))
         assert len(gpus) == 1
         assert gpus[0].vendor == "AMD"
-        assert gpus[0].kind == "discrete"
+        assert gpus[0].kind == "unknown"
 
-    def test_intel_laptop_single_integrated_gpu(self, host_root):
+    def test_intel_laptop_solo_gpu_is_unknown_without_class_evidence(self, host_root):
         gpus = detect_gpus(host_root("intel_laptop"))
         assert len(gpus) == 1
         assert gpus[0].vendor == "Intel"
-        assert gpus[0].kind == "integrated"
+        assert gpus[0].kind == "unknown"
 
     def test_nvidia_workstation_hybrid_multi_gpu(self, host_root):
         gpus = detect_gpus(host_root("nvidia_workstation"))
         vendors = {(gpu.vendor, gpu.kind) for gpu in gpus}
-        assert vendors == {("Intel", "integrated"), ("NVIDIA", "discrete")}
+        # NVIDIA remains "discrete" on the documented vendor assumption;
+        # Intel has VGA-class evidence but no 3D-only class code, so the
+        # schema-locked kind stays "unknown" here (boot_vga is not used
+        # by this raw probe - see gpu.py's docstring).
+        assert vendors == {("Intel", "unknown"), ("NVIDIA", "discrete")}
 
     def test_hybrid_gpu_laptop_multi_gpu(self, host_root):
         gpus = detect_gpus(host_root("hybrid_gpu_laptop"))
         vendors = {(gpu.vendor, gpu.kind) for gpu in gpus}
-        assert vendors == {("Intel", "integrated"), ("AMD", "discrete")}
+        # AMD's card is class 0302 (3D-only) - vendor-independent
+        # structural proof of "discrete" even in the raw probe.
+        assert vendors == {("Intel", "unknown"), ("AMD", "discrete")}
+
+    def test_intel_arc_like_discrete_via_pci_class(self, host_root):
+        gpus = detect_gpus(host_root("intel_arc_workstation"))
+        assert len(gpus) == 1
+        assert gpus[0].vendor == "Intel"
+        assert gpus[0].kind == "discrete"
+
+    def test_amd_apu_nvidia_hybrid(self, host_root):
+        gpus = detect_gpus(host_root("amd_apu_nvidia_laptop"))
+        vendors = {(gpu.vendor, gpu.kind) for gpu in gpus}
+        assert vendors == {("AMD", "unknown"), ("NVIDIA", "discrete")}
 
     def test_missing_data_returns_empty_list_not_error(self, host_root):
         assert detect_gpus(host_root("missing_data")) == []
