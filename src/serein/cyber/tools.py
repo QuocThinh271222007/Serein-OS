@@ -37,9 +37,11 @@ HOST_NETWORK_TOOLS: tuple[CyberToolDefinition, ...] = (
         "capture tool; Serein never runs a live capture (Section 7/8).",
     ),
     CyberToolDefinition(
-        "dnsutils", "dnsutils (dig)", "network-diagnostics", "ubuntu-repository",
-        "dnsutils", "host", True, False, True, "none",
-        "DNS diagnostics (dig/nslookup) - read-only local tooling.",
+        "bind9-dnsutils", "dnsutils (dig)", "network-diagnostics", "ubuntu-repository",
+        "bind9-dnsutils", "host", True, False, True, "none",
+        "DNS diagnostics (dig/nslookup) - read-only local tooling. Package "
+        "name is bind9-dnsutils, not the older transitional 'dnsutils' name "
+        "(removed on Ubuntu 26.04 - see docs/validation/s5/package-validation.md).",
     ),
     CyberToolDefinition(
         "whois", "whois", "network-diagnostics", "ubuntu-repository", "whois",

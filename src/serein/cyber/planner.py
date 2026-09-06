@@ -55,7 +55,7 @@ def _host_installed_map(
     return {
         "nmap": network.nmap.installed,
         "tcpdump": network.tcpdump.installed,
-        "dnsutils": network.dig.installed,
+        "bind9-dnsutils": network.dig.installed,
         "whois": network.whois.installed,
         "openssl": network.openssl.installed,
         "socat": network.socat.installed,
@@ -160,11 +160,20 @@ def _toolbox_distrobox_action(
     )
 
 
+_VM_PACKAGES = "qemu-system-x86, libvirt-daemon-system, libvirt-clients"
+
+
 def _vm_prerequisites_action(vm: VMCapabilityInfo) -> CyberPlanAction:
+    """``tool``/``target`` list real Ubuntu apt package names, not the
+    probed binary names (``qemu-system-x86_64``/``virsh``) - live
+    validation on Ubuntu 26.04 found no ``qemu-system-x86_64`` or
+    ``libvirt`` package (see docs/validation/s5/package-validation.md);
+    the packages that actually provide those binaries are
+    ``qemu-system-x86`` and ``libvirt-daemon-system``/``libvirt-clients``."""
     action_id, component, action = "vm.prerequisites", "vm", "install_apt_packages"
     if not vm.kvm_device_present:
         return CyberPlanAction(
-            action_id, component, action, "qemu-system-x86_64, libvirt", "ubuntu-repository",
+            action_id, component, action, _VM_PACKAGES, "ubuntu-repository",
             "kvm unavailable", None,
             "/dev/kvm not present - hardware virtualization is unavailable "
             "or not exposed to this environment. Serein will not plan VM "
@@ -172,14 +181,14 @@ def _vm_prerequisites_action(vm: VMCapabilityInfo) -> CyberPlanAction:
         )
     if vm.qemu.installed and vm.libvirt.installed:
         return CyberPlanAction(
-            action_id, component, action, "qemu-system-x86_64, libvirt", "ubuntu-repository",
+            action_id, component, action, _VM_PACKAGES, "ubuntu-repository",
             "installed", "installed",
             "KVM device present and qemu/libvirt already installed.",
             False, True, "none", "qemu-system-x86_64 --version", "NOOP",
         )
     return CyberPlanAction(
-        action_id, component, action, "qemu-system-x86_64, libvirt", "ubuntu-repository",
-        "not installed", "qemu-system-x86_64, libvirt",
+        action_id, component, action, _VM_PACKAGES, "ubuntu-repository",
+        "not installed", _VM_PACKAGES,
         "KVM device present; qemu/libvirt prerequisites can be installed. "
         "Serein never creates a VM, never downloads an ISO, and never "
         "modifies groups (Section 34/66/67).",

@@ -77,7 +77,7 @@ def build_cyber_capabilities(
     capabilities.append(
         Capability(
             "dns_diagnostics", True, network.dig.installed, network.dig.installed,
-            "apt: dnsutils", "ubuntu-repository", "high",
+            "apt: bind9-dnsutils", "ubuntu-repository", "high",
             "dig/nslookup presence - local diagnostic use only.",
         )
     )

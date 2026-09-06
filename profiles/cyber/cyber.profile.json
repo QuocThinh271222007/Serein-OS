@@ -10,8 +10,8 @@
   ],
   "conflicts": [],
   "packages": [
+    "bind9-dnsutils",
     "binutils",
-    "dnsutils",
     "ethtool",
     "file",
     "libimage-exiftool-perl",
