@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/ai-plan.schema.json",
+  "title": "Serein AI Plan",
+  "description": "Output of `serein ai plan [component] --json`.",
+  "type": "object",
+  "required": ["schema_version", "actions"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "component", "action", "tool", "source", "current", "target",
+          "reason", "requires_root", "reversible", "risk", "verification", "status"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "component": { "type": "string", "minLength": 1 },
+          "action": { "type": "string", "minLength": 1 },
+          "tool": { "type": "string", "minLength": 1 },
+          "source": { "type": ["string", "null"] },
+          "current": { "type": ["string", "null"] },
+          "target": { "type": ["string", "null"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "requires_root": { "type": "boolean" },
+          "reversible": { "type": "boolean" },
+          "risk": { "type": "string", "enum": ["none", "low", "medium", "high"] },
+          "verification": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["APPLY", "NOOP", "SKIP", "BLOCKED"] }
+        }
+      }
+    }
+  }
+}
