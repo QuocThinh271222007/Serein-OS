@@ -228,7 +228,7 @@ class PyTorchStatus:
     are read."""
 
     installed: ToolStatus = field(default_factory=lambda: ToolStatus(id="torch"))
-    #: "cuda" | "rocm" | "cpu" | None (not installed / undetermined)
+    #: "cuda" | "rocm" | "xpu" | "cpu" | None (not installed / undetermined)
     build_backend: str | None = None
     build_backend_version: str | None = None
 
@@ -285,15 +285,24 @@ class AIContainerStatusInfo:
     nvidia_container_toolkit: ToolStatus = field(
         default_factory=lambda: ToolStatus(id="nvidia-container-toolkit")
     )
-    #: Whether NVIDIA CDI integration for containers is evidenced —
-    #: either a real spec file (`/etc/cdi/nvidia.yaml` or
-    #: `/var/run/cdi/nvidia.yaml`, existence only, contents never read)
-    #: or a successful, read-only `nvidia-ctk cdi list` reporting a
-    #: real device entry (current NVIDIA Container Toolkit releases can
-    #: generate/manage CDI specs automatically, so a static file is not
-    #: the only valid evidence — S4R Section 27/28). Never generated,
-    #: listed, or mutated by Serein beyond this read-only check.
-    cdi_nvidia_generated: bool = False
+    #: A static CDI spec file exists at one of the well-known paths
+    #: (`/etc/cdi/nvidia.yaml` or `/var/run/cdi/nvidia.yaml` —
+    #: existence only, contents never read/parsed, no YAML dependency).
+    #: This is AUXILIARY evidence only (S4RM Section 3/4/6): an empty,
+    #: malformed, stale, or unrelated file would satisfy this check, so
+    #: it is never by itself sufficient to prove GPU CDI integration is
+    #: valid/usable — see `cdi_nvidia_resolved`.
+    cdi_marker_present: bool = False
+    #: STRONG evidence: a read-only `nvidia-ctk cdi list` query
+    #: actually resolved a real `nvidia.com/gpu` device entry — proof
+    #: the toolkit currently has a working CDI device registered,
+    #: regardless of whether that came from a static file or was
+    #: generated/managed automatically by the toolkit (current NVIDIA
+    #: Container Toolkit releases can do this dynamically). This is the
+    #: field capability/doctor usability decisions must key off of, not
+    #: `cdi_marker_present`. Never generated, listed further, or
+    #: mutated by Serein beyond this one read-only check.
+    cdi_nvidia_resolved: bool = False
 
 
 @dataclass

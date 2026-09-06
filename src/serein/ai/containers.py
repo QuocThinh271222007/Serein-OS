@@ -9,13 +9,23 @@ and works with both Docker and Podman — Serein does not special-case
 one engine over the other for AI container support (see
 docs/ai/container-strategy.md and ADR-0011, which S4 does not reopen).
 
-CDI evidence uses two read-only sources (S4R Section 27/28 — current
-NVIDIA Container Toolkit releases can generate/manage CDI specs
-automatically, so a static file is not the only valid signal):
-a real spec file existing at one of the well-known paths, or a
-successful ``nvidia-ctk cdi list`` reporting a real NVIDIA device
-entry. Detection never starts a daemon, never runs
-``nvidia-ctk cdi generate``, and never inspects container contents.
+CDI evidence is split into two genuinely different signals (S4RM
+Section 3-10 — a prior revision treated a static file's mere existence
+as equivalent to real integration, which an empty/stale/malformed file
+would satisfy without proving anything):
+
+- ``cdi_marker_present`` — a static spec file exists at a well-known
+  path. Existence only, contents never read/parsed (no YAML dependency
+  — Section 7). Auxiliary evidence only; never sufficient alone.
+- ``cdi_nvidia_resolved`` — a read-only ``nvidia-ctk cdi list`` query
+  actually resolved a real ``nvidia.com/gpu`` device entry. This is the
+  strong signal capability/doctor usability decisions key off of,
+  since current NVIDIA Container Toolkit releases can generate/manage
+  CDI state dynamically — the static file is not authoritative on its
+  own in either direction.
+
+Detection never starts a daemon, never runs ``nvidia-ctk cdi
+generate``, and never inspects container contents.
 """
 
 from __future__ import annotations
@@ -36,15 +46,16 @@ _CDI_NVIDIA_PATHS = (
 _CDI_NVIDIA_DEVICE_RE = re.compile(r"nvidia\.com/gpu")
 
 
-def _cdi_nvidia_marker_present(root: Path) -> bool:
+def _cdi_marker_present(root: Path) -> bool:
+    """Existence-only check for a static CDI spec file — never read
+    for contents, never parsed as YAML. Auxiliary evidence only; see
+    module docstring."""
     return any(root.joinpath(*parts).is_file() for parts in _CDI_NVIDIA_PATHS)
 
 
-def _cdi_nvidia_listed(runner: CommandRunner) -> bool:
-    """Read-only ``nvidia-ctk cdi list`` query — real evidence the
-    toolkit currently has an NVIDIA CDI device registered, whether it
-    came from a static spec file or was generated automatically.
-    Never runs ``nvidia-ctk cdi generate``."""
+def _cdi_nvidia_resolved(runner: CommandRunner) -> bool:
+    """Read-only ``nvidia-ctk cdi list`` query — the strong evidence
+    signal. Never runs ``nvidia-ctk cdi generate``."""
     result = runner.run(["nvidia-ctk", "cdi", "list"], timeout=5.0)
     if result is None or result.returncode != 0:
         return False
@@ -55,11 +66,11 @@ def detect_ai_container_status(
     runner: CommandRunner = DEFAULT_RUNNER, root: Path = DEFAULT_ROOT
 ) -> AIContainerStatusInfo:
     dev_status = detect_container_status(runner)
-    cdi_evidence = _cdi_nvidia_marker_present(root) or _cdi_nvidia_listed(runner)
     return AIContainerStatusInfo(
         podman=dev_status.podman,
         docker=dev_status.docker,
         distrobox=dev_status.distrobox,
         nvidia_container_toolkit=probe_tool("nvidia-ctk", "nvidia-ctk", runner=runner),
-        cdi_nvidia_generated=cdi_evidence,
+        cdi_marker_present=_cdi_marker_present(root),
+        cdi_nvidia_resolved=_cdi_nvidia_resolved(runner),
     )

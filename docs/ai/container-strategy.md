@@ -27,14 +27,18 @@ independent layer on top, never a reason to switch engines.
 re-probing) and adds:
 
 - `nvidia_container_toolkit` — an `nvidia-ctk --version` probe.
-- `cdi_nvidia_generated` — CDI integration evidence from **two**
-  read-only sources (S4R Section 27/28 correction — current NVIDIA
-  Container Toolkit releases can generate/manage CDI specs
-  automatically, so a static file is not the only valid signal): a
-  real spec file at `/etc/cdi/nvidia.yaml`/`/var/run/cdi/nvidia.yaml`
-  (existence only, contents never read), OR a successful, read-only
-  `nvidia-ctk cdi list` reporting a real `nvidia.com/gpu` device entry.
-  Serein never runs `nvidia-ctk cdi generate` itself.
+- `cdi_marker_present` / `cdi_nvidia_resolved` — **two separate**
+  signals, not one (S4RM Section 3-10 correction — a prior revision
+  combined them into a single `cdi_nvidia_generated` boolean that an
+  empty/stale/malformed spec file could satisfy on its own, which
+  overstated the evidence): `cdi_marker_present` is existence-only for
+  a static spec file at `/etc/cdi/nvidia.yaml`/`/var/run/cdi/nvidia.yaml`
+  (contents never read/parsed — no YAML dependency) and is auxiliary
+  evidence only; `cdi_nvidia_resolved` is the strong signal, set only
+  when a read-only `nvidia-ctk cdi list` query actually resolves a real
+  `nvidia.com/gpu` device entry. Usability decisions key off
+  `cdi_nvidia_resolved`, never off `cdi_marker_present` alone. Serein
+  never runs `nvidia-ctk cdi generate` itself.
 
 ## Planning
 
@@ -49,9 +53,12 @@ hasn't been proven working yet — the toolkit would not be usable
 without a driver, so provisioning it first would be premature.
 Correspondingly, `capabilities.py`'s `ai_container_runtime` capability
 now requires the **full evidence chain** for `usable=true`: a working
-driver, a container engine, the NVIDIA Container Toolkit, AND real CDI
-integration evidence — engine+toolkit alone is no longer sufficient
-(the pre-corrective behavior understated what "usable" should mean).
+driver, a container engine, the NVIDIA Container Toolkit, AND
+*resolved* CDI evidence (`cdi_nvidia_resolved`, never
+`cdi_marker_present` alone — S4RM correction) — engine+toolkit alone
+is no longer sufficient, and neither is a static spec file's mere
+existence (the pre-corrective behavior understated what "usable"
+should mean, twice over).
 
 `containers.engine`'s action mirrors S3's exactly: `NOOP` if either
 engine is already present (never a forced choice between them),

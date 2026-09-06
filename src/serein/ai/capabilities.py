@@ -242,13 +242,15 @@ def build_ai_capabilities(
     if nvidia_backend_present:
         # Full GPU-container usability requires every link in the chain:
         # a working driver, a container engine, the NVIDIA Container
-        # Toolkit, and real CDI integration evidence - engine+toolkit
-        # alone is not sufficient (S4R Section 25/26/29).
+        # Toolkit, and RESOLVED CDI device evidence - engine+toolkit
+        # alone is not sufficient (S4R Section 25/26/29), and neither is
+        # a static spec file's mere existence (S4RM Section 3-5: an
+        # empty/stale/malformed file must never count as proof).
         driver_ready = nvidia.driver_version is not None
         toolkit_installed = containers.nvidia_container_toolkit.installed
-        cdi_evidenced = containers.cdi_nvidia_generated
+        cdi_resolved = containers.cdi_nvidia_resolved
         ai_container_usable = (
-            driver_ready and container_installed and toolkit_installed and cdi_evidenced
+            driver_ready and container_installed and toolkit_installed and cdi_resolved
         )
         if not driver_ready:
             reason = (
@@ -259,10 +261,11 @@ def build_ai_capabilities(
             reason = "No container engine installed."
         elif not toolkit_installed:
             reason = "NVIDIA Container Toolkit not installed."
-        elif not cdi_evidenced:
+        elif not cdi_resolved:
             reason = (
-                "No CDI integration evidence found (neither a spec file "
-                "nor `nvidia-ctk cdi list`)."
+                "No resolved CDI device evidence from `nvidia-ctk cdi "
+                "list` - a static spec file's mere existence is not "
+                "sufficient proof of working CDI integration."
             )
         else:
             reason = (
