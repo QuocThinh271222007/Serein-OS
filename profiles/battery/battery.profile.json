@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "battery",
+  "name": "Battery Saver",
+  "version": "0.1.0",
+  "status": "implemented",
+  "description": "Hardware resource policy for power-constrained laptops: CPU energy preference biased toward 'balance_power'/'power', power-profiles-daemon mapped to its own 'power-saver' profile, and (informational only, no forced GPU switching) a preference note for integrated graphics on hybrid systems. Only available on hosts with a detected battery — 'serein hardware plan battery' reports profile_available=false with a stated reason on a desktop, it never pretends the profile applies. See docs/hardware/power-policy.md.",
+  "dependencies": ["core"],
+  "conflicts": [],
+  "packages": ["power-profiles-daemon", "systemd-zram-generator"],
+  "services": [],
+  "configuration_units": ["zram-generator-defaults"],
+  "hardware_conditions": ["battery_present"],
+  "verification_checks": [
+    "hardware_report_integrity",
+    "hardware_cpu_topology",
+    "hardware_memory_detection",
+    "hardware_storage_detection",
+    "hardware_power_consistency",
+    "hardware_existing_zram",
+    "hardware_profile_plan_generation",
+    "hardware_virtualization_guard",
+    "hardware_required_resources"
+  ],
+  "rollback": {
+    "supported": false,
+    "notes": "No Apply mechanism exists yet in S2; serein hardware plan is read-only. See docs/hardware/architecture.md for what a future Apply step would need."
+  }
+}

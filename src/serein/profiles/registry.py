@@ -1,11 +1,17 @@
 """Combines on-disk profile manifests with declared-but-unbuilt profile
 identities into the list ``serein profile list`` shows.
 
-Only ``core`` has a manifest in S0 (``profiles/core/core.profile.json``).
-The remaining identities from the roadmap (desktop, dev, ai, battery,
-cyber) are named here so the contract is visible, but carry no manifest,
-no packages, and no behavior — listing them is not a promise they work.
-Activation is not implemented in S0: every entry reports ``active=False``.
+As of S2, every profile named in the roadmap (``core``, ``desktop``,
+``balanced``, ``dev``, ``ai``, ``battery``, ``cyber``) has a real manifest
+under ``profiles/<id>/<id>.profile.json`` — ``DECLARED_ONLY_PROFILES`` is
+empty for now, kept only as the mechanism a future phase (e.g. S6's veil/
+privacy profile) will use before it has a manifest of its own. "implemented"
+for ``balanced``/``dev``/``ai``/``battery``/``cyber`` means their hardware
+resource-policy layer is real (see ``docs/hardware/architecture.md``) —
+their S3/S4/S5 application/tooling layers remain entirely separate,
+unimplemented future work; this distinction is documented in
+``docs/architecture/profile-contract.md``, not left implicit. Activation
+is not implemented yet: every entry reports ``active=False``.
 """
 
 from __future__ import annotations
@@ -27,35 +33,11 @@ class _DeclaredProfile:
     description: str
 
 
-# Profile identities named in the S0 roadmap (docs/roadmap.md) that have no
-# manifest yet. Keep in id order matching the roadmap phase they belong to.
-DECLARED_ONLY_PROFILES: tuple[_DeclaredProfile, ...] = (
-    _DeclaredProfile(
-        "balanced",
-        "Balanced",
-        "Default day-to-day workstation profile. Declared for S2 (Hardware).",
-    ),
-    _DeclaredProfile(
-        "dev",
-        "Development",
-        "Software development toolchain profile. Declared for S3 (Development).",
-    ),
-    _DeclaredProfile(
-        "ai",
-        "AI Workstation",
-        "Local AI/ML workload profile. Declared for S4 (AI).",
-    ),
-    _DeclaredProfile(
-        "battery",
-        "Battery Saver",
-        "Power-constrained laptop profile. Declared for S2 (Hardware).",
-    ),
-    _DeclaredProfile(
-        "cyber",
-        "Cybersecurity Research",
-        "Isolated security research/testing profile. Declared for S5 (Cybersecurity).",
-    ),
-)
+# Profile identities named in the roadmap (docs/roadmap.md) that have no
+# manifest yet. Empty as of S2 — every roadmap profile now has one. A
+# future phase (e.g. S6's veil/privacy profile) adds an entry here before
+# it has a manifest of its own.
+DECLARED_ONLY_PROFILES: tuple[_DeclaredProfile, ...] = ()
 
 
 def _load_manifests(profiles_dir: Path) -> dict[str, ProfileManifest]:

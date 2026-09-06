@@ -13,6 +13,9 @@ from serein.desktop.doctor import run_desktop_checks
 from serein.desktop.plan import build_desktop_plan
 from serein.desktop.status import build_desktop_status
 from serein.doctor.checks import run_checks
+from serein.hardware.capabilities import build_capabilities
+from serein.hardware.doctor import run_hardware_checks
+from serein.hardware.planner import VALID_PROFILES, build_hardware_plan
 from serein.hardware.probe import probe_hardware
 from serein.profiles.models import ProfileManifest
 
@@ -32,6 +35,8 @@ def _load_schema(name: str) -> dict:
         "profile.schema.json",
         "desktop-plan.schema.json",
         "desktop-state.schema.json",
+        "hardware-plan.schema.json",
+        "hardware-capabilities.schema.json",
     ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:
@@ -57,7 +62,9 @@ def test_doctor_report_validates_against_schema(host_root) -> None:
     jsonschema.validate(instance=report.to_dict(), schema=schema)
 
 
-@pytest.mark.parametrize("profile_id", ["core", "desktop"])
+@pytest.mark.parametrize(
+    "profile_id", ["core", "desktop", "balanced", "dev", "ai", "battery", "cyber"]
+)
 def test_profile_manifest_validates_against_schema(profile_id: str) -> None:
     schema = _load_schema("profile.schema.json")
     manifest_path = REPO_ROOT / "profiles" / profile_id / f"{profile_id}.profile.json"
@@ -88,4 +95,31 @@ def test_desktop_status_validates_for_missing_data(host_root) -> None:
 def test_desktop_doctor_report_validates_against_schema(host_root) -> None:
     schema = _load_schema("doctor-report.schema.json")
     report = run_desktop_checks(host_root("amd_desktop"), env={})
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+@pytest.mark.parametrize("profile_id", list(VALID_PROFILES))
+def test_hardware_plan_validates_against_schema(host_root, profile_id: str) -> None:
+    schema = _load_schema("hardware-plan.schema.json")
+    plan = build_hardware_plan(profile_id, host_root("nvidia_workstation"))
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+def test_hardware_plan_validates_for_missing_data(host_root) -> None:
+    schema = _load_schema("hardware-plan.schema.json")
+    root = host_root("missing_data")
+    for profile_id in VALID_PROFILES:
+        plan = build_hardware_plan(profile_id, root)
+        jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+def test_hardware_capabilities_validates_against_schema(host_root) -> None:
+    schema = _load_schema("hardware-capabilities.schema.json")
+    report = build_capabilities(host_root("amd_desktop"))
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+def test_hardware_doctor_report_validates_against_schema(host_root) -> None:
+    schema = _load_schema("doctor-report.schema.json")
+    report = run_hardware_checks(host_root("amd_desktop"))
     jsonschema.validate(instance=report.to_dict(), schema=schema)

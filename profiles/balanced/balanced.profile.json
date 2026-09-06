@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "balanced",
+  "name": "Balanced",
+  "version": "0.1.0",
+  "status": "implemented",
+  "description": "Default day-to-day hardware resource policy: upstream-default CPU energy preference, ZRAM sized to this host's RAM tier if not already configured, no forced I/O scheduler changes without evidence, power-profiles-daemon mapped to its own 'balanced' profile. Describes resource policy only — no packages are installed and no sysfs/config write happens in S2. See docs/hardware/architecture.md.",
+  "dependencies": ["core"],
+  "conflicts": [],
+  "packages": ["power-profiles-daemon", "systemd-zram-generator"],
+  "services": [],
+  "configuration_units": ["zram-generator-defaults"],
+  "hardware_conditions": [],
+  "verification_checks": [
+    "hardware_report_integrity",
+    "hardware_cpu_topology",
+    "hardware_memory_detection",
+    "hardware_storage_detection",
+    "hardware_power_consistency",
+    "hardware_existing_zram",
+    "hardware_profile_plan_generation",
+    "hardware_virtualization_guard",
+    "hardware_required_resources"
+  ],
+  "rollback": {
+    "supported": false,
+    "notes": "No Apply mechanism exists yet in S2; serein hardware plan is read-only. See docs/hardware/architecture.md for what a future Apply step would need."
+  }
+}

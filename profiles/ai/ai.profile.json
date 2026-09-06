@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "id": "ai",
+  "name": "AI Workstation",
+  "version": "0.1.0",
+  "status": "implemented",
+  "description": "Hardware resource policy for compute-heavy local AI workloads: CPU energy preference biased toward 'performance' when on AC power or on a desktop, GPU topology reporting (compute-capable GPU presence, without requiring one), and the same evidence-based memory/storage policy as other profiles. This is resource policy only — CUDA/ROCm/PyTorch/Ollama installation is S4 scope and is not touched here. A host with no discrete GPU is still a valid 'ai' profile target (CPU-only inference). See docs/hardware/architecture.md.",
+  "dependencies": ["core"],
+  "conflicts": [],
+  "packages": ["power-profiles-daemon", "systemd-zram-generator"],
+  "services": [],
+  "configuration_units": ["zram-generator-defaults"],
+  "hardware_conditions": [],
+  "verification_checks": [
+    "hardware_report_integrity",
+    "hardware_cpu_topology",
+    "hardware_memory_detection",
+    "hardware_storage_detection",
+    "hardware_power_consistency",
+    "hardware_existing_zram",
+    "hardware_profile_plan_generation",
+    "hardware_virtualization_guard",
+    "hardware_required_resources"
+  ],
+  "rollback": {
+    "supported": false,
+    "notes": "No Apply mechanism exists yet in S2; serein hardware plan is read-only. See docs/hardware/architecture.md for what a future Apply step would need."
+  }
+}

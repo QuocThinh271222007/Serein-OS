@@ -54,3 +54,22 @@ jobs:
           # docs/architecture/doctor-contract.md.
           serein desktop doctor
           serein desktop doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: Hardware CLI smoke test
+        run: |
+          serein hardware probe
+          serein hardware status
+          serein hardware capabilities
+          serein hardware capabilities --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein hardware plan balanced
+          serein hardware plan dev
+          serein hardware plan ai
+          serein hardware plan battery
+          serein hardware plan cyber
+          serein hardware plan ai --json | python -c "import json,sys; json.load(sys.stdin)"
+          # hardware doctor's exit code is 1 only on a genuine FAIL (a
+          # Serein-managed component found broken); a stock CI runner with
+          # no Serein hardware config applied should always exit 0 here,
+          # same reasoning as the desktop doctor step above.
+          serein hardware doctor
+          serein hardware doctor --json | python -c "import json,sys; json.load(sys.stdin)"
