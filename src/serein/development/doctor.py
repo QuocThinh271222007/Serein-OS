@@ -70,14 +70,7 @@ def _check_node_conflicts(runner: CommandRunner, home: Path | None) -> CheckResu
     check_id, title = _NODE_CONFLICT_CHECK
     node_status = detect_node_status(runner, home)
     if node_status.manager_count > 1:
-        managers = [
-            name for name, present in (
-                ("fnm", node_status.fnm.installed),
-                ("mise", node_status.mise.installed),
-                ("nvm", node_status.nvm_present),
-            ) if present
-        ]
-        detail = f"Multiple Node version managers detected ({', '.join(managers)})."
+        detail = f"Multiple Node version managers detected ({', '.join(node_status.managers)})."
         return CheckResult(check_id, title, CheckStatus.WARN, detail)
     return CheckResult(check_id, title, CheckStatus.PASS, "No conflicting Node version managers.")
 

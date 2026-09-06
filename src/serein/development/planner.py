@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from serein.development.containers import container_capability_available, detect_container_status
-from serein.development.cpp import detect_cpp_status
+from serein.development.cpp import cpp_installed_map, detect_cpp_status
 from serein.development.editor import detect_editor_status
 from serein.development.git import detect_git_status
 from serein.development.go import detect_go_status
@@ -139,23 +139,48 @@ def _python_conflict_action(python_status: PythonStatusInfo) -> DevPlanAction:
     )
 
 
+def _node_manager_conflict(node_status: NodeStatusInfo) -> bool:
+    """True when Node runtime ownership is ambiguous: more than one
+    manager present, or exactly one manager present that isn't fnm.
+    Single source of truth shared by ``_node_manager_action`` and
+    ``_pnpm_action`` (S3R corrective - see docs/development/
+    node-strategy.md's "Node manager conflict state machine")."""
+    managers = node_status.managers
+    if len(managers) > 1:
+        return True
+    return len(managers) == 1 and not node_status.fnm.installed
+
+
 def _node_manager_action(node_status: NodeStatusInfo) -> DevPlanAction:
     action_id, component, action = "node.manager", "node", "install_tool"
+    managers = node_status.managers
+    if len(managers) > 1:
+        detected = ", ".join(managers)
+        return DevPlanAction(
+            action_id, component, action, "fnm", "language-bootstrap-tool",
+            detected, "fnm",
+            f"Multiple Node version managers are already present ({detected}). "
+            "Serein will not select, remove, or layer another manager until the "
+            "user chooses which existing manager should own Node runtime "
+            "management.",
+            False, True, "none", "n/a", "BLOCKED",
+        )
+    if len(managers) == 1 and not node_status.fnm.installed:
+        other = managers[0]
+        return DevPlanAction(
+            action_id, component, action, "fnm", "language-bootstrap-tool",
+            other, "fnm",
+            f"An existing Node version manager ({other}) is already present. "
+            "Serein will not layer fnm on top of it; choose which manager "
+            "should own Node runtime management before Serein provisions "
+            "another.",
+            False, True, "none", "n/a", "BLOCKED",
+        )
     if node_status.fnm.installed:
         return DevPlanAction(
             action_id, component, action, "fnm", "language-bootstrap-tool",
             node_status.fnm.version, node_status.fnm.version,
             "fnm is already installed.", False, True, "none", "fnm --version", "NOOP",
-        )
-    if node_status.manager_count > 0:
-        other = "mise" if node_status.mise.installed else "nvm"
-        return DevPlanAction(
-            action_id, component, action, "fnm", "language-bootstrap-tool",
-            other, "fnm",
-            f"Existing Node management detected ({other}); choose which manager Serein "
-            "should integrate before provisioning another. Serein does not fight "
-            "existing user tooling.",
-            False, True, "none", "n/a", "BLOCKED",
         )
     return DevPlanAction(
         action_id, component, action, "fnm", "language-bootstrap-tool",
@@ -173,6 +198,16 @@ def _pnpm_action(node_status: NodeStatusInfo) -> DevPlanAction:
             "node.pnpm", "node", "install_tool", "pnpm", "official-upstream-binary",
             node_status.pnpm.version, node_status.pnpm.version,
             "pnpm is already installed.", False, True, "none", "pnpm --version", "NOOP",
+        )
+    if _node_manager_conflict(node_status):
+        return DevPlanAction(
+            "node.pnpm", "node", "install_tool", "pnpm", "official-upstream-binary",
+            "not installed", None,
+            "Node runtime management is unresolved (see node.manager); Serein "
+            "will not provision pnpm until an existing or chosen Node manager "
+            "owns the Node runtime, to avoid adding a second ambiguous "
+            "PATH/config source on top of an already-ambiguous Node setup.",
+            False, True, "none", "n/a", "BLOCKED",
         )
     return DevPlanAction(
         "node.pnpm", "node", "install_tool", "pnpm", "official-upstream-binary",
@@ -226,18 +261,7 @@ def _go_action(go_status: GoStatusInfo) -> DevPlanAction:
 
 
 def _cpp_action(cpp_status: CppStatusInfo) -> DevPlanAction:
-    installed_map = {
-        "build-essential": cpp_status.gcc.installed,
-        "gcc": cpp_status.gcc.installed,
-        "g++": cpp_status.gpp.installed,
-        "clang": cpp_status.clang.installed,
-        "cmake": cpp_status.cmake.installed,
-        "ninja-build": cpp_status.ninja.installed,
-        "pkg-config": cpp_status.pkg_config.installed,
-        "gdb": cpp_status.gdb.installed,
-        "lldb": cpp_status.lldb.installed,
-        "strace": cpp_status.strace.installed,
-    }
+    installed_map = cpp_installed_map(cpp_status)
     installed_ids = {t.id for t in CPP_TOOLS if installed_map.get(t.package or "", False)}
     return _apt_group_action("cpp.toolchain", "cpp", CPP_TOOLS, installed_ids)
 

@@ -146,8 +146,23 @@ class NodeStatusInfo:
     npm: ToolStatus
 
     @property
+    def managers(self) -> tuple[str, ...]:
+        """Detected Node version managers, in a stable order. Single
+        source of truth for "which managers are present" - the planner
+        and doctor both derive their conflict decisions from this
+        instead of each re-enumerating fnm/mise/nvm independently."""
+        detected = []
+        if self.fnm.installed:
+            detected.append("fnm")
+        if self.mise.installed:
+            detected.append("mise")
+        if self.nvm_present:
+            detected.append("nvm")
+        return tuple(detected)
+
+    @property
     def manager_count(self) -> int:
-        return sum([self.fnm.installed, self.mise.installed, self.nvm_present])
+        return len(self.managers)
 
 
 @dataclass
@@ -173,6 +188,11 @@ class CppStatusInfo:
     lldb: ToolStatus
     pkg_config: ToolStatus
     strace: ToolStatus
+    #: dpkg package-installation state for the ``build-essential``
+    #: metapackage - deliberately not a ``ToolStatus`` (it owns no
+    #: binary/version of its own) and never inferred from ``gcc``'s
+    #: presence. See ``serein.development.dpkg``.
+    build_essential_installed: bool = False
 
 
 @dataclass
