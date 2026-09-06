@@ -60,6 +60,13 @@ class CyberToolDefinition:
     reversible: bool
     risk: str  # "none" | "low" | "medium" | "high"
     reason: str
+    # host-tier only: is this tool part of Serein's *default* installed
+    # baseline, or merely appropriate-for-host-if-chosen? A tool can be
+    # recommended_tier="host" (it's fine to have on a desktop host) yet
+    # default_install=False (Serein does not force it onto every host) -
+    # these are deliberately independent (S5R corrective Section 10).
+    # Meaningless for non-host tiers; always True there.
+    default_install: bool = True
 
 
 @dataclass
@@ -154,6 +161,32 @@ class VMCapabilityInfo:
     #: device); None when the device doesn't exist or can't be
     #: checked.
     user_access: bool | None = None
+
+
+VM_READINESS_STATUSES: tuple[str, ...] = (
+    "blocked_no_hardware", "blocked_module_missing", "blocked_no_access",
+    "blocked_access_unknown", "needs_qemu", "needs_libvirt", "ready",
+)
+
+
+@dataclass(frozen=True)
+class VMReadiness:
+    """The single canonical VM-readiness verdict, computed once
+    (``virtualization.evaluate_vm_readiness``) from a ``VMCapabilityInfo``
+    and consumed identically by ``capabilities.py``, ``planner.py``, and
+    ``doctor.py`` (S5R corrective Section 17-18) — none of them derives
+    "is a VM usable" independently any more. Canonical managed VM stack
+    is KVM + QEMU + libvirt (Section 17's preferred contract); ``usable``
+    is only ever ``True`` for ``status == "ready"``, and ``user_access is
+    None`` is always treated as not-ready, never guessed true (Section 20)."""
+
+    hardware_available: bool
+    user_access: bool | None
+    qemu_ready: bool
+    libvirt_ready: bool
+    usable: bool
+    status: str  # one of VM_READINESS_STATUSES
+    reason: str
 
 
 @dataclass

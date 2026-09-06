@@ -9,7 +9,15 @@ a different design), and plain ``--version``-style binary probes for
 creates a VM, never modifies groups. "VM usable" is never inferred
 from one binary alone (Section 35) — ``VMCapabilityInfo`` keeps
 device presence, kernel module state, both binaries, and user access
-as separate fields; callers decide what combination means "ready".
+as separate fields.
+
+``evaluate_vm_readiness()`` is the single canonical function that turns
+those independent fields into one readiness verdict (S5R corrective
+Section 17-18) — ``capabilities.py``, ``planner.py``, and ``doctor.py``
+all call this instead of each deriving "is a VM usable" separately,
+which had previously let the capability and the planner disagree about
+whether libvirt was required. Canonical managed stack: KVM + QEMU +
+libvirt.
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from serein.cyber.models import VMCapabilityInfo
+from serein.cyber.models import VMCapabilityInfo, VMReadiness
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.development.toolchains import probe_tool
 from serein.hardware._util import DEFAULT_ROOT, read_text
@@ -61,4 +69,58 @@ def detect_vm_status(
         qemu=probe_tool("qemu-system-x86_64", "qemu-system-x86_64", runner=runner),
         libvirt=probe_tool("virsh", "virsh", version_args=("--version",), runner=runner),
         user_access=_kvm_user_access(root, kvm_present),
+    )
+
+
+def evaluate_vm_readiness(vm: VMCapabilityInfo) -> VMReadiness:
+    """The single canonical VM-readiness verdict (S5R Section 17-18).
+    Checked in a fixed order, each a hard requirement for the next -
+    ``usable`` is ``True`` only for the final ``"ready"`` status, and
+    ``user_access is None`` is always treated as not-ready (Section 20:
+    unknown is never guessed true)."""
+    if not vm.kvm_device_present:
+        return VMReadiness(
+            False, vm.user_access, vm.qemu.installed, vm.libvirt.installed, False,
+            "blocked_no_hardware",
+            "/dev/kvm is not present - hardware virtualization is "
+            "unavailable or not exposed to this environment.",
+        )
+    if not vm.kvm_module_loaded:
+        return VMReadiness(
+            True, vm.user_access, vm.qemu.installed, vm.libvirt.installed, False,
+            "blocked_module_missing",
+            "/dev/kvm exists but the kvm kernel module is not loaded.",
+        )
+    if vm.user_access is None:
+        return VMReadiness(
+            True, None, vm.qemu.installed, vm.libvirt.installed, False,
+            "blocked_access_unknown",
+            "Whether the current user can access /dev/kvm could not be "
+            "determined - treated as not-ready, never guessed true.",
+        )
+    if vm.user_access is False:
+        return VMReadiness(
+            True, False, vm.qemu.installed, vm.libvirt.installed, False,
+            "blocked_no_access",
+            "/dev/kvm is present but the current user cannot read/write it - "
+            "this requires explicit future user/admin action (e.g. kvm "
+            "group membership); Serein never modifies group membership "
+            "automatically.",
+        )
+    if not vm.qemu.installed:
+        return VMReadiness(
+            True, True, False, vm.libvirt.installed, False, "needs_qemu",
+            "Hardware virtualization and device access are ready; qemu is "
+            "not yet installed.",
+        )
+    if not vm.libvirt.installed:
+        return VMReadiness(
+            True, True, True, False, False, "needs_libvirt",
+            "Hardware virtualization, device access, and qemu are ready; "
+            "libvirt is not yet installed.",
+        )
+    return VMReadiness(
+        True, True, True, True, True, "ready",
+        "KVM device, kernel module, user access, qemu, and libvirt are all "
+        "confirmed present.",
     )

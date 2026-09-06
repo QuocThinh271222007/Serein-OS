@@ -8,6 +8,19 @@ wrapper over S3's `serein.development.containers.detect_container_status`
 directly satisfies Section 5's "mechanism: Distrobox + Podman, reusing
 S3's container architecture" instruction.
 
+## Engine/Distrobox presence ≠ confirmed runtime usability
+
+`capabilities.py`'s `container_toolbox` capability's `usable` field is
+always `None`, even when Podman/Docker and Distrobox are both installed
+(S5R corrective, Section 31-34): binary presence does not prove the
+rootless engine's storage/network namespace actually works, or that
+Distrobox can genuinely create/start a container in this environment.
+Confirming that would require actually running/creating a container
+(`podman run`, `distrobox create`) — exactly what S5's detection layer
+must never do. `installed` still reflects real presence (engine +
+Distrobox both found); `usable` stays conservative rather than
+overstating what presence alone proves.
+
 ## Rootless by default; no privileged defaults, ever
 
 `planner.py`'s `_toolbox_engine_action` plans Podman as the default
@@ -52,18 +65,29 @@ strategy.
 
 ## Web-security tooling is individually classified, not bulk-included
 
-`mitmproxy` (toolbox/optional host — CLI-friendly, `uv`-managed Python,
-never system Python), Burp Suite Community (toolbox/user-managed GUI —
-no automated proprietary installer or license acceptance), OWASP ZAP
+`mitmproxy` (toolbox — `uv`-managed Python, never system Python; see
+below for why apt is deliberately *not* used despite a package
+existing), Burp Suite Community (toolbox/user-managed GUI — no
+automated proprietary installer or license acceptance), OWASP ZAP
 (toolbox/user-managed GUI — Linux distribution mechanism verified per-
-release, not assumed to be Flatpak/Snap), `ffuf`/`gobuster` (toolbox,
-small Go binaries), `nikto`/`sqlmap` (toolbox). None are bundled onto
-the host.
+release, not assumed to be Flatpak/Snap), `ffuf`/`gobuster`/`sqlmap`
+(toolbox — real, current Ubuntu 26.04 packages, preferred over an
+upstream binary/git-clone install; see
+`docs/cyber/tool-classification.md`), `nikto` (toolbox). None are
+bundled onto the host.
 
-## Python/Go/Rust cyber tooling never targets system Python
+## Python/Go/Rust cyber tooling: apt preferred when current, uv/toolbox otherwise
 
-Reuses S3's `uv` ownership policy exactly: `pwntools`, `impacket`,
-`mitmproxy`, `volatility` are `uv`-managed or toolbox-installed, never
-`pip install`ed into system Python. `go install`/`cargo install`
-security tools default to the toolbox unless a specific tool is small
-and justified enough to be host-tier (none currently are).
+Reuses S3's `uv` ownership policy: a Python-based tool is `uv`-managed,
+never `pip install`ed into system Python, specifically when its Ubuntu
+package would be a meaningful step behind upstream. `mitmproxy` is the
+concrete case — Ubuntu 26.04 carries `8.1.1-4` while upstream is at
+`12.2.3` (live-confirmed, a 4-major-version gap), so it stays
+`python-package-index`/`uv`-managed rather than apt. `pwntools`/
+`impacket`/`volatility` follow the same rule. Go-sourced security tools
+(`ffuf`, `gobuster`) are the opposite case: their Ubuntu 26.04 packages
+are current (gobuster's apt version exactly matches upstream's latest
+tag; ffuf is one minor release behind) and are therefore preferred over
+a `go install`/upstream-binary install — reducing supply-chain
+complexity is worth more than chasing the very latest patch release
+when the two are this close (S5R Section 24/26).

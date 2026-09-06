@@ -92,9 +92,18 @@ HOST_CAPTURE_TOOLS: tuple[CyberToolDefinition, ...] = (
     CyberToolDefinition(
         "wireshark", "Wireshark", "packet-capture", "ubuntu-repository", "wireshark",
         "host", True, True, True, "low",
-        "GUI packet analysis - optional on headless hosts; tshark covers "
-        "the same CLI-safe capability. Serein never mutates dumpcap's "
+        "GUI packet analysis - fully appropriate to have on a desktop "
+        "host (recommended_tier=host), but NOT part of Serein's default "
+        "install baseline (default_install=False): live validation found "
+        "installing the full GUI package pulls a complete Qt6/GTK "
+        "dependency stack (169 packages resolved vs. 48 for tshark alone "
+        "- see docs/validation/s5/package-validation.md Finding 2), and "
+        "tshark/wireshark-common already supply the compact default "
+        "CLI-safe capture stack (Section 38/37). A user who wants the "
+        "GUI may still install it; Serein just never forces its weight "
+        "onto every host by default. Serein never mutates dumpcap's "
         "file capabilities or group membership to enable capture.",
+        default_install=False,
     ),
 )
 
@@ -138,7 +147,12 @@ TOOLBOX_WEB_TOOLS: tuple[CyberToolDefinition, ...] = (
         "mitmproxy", "mitmproxy", "web-security", "python-package-index", "mitmproxy",
         "toolbox", False, False, True, "low",
         "TLS-intercepting proxy - installed via uv into an isolated "
-        "environment/toolbox, never system Python (Section 42/43).",
+        "environment/toolbox, never system Python (Section 42/43). Ubuntu "
+        "26.04 does carry an apt package (8.1.1-4, live-confirmed), but it "
+        "is significantly stale against upstream's current 12.2.3 release "
+        "(a 4-major-version gap spanning substantial HTTP/addon-API "
+        "changes) - a deliberate exception to the 'prefer apt when "
+        "reasonably current' default (S5R Section 24/26), not inertia.",
     ),
     CyberToolDefinition(
         "burpsuite", "Burp Suite Community", "web-security", "optional", None,
@@ -155,15 +169,21 @@ TOOLBOX_WEB_TOOLS: tuple[CyberToolDefinition, ...] = (
         "toolbox-hosted (Section 41).",
     ),
     CyberToolDefinition(
-        "ffuf", "ffuf", "web-security", "official-upstream-binary", None,
-        "toolbox", False, False, True, "low",
-        "Go-installed fuzzing tool - toolbox, not host, per S3's "
-        "Go-tool-ownership rules (Section 44).",
+        "ffuf", "ffuf", "web-security", "ubuntu-repository", "ffuf",
+        "toolbox", True, False, True, "low",
+        "Web fuzzing tool - real, reasonably current Ubuntu 26.04 package "
+        "(2.1.0-1build1 vs. upstream's current 2.2.1 - one minor release "
+        "behind, live-confirmed), preferred over an upstream Go-binary "
+        "install to reduce supply-chain complexity (S5R Section 26); "
+        "toolbox-tier, not host, regardless of source.",
     ),
     CyberToolDefinition(
-        "gobuster", "gobuster", "web-security", "official-upstream-binary", None,
-        "toolbox", False, False, True, "low",
-        "Go-installed content/DNS bruteforce tool - toolbox only.",
+        "gobuster", "gobuster", "web-security", "ubuntu-repository", "gobuster",
+        "toolbox", True, False, True, "low",
+        "Content/DNS bruteforce tool - real Ubuntu 26.04 package "
+        "(3.8.2-1) exactly matching upstream's current v3.8.2 release, "
+        "live-confirmed; preferred over an upstream Go-binary install "
+        "(S5R Section 26). Toolbox-tier, not host.",
     ),
     CyberToolDefinition(
         "nikto", "Nikto", "web-security", "official-upstream-binary", None,
@@ -171,10 +191,14 @@ TOOLBOX_WEB_TOOLS: tuple[CyberToolDefinition, ...] = (
         "Web server scanner - active-scanning tool, toolbox only.",
     ),
     CyberToolDefinition(
-        "sqlmap", "sqlmap", "web-security", "official-upstream-binary", None,
-        "toolbox", False, False, True, "high",
+        "sqlmap", "sqlmap", "web-security", "ubuntu-repository", "sqlmap",
+        "toolbox", True, False, True, "high",
         "Automated SQL injection tool - toolbox only, never host "
-        "baseline (Section 12).",
+        "baseline (Section 12). Real Ubuntu 26.04 package (1.10.4-1, "
+        "live-confirmed); upstream sqlmap has no frequent tagged release "
+        "beyond its last 1.10 tag and is otherwise developed continuously "
+        "on its master branch, so Ubuntu's packaged snapshot is preferred "
+        "over an ad hoc git-clone-of-master install (S5R Section 26/30).",
     ),
 )
 
@@ -291,7 +315,20 @@ def all_tools() -> list[CyberToolDefinition]:
 
 
 def host_tools() -> list[CyberToolDefinition]:
+    """Every tool appropriate to have on the host, IF the user chooses
+    it. Not the same as the default install set - see
+    ``default_host_tools()`` (S5R Section 10: tier != default)."""
     return [t for t in all_tools() if t.recommended_tier == "host"]
+
+
+def default_host_tools() -> list[CyberToolDefinition]:
+    """The strict subset of ``host_tools()`` Serein actually installs
+    by default (``default_install=True``) - e.g. Wireshark's GUI is
+    ``recommended_tier="host"`` (appropriate to have) but
+    ``default_install=False`` (not forced onto every host). This is the
+    single canonical source both the planner and the profile manifest
+    must derive from (Section 12-13) - never duplicated independently."""
+    return [t for t in host_tools() if t.default_install]
 
 
 def toolbox_tools() -> list[CyberToolDefinition]:
@@ -301,12 +338,13 @@ def toolbox_tools() -> list[CyberToolDefinition]:
 def default_apt_packages() -> list[str]:
     """Every apt package Serein's *default* host-tier manifest
     requests, deduplicated and sorted - mirrors S3/S4's own
-    ``default_apt_packages()`` shape. Only host-tier, ubuntu-repository
-    tools contribute - toolbox/VM/user-managed tools are documented,
-    never part of a default host install."""
+    ``default_apt_packages()`` shape. Only default-install,
+    ubuntu-repository host-tier tools contribute - toolbox/VM/
+    user-managed tools, and host-tier-but-optional tools (Wireshark
+    GUI), are documented but never part of a default host install."""
     seen: set[str] = set()
     result: list[str] = []
-    for tool in host_tools():
+    for tool in default_host_tools():
         if tool.source_type == "ubuntu-repository" and tool.package and tool.package not in seen:
             seen.add(tool.package)
             result.append(tool.package)

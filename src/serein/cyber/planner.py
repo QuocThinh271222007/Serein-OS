@@ -35,8 +35,8 @@ from serein.cyber.models import (
 from serein.cyber.network import detect_network_status
 from serein.cyber.reverse import detect_reverse_status
 from serein.cyber.toolbox import detect_toolbox_status
-from serein.cyber.tools import all_tools
-from serein.cyber.virtualization import detect_vm_status
+from serein.cyber.tools import default_host_tools
+from serein.cyber.virtualization import detect_vm_status, evaluate_vm_readiness
 from serein.development.models import ToolStatus
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.development.toolchains import probe_tool
@@ -63,7 +63,6 @@ def _host_installed_map(
         "mtr-tiny": network.mtr.installed,
         "ethtool": network.ethtool.installed,
         "tshark": capture.tshark.installed,
-        "wireshark": capture.wireshark.installed,
         "file": reverse.file.installed,
         "binutils": reverse.binutils.installed,
         "libimage-exiftool-perl": exiftool.installed,
@@ -78,8 +77,13 @@ def _host_baseline_action(
 ) -> CyberPlanAction:
     """One canonical Host Cyber Light group action (Section 27 —
     "create ONE canonical manifest, do not create a kitchen sink"),
-    mirroring S3's ``_base_action``/``_apt_group_action`` pattern."""
-    host_tools = [t for t in all_tools() if t.recommended_tier == "host" and t.package]
+    mirroring S3's ``_base_action``/``_apt_group_action`` pattern.
+
+    Uses ``default_host_tools()`` (default-install subset), never every
+    ``recommended_tier == "host"`` tool — a tool can be host-appropriate
+    without being part of the forced default baseline (Wireshark's GUI
+    package is the concrete example; S5R corrective Section 14)."""
+    host_tools = [t for t in default_host_tools() if t.package]
     installed_map = _host_installed_map(network, capture, reverse, exiftool)
     missing = [t for t in host_tools if not installed_map.get(t.package or "", False)]
     tool_names = ", ".join(t.package or t.id for t in host_tools)
@@ -163,35 +167,48 @@ def _toolbox_distrobox_action(
 _VM_PACKAGES = "qemu-system-x86, libvirt-daemon-system, libvirt-clients"
 
 
+_VM_BLOCKED_STATUSES = (
+    "blocked_no_hardware", "blocked_module_missing",
+    "blocked_no_access", "blocked_access_unknown",
+)
+
+
 def _vm_prerequisites_action(vm: VMCapabilityInfo) -> CyberPlanAction:
     """``tool``/``target`` list real Ubuntu apt package names, not the
     probed binary names (``qemu-system-x86_64``/``virsh``) - live
     validation on Ubuntu 26.04 found no ``qemu-system-x86_64`` or
     ``libvirt`` package (see docs/validation/s5/package-validation.md);
     the packages that actually provide those binaries are
-    ``qemu-system-x86`` and ``libvirt-daemon-system``/``libvirt-clients``."""
+    ``qemu-system-x86`` and ``libvirt-daemon-system``/``libvirt-clients``.
+
+    Consumes ``evaluate_vm_readiness()`` (S5R Section 17-18) - the same
+    canonical verdict ``capabilities.py``'s ``vm_isolation`` and
+    ``doctor.py``'s VM check use, so ``vm_isolation.usable == True``
+    always implies this action's status is ``NOOP`` (Section 22/43
+    invariant) and a present-but-inaccessible/unknown-access ``/dev/kvm``
+    is always ``BLOCKED``, never treated as though prerequisites alone
+    make a VM usable (Section 19-20)."""
     action_id, component, action = "vm.prerequisites", "vm", "install_apt_packages"
-    if not vm.kvm_device_present:
+    readiness = evaluate_vm_readiness(vm)
+    if readiness.status in _VM_BLOCKED_STATUSES:
         return CyberPlanAction(
             action_id, component, action, _VM_PACKAGES, "ubuntu-repository",
-            "kvm unavailable", None,
-            "/dev/kvm not present - hardware virtualization is unavailable "
-            "or not exposed to this environment. Serein will not plan VM "
-            "prerequisites without it.", False, True, "none", "n/a", "BLOCKED",
+            readiness.status, None, readiness.reason,
+            False, True, "none", "n/a", "BLOCKED",
         )
-    if vm.qemu.installed and vm.libvirt.installed:
+    if readiness.status == "ready":
         return CyberPlanAction(
             action_id, component, action, _VM_PACKAGES, "ubuntu-repository",
-            "installed", "installed",
-            "KVM device present and qemu/libvirt already installed.",
+            "installed", "installed", readiness.reason,
             False, True, "none", "qemu-system-x86_64 --version", "NOOP",
         )
+    # needs_qemu / needs_libvirt: hardware+access already confirmed ready,
+    # only the package layer is missing.
     return CyberPlanAction(
         action_id, component, action, _VM_PACKAGES, "ubuntu-repository",
         "not installed", _VM_PACKAGES,
-        "KVM device present; qemu/libvirt prerequisites can be installed. "
-        "Serein never creates a VM, never downloads an ISO, and never "
-        "modifies groups (Section 34/66/67).",
+        readiness.reason + " Serein never creates a VM, never downloads an "
+        "ISO, and never modifies groups (Section 34/66/67).",
         True, True, "low", "qemu-system-x86_64 --version", "APPLY",
     )
 

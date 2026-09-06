@@ -20,6 +20,7 @@ from serein.cyber.models import CYBER_TIERS
 from serein.cyber.planner import VALID_COMPONENTS, build_cyber_plan
 from serein.cyber.toolbox import detect_host_hygiene, detect_toolbox_status
 from serein.cyber.tools import all_tools
+from serein.cyber.virtualization import detect_vm_status, evaluate_vm_readiness
 from serein.development.models import ToolSourceType
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.doctor.models import SCHEMA_VERSION, CheckResult, CheckStatus, DoctorReport
@@ -32,6 +33,7 @@ _PLAN_CHECK = ("cyber_plan_generation", "Cyber plan generation")
 _HYGIENE_CHECK = ("cyber_host_hygiene", "Host-heavy tooling on the daily host")
 _CAPTURE_CHECK = ("cyber_capture_backend_consistency", "Packet capture backend consistency")
 _CONTAINER_ENGINE_CHECK = ("cyber_container_engine_conflict", "Toolbox container engine conflicts")
+_VM_READINESS_CHECK = ("cyber_vm_readiness", "VM isolation readiness")
 
 _VALID_SOURCE_TYPES: set[ToolSourceType] = {
     "ubuntu-repository", "official-upstream-repository", "official-upstream-binary",
@@ -103,6 +105,11 @@ def _check_host_hygiene(runner: CommandRunner) -> CheckResult:
 
 
 def _check_capture_backend_consistency(runner: CommandRunner) -> CheckResult:
+    """Distinguishes backend-missing / permission-denied / permission-
+    unknown (S5R Section 8) - never FAILs a clean/unprovisioned system.
+    Explicit denial is WARN (actionable: the user may want to know);
+    "unknown" is PASS (most hosts never need capture set up, and
+    guessing a problem into existence would be false certainty)."""
     check_id, title = _CAPTURE_CHECK
     capture = detect_capture_status(runner=runner)
     gui_or_cli_present = capture.wireshark.installed or capture.tshark.installed
@@ -111,6 +118,13 @@ def _check_capture_backend_consistency(runner: CommandRunner) -> CheckResult:
             "wireshark/tshark is installed but dumpcap is not - a partial "
             "or broken capture-tooling install (dumpcap is the shared "
             "capture backend both depend on)."
+        )
+        return CheckResult(check_id, title, CheckStatus.WARN, detail)
+    if capture.dumpcap.installed and capture.capture_permitted is False:
+        detail = (
+            "dumpcap is installed but capture is not permitted for the "
+            f"current user ({capture.capture_permission_reason}) - Serein "
+            "never grants capture privileges automatically."
         )
         return CheckResult(check_id, title, CheckStatus.WARN, detail)
     detail = "No capture-backend inconsistency detected."
@@ -128,6 +142,24 @@ def _check_container_engine_conflict(runner: CommandRunner) -> CheckResult:
     return CheckResult(check_id, title, CheckStatus.PASS, "No conflicting container engines.")
 
 
+def _check_vm_readiness(root: Path, runner: CommandRunner) -> CheckResult:
+    """Consumes the same ``evaluate_vm_readiness()`` verdict
+    ``capabilities.py``/``planner.py`` use (S5R Section 17-18/21) - never
+    FAILs an environment with no KVM hardware, since that is simply the
+    common case, not a broken state."""
+    check_id, title = _VM_READINESS_CHECK
+    vm = detect_vm_status(runner=runner, root=root)
+    readiness = evaluate_vm_readiness(vm)
+    if readiness.status == "blocked_no_hardware":
+        return CheckResult(check_id, title, CheckStatus.SKIP, readiness.reason)
+    if readiness.status == "ready":
+        return CheckResult(check_id, title, CheckStatus.PASS, readiness.reason)
+    # blocked_module_missing / blocked_no_access / blocked_access_unknown /
+    # needs_qemu / needs_libvirt: hardware exists but the chain isn't
+    # complete yet - worth knowing about, never a hard failure.
+    return CheckResult(check_id, title, CheckStatus.WARN, readiness.reason)
+
+
 def run_cyber_checks(
     root: Path = DEFAULT_ROOT, runner: CommandRunner = DEFAULT_RUNNER
 ) -> DoctorReport:
@@ -138,5 +170,6 @@ def run_cyber_checks(
         _check_host_hygiene(runner),
         _check_capture_backend_consistency(runner),
         _check_container_engine_conflict(runner),
+        _check_vm_readiness(root, runner),
     ]
     return DoctorReport(schema_version=SCHEMA_VERSION, checks=checks)

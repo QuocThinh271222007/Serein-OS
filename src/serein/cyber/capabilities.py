@@ -24,7 +24,7 @@ from serein.cyber.models import CyberCapability as Capability
 from serein.cyber.network import detect_network_status
 from serein.cyber.reverse import detect_reverse_status
 from serein.cyber.toolbox import detect_host_hygiene, detect_toolbox_status
-from serein.cyber.virtualization import detect_vm_status
+from serein.cyber.virtualization import detect_vm_status, evaluate_vm_readiness
 from serein.development.containers import container_capability_available
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.hardware._util import DEFAULT_ROOT
@@ -146,27 +146,24 @@ def build_cyber_capabilities(
     )
 
     container_installed = containers.podman.installed or containers.docker.installed
-    toolbox_usable = container_available and container_installed and containers.distrobox.installed
     capabilities.append(
         Capability(
-            "container_toolbox", container_available, container_installed, toolbox_usable,
+            "container_toolbox", container_available, container_installed, None,
             "podman + distrobox", "ubuntu-repository", "high",
-            "Reuses S3's container detection directly - a working engine + "
-            "Distrobox means Serein could plan a toolbox; none is created yet.",
+            "Reuses S3's container detection directly - engine/Distrobox "
+            "presence is confirmed, but Serein never runs/creates a "
+            "container merely to prove rootless runtime usability "
+            "(S5R Section 32-34); usable is always None, conservative by "
+            "design, never inferred from binary presence alone.",
         )
     )
 
-    vm_usable = (
-        vm.kvm_device_present and vm.kvm_module_loaded
-        and vm.user_access is True and vm.qemu.installed
-    )
+    readiness = evaluate_vm_readiness(vm)
     capabilities.append(
         Capability(
-            "vm_isolation", True, vm.qemu.installed or vm.libvirt.installed, vm_usable,
-            "qemu-system-x86_64 + KVM", "ubuntu-repository", "high",
-            "Full evidence chain required for usable=true: KVM device, "
-            "kernel module, user access, and qemu all confirmed (Section 35) "
-            "- never inferred from one binary alone. Required for Kali/"
+            "vm_isolation", True, vm.qemu.installed or vm.libvirt.installed,
+            readiness.usable, "qemu-system-x86 + libvirt + KVM", "ubuntu-repository", "high",
+            readiness.reason + " Required for Kali/"
             "malware/full-offensive workloads (Section 20/36).",
         )
     )

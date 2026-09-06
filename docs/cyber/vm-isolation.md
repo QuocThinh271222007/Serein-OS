@@ -13,14 +13,34 @@ libvirt: ToolStatus          # virsh --version
 user_access: bool | None     # real os.access(R_OK|W_OK) on /dev/kvm
 ```
 
-`capabilities.py`'s `vm_isolation` capability's `usable` field requires
-the full AND-chain of all five (`kvm_device_present and
-kvm_module_loaded and user_access is True and qemu.installed`) —
-mirroring the same "don't derive independently in multiple places"
-discipline S2R/S4R established for GPU/container capability
-consistency. This is unit-tested
-(`tests/test_cyber.py::TestCapabilities::test_vm_isolation_usable_requires_full_chain` —
-`qemu` alone, with no KVM device, must never report `usable=True`).
+`virtualization.evaluate_vm_readiness(vm) -> VMReadiness` is the single
+canonical function that turns those five fields into one readiness
+verdict — `capabilities.py`'s `vm_isolation.usable`, `planner.py`'s
+`vm.prerequisites` action, and `doctor.py`'s `cyber_vm_readiness` check
+all consume this same result rather than each deriving "is a VM usable"
+independently (S5R corrective, Section 17-18 — an earlier pass had let
+the capability and the planner disagree about whether `libvirt` was
+required, and let the planner treat `qemu`/`libvirt` presence as
+sufficient even when `user_access` was `False` or unknown). The
+canonical managed stack is **KVM + QEMU + libvirt**, checked in a fixed
+order, each a hard requirement for the next:
+
+```
+kvm_device_present=False        → "blocked_no_hardware"   (usable=False)
+kvm_module_loaded=False         → "blocked_module_missing" (usable=False)
+user_access is None             → "blocked_access_unknown" (usable=False)
+user_access is False            → "blocked_no_access"      (usable=False)
+qemu not installed              → "needs_qemu"              (usable=False)
+libvirt not installed           → "needs_libvirt"           (usable=False)
+everything above satisfied      → "ready"                   (usable=True)
+```
+
+`user_access is None` (unknown) is always treated as not-ready — never
+guessed `True` (Section 20). This makes `vm_isolation.usable == True`
+imply `vm.prerequisites.status == "NOOP"` by construction, and is
+unit-tested directly
+(`tests/test_cyber.py::TestVMReadiness`/`TestCapabilities::test_vm_isolation_usable_requires_full_chain`
+— `qemu` alone, with no KVM device, must never report `usable=True`).
 
 ## What requires a VM (never Distrobox, never a rootless container)
 
@@ -63,13 +83,16 @@ not exist as apt package names on Ubuntu 26.04. See
 `docs/validation/s5/package-validation.md` Finding 4 for the live
 evidence behind this correction.
 
-- **KVM device absent** → `BLOCKED`. Serein will not plan VM
-  prerequisites without hardware virtualization actually being exposed
-  to the environment.
-- **KVM present, qemu/libvirt missing** → `APPLY` (install
-  prerequisites only — never creates a VM, never downloads an ISO,
-  never modifies groups).
-- **KVM present, qemu/libvirt installed** → `NOOP`.
+- **KVM device absent, module not loaded, `/dev/kvm` access denied, or
+  access unknown** → `BLOCKED`. Serein will not say VM prerequisites
+  "can be used" merely because packages could be installed — the user
+  genuinely cannot run KVM yet, and fixing that (e.g. `kvm` group
+  membership) is an explicit future user/admin action Serein never
+  performs automatically.
+- **Hardware and access confirmed ready, qemu/libvirt missing** →
+  `APPLY` (install prerequisites only — never creates a VM, never
+  downloads an ISO, never modifies groups).
+- **Full chain ready (hardware, access, qemu, libvirt)** → `NOOP`.
 
 ## No ISO download, ever
 
