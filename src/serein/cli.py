@@ -14,6 +14,11 @@ import sys
 from collections.abc import Sequence
 
 from serein import __version__
+from serein.ai.capabilities import build_ai_capabilities
+from serein.ai.doctor import run_ai_checks
+from serein.ai.planner import VALID_COMPONENTS as AI_VALID_COMPONENTS
+from serein.ai.planner import build_ai_plan
+from serein.ai.status import build_ai_status
 from serein.core.status import build_status_report
 from serein.desktop.config import RESOURCES, missing_resources
 from serein.desktop.doctor import run_desktop_checks
@@ -65,6 +70,25 @@ _DEV_CAPABILITY_LABELS = {
     "zed_editor": "Zed editor",
     "container_engine": "Container engine",
     "distrobox": "Distrobox",
+}
+
+_AI_CAPABILITY_LABELS = {
+    "nvidia_hardware": "NVIDIA hardware",
+    "nvidia_driver": "NVIDIA driver",
+    "cuda_runtime": "CUDA driver runtime",
+    "cuda_toolkit": "CUDA Toolkit",
+    "rocm_runtime": "ROCm runtime",
+    "intel_gpu_runtime": "Intel GPU runtime",
+    "pytorch": "PyTorch",
+    "pytorch_cuda": "PyTorch (CUDA)",
+    "pytorch_rocm": "PyTorch (ROCm)",
+    "pytorch_cpu": "PyTorch (CPU)",
+    "ollama": "Ollama",
+    "llama_cpp": "llama.cpp",
+    "vllm": "vLLM",
+    "onnxruntime": "ONNX Runtime",
+    "tensorrt": "TensorRT",
+    "ai_container_runtime": "AI container runtime",
 }
 
 
@@ -396,6 +420,110 @@ def _cmd_dev_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_ai_status(_args: argparse.Namespace) -> int:
+    status = build_ai_status()
+    print("SEREIN AI")
+    print()
+    print(f"Profile        {status.profile_id} ({status.profile_status})")
+    print()
+    print("Backend")
+    backend_conf = status.backend.primary_confidence
+    print(f"  primary        {status.backend.primary} (confidence: {backend_conf})")
+    print(f"  hybrid         {_yes_no_unknown(status.backend.hybrid)}")
+    print()
+    print("NVIDIA")
+    print(f"  hardware       {'yes' if status.nvidia.hardware_present else 'no'}")
+    print(_tool_line("nvidia-smi", status.nvidia.nvidia_smi))
+    print(f"  driver         {status.nvidia.driver_version or 'missing'}")
+    print(f"  CUDA (driver)  {status.nvidia.cuda_driver_api_version or 'unknown'}")
+    print(f"  CUDA Toolkit   {'yes' if status.nvidia.cuda_toolkit_installed else 'no'}")
+    print(_tool_line("nvidia-ctk", status.nvidia.nvidia_ctk))
+    print()
+    print("AMD")
+    print(f"  hardware       {'yes' if status.amd.hardware_present else 'no'}")
+    print(_tool_line("rocminfo", status.amd.rocminfo))
+    print(f"  ROCm support   {_yes_no_unknown(status.amd.rocm_support.supported)}")
+    print()
+    print("Intel")
+    print(f"  hardware       {'yes' if status.intel.hardware_present else 'no'}")
+    print(f"  kind           {status.intel.kind or 'n/a'}")
+    print()
+    print("PyTorch")
+    print(_tool_line("torch", status.pytorch.installed))
+    print(f"  backend        {status.pytorch.build_backend or 'n/a'}")
+    print()
+    print("Python AI packages")
+    print(_tool_line("transformers", status.python_packages.transformers))
+    print(_tool_line("accelerate", status.python_packages.accelerate))
+    print(_tool_line("safetensors", status.python_packages.safetensors))
+    print(_tool_line("huggingface_hub", status.python_packages.huggingface_hub))
+    print()
+    print("Inference")
+    print(_tool_line("ollama", status.inference.ollama.binary))
+    print(f"  service active {_yes_no_unknown(status.inference.ollama.service_active)}")
+    print(_tool_line("llama-cli", status.inference.llama_cpp.llama_cli))
+    print(_tool_line("llama-server", status.inference.llama_cpp.llama_server))
+    print()
+    print("Containers")
+    print(_tool_line("podman", status.containers.podman))
+    print(_tool_line("docker", status.containers.docker))
+    print(_tool_line("nvidia-ctk", status.containers.nvidia_container_toolkit))
+    print()
+    print("Storage")
+    print(f"  HF cache       {status.storage.hf_home}")
+    print(f"  Ollama models  {status.storage.ollama_models}")
+    return 0
+
+
+def _cmd_ai_doctor(args: argparse.Namespace) -> int:
+    report = run_ai_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN AI DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_ai_capabilities(args: argparse.Namespace) -> int:
+    report = build_ai_capabilities()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN AI CAPABILITIES")
+    print()
+    for capability in report.capabilities:
+        label = _AI_CAPABILITY_LABELS.get(capability.id, capability.id)
+        usable = _yes_no_unknown(capability.usable)
+        print(f"{label:<24}available={_yes_no_unknown(capability.available):<9}usable={usable}")
+    return 0
+
+
+def _cmd_ai_plan(args: argparse.Namespace) -> int:
+    plan = build_ai_plan(getattr(args, "component", None))
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    header = "SEREIN AI PLAN"
+    if getattr(args, "component", None):
+        header += f" - {args.component}"
+    print(header)
+    print()
+    for step in plan.actions:
+        target = f" -> {step.target}" if step.target else ""
+        current = f" (current: {step.current})" if step.current else ""
+        print(f"  [{step.status:<7}] {step.component}.{step.action}: {step.tool}{target}{current}")
+        print(f"            reason: {step.reason}")
+        print(
+            f"            risk: {step.risk} | reversible: {'yes' if step.reversible else 'no'} | "
+            f"requires_root: {'yes' if step.requires_root else 'no'} | source: {step.source}"
+        )
+        print(f"            verify: {step.verification}")
+    return 0
+
+
 def _cmd_profile_list(args: argparse.Namespace) -> int:
     profiles = list_profiles()
     if args.json:
@@ -566,6 +694,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dev_plan_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     dev_plan_parser.set_defaults(func=_cmd_dev_plan)
+
+    ai_parser = subparsers.add_parser("ai", help="AI workstation")
+    ai_subparsers = ai_parser.add_subparsers(dest="ai_command", required=True)
+
+    ai_subparsers.add_parser("status", help="Show AI backend/runtime state").set_defaults(
+        func=_cmd_ai_status
+    )
+
+    ai_doctor_parser = ai_subparsers.add_parser("doctor", help="Run AI-level diagnostics")
+    ai_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    ai_doctor_parser.set_defaults(func=_cmd_ai_doctor)
+
+    ai_capabilities_parser = ai_subparsers.add_parser(
+        "capabilities", help="Show which AI stacks Serein can provision"
+    )
+    ai_capabilities_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    ai_capabilities_parser.set_defaults(func=_cmd_ai_capabilities)
+
+    ai_plan_parser = ai_subparsers.add_parser(
+        "plan", help="Show the AI workstation plan"
+    )
+    ai_plan_parser.add_argument(
+        "component", nargs="?", choices=AI_VALID_COMPONENTS, default=None,
+        help="Show only actions for this component (e.g. pytorch, inference, containers, voice)",
+    )
+    ai_plan_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    ai_plan_parser.set_defaults(func=_cmd_ai_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)

@@ -42,7 +42,7 @@ this phase (the application/tooling layers these profiles will eventually
 carry — S3 dev tools, S4 AI runtime, S5 security tooling — remain
 entirely separate, unimplemented future work).
 
-## S3 — Development *(this repository, in progress)*
+## S3 — Development *(complete, merged to main)*
 
 Editor/IDE integration (Zed), language toolchains (Python via uv, Node
 via fnm/pnpm, Rust via rustup, Go, C/C++), Git/GitHub CLI, and container
@@ -63,13 +63,27 @@ install, no `~/.gitconfig`/`~/.config/zed` write, and no Apply
 mechanism exists yet — see `docs/development/architecture.md` for
 exactly what "implemented" means at this phase.
 
-## S4 — AI
+## S4 — AI *(this repository, in progress)*
 
-Hardware-detection-driven local AI stack: NVIDIA/AMD/CPU-appropriate
-PyTorch, llama.cpp, Ollama, and container-based compute. Builds on the
-`gpu`/`cpu` fields in the S0 hardware report and the `ai` profile's S2
-hardware resource-policy layer (`docs/hardware/gpu-policy.md`). **No
-CUDA or driver installation happens in S0–S2.**
+Hardware-backend classification (NVIDIA CUDA / AMD ROCm / Intel GPU /
+CPU) built on S2's existing GPU detection (never re-probed), NVIDIA
+driver/CUDA-Toolkit/container-toolkit detection with the
+driver-vs-toolkit distinction enforced by construction, AMD ROCm
+support determined only from real `rocminfo` runtime evidence (never
+guessed from vendor ID), PyTorch/Transformers-baseline/local-inference
+(Ollama, llama.cpp) detection, and deterministic AI planning. The `ai`
+profile's hardware resource-policy layer was implemented in S2; this
+phase extends that same profile into a real workload profile (same
+pattern S3 used for `dev`) and adds `serein ai status`,
+`serein ai capabilities [--json]`, `serein ai doctor [--json]`, and
+`serein ai plan [component] [--json]`. See [`docs/ai/`](ai/architecture.md)
+for the full design and [ADR-0013](adr/0013-ai-backend-selection.md)
+through [ADR-0016](adr/0016-ai-model-cache-storage-ownership.md). **No
+driver, CUDA Toolkit, ROCm, Python package, or model file is installed
+or downloaded by this repository** — see `docs/ai/architecture.md` for
+exactly what "implemented" means at this phase. CUDA/PyTorch
+installation into the developer's own host never happens; live GPU
+runtime evidence is out of scope for this pass (`docs/ai/known-limitations.md`).
 
 ## S5 — Cybersecurity
 

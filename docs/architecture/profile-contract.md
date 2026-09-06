@@ -24,7 +24,7 @@ path that would actually apply a profile) is not implemented. Reporting an
 inactive profile as active would violate the "no fake PASS output" rule
 that also governs `doctor`.
 
-## Current scope (as of S3)
+## Current scope (as of S4)
 
 - `core` (S0): `profiles/core/core.profile.json`. Describes the
   unmodified host — empty `packages`/`services`/etc. — and exists to
@@ -34,7 +34,8 @@ that also governs `doctor`.
   `configuration_units`, and `verification_checks` — see
   `docs/desktop/architecture.md`. Still performs no installation; see
   `docs/desktop/installation-plan.md` for what "implemented" means here.
-- `balanced`, `dev`, `ai`, `battery`, `cyber` (S2):
+- `balanced`, `dev`, `ai`, `battery`, `cyber` (S2 baseline — `dev` and
+  `ai` were since extended further, see below):
   `profiles/<id>/<id>.profile.json`. Each carries a real hardware
   resource-policy manifest (`packages: ["power-profiles-daemon",
   "systemd-zram-generator"]`, a shared `zram-generator-defaults`
@@ -67,6 +68,24 @@ that also governs `doctor`.
   detection, capability modeling, and `serein dev plan` all work end to
   end, but there is still no Apply mechanism, same as the hardware
   layer.
+- `ai` (S4): `profiles/ai/ai.profile.json` (version `0.2.0`). Extended
+  the same way `dev` was in S3 — one canonical profile combining S2's
+  hardware resource-policy layer with S4's AI-workstation software
+  layer. Its `packages` field adds `ffmpeg` (the one real
+  `ubuntu-repository` tool in S4's default manifest — NVIDIA/AMD/Intel/
+  PyTorch/inference tooling all come from non-Ubuntu-archive sources,
+  except CUDA Toolkit and ROCm, which live validation found are
+  genuinely Ubuntu-repository packages on 26.04 but are still
+  represented only in `serein.ai.packages`, not duplicated into this
+  profile's `packages` array, since they are conditional on hardware
+  presence rather than an unconditional default install like `ffmpeg`);
+  its `verification_checks` field adds S4's seven `ai_*` doctor check
+  ids alongside S2's ten hardware checks and S3's development checks
+  reused by the separate `dev` profile. See `docs/ai/architecture.md`
+  for what "implemented" means here — detection, capability modeling
+  (including the hardware-present-vs-runtime-usable distinction), and
+  `serein ai plan` all work end to end, but there is still no Apply
+  mechanism.
 - `DECLARED_ONLY_PROFILES` (`src/serein/profiles/registry.py`) is empty
   as of S2 — every roadmap profile now has a manifest. It remains the
   mechanism a future phase (e.g. S6's veil/privacy profile) will use
