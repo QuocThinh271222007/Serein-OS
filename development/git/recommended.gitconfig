@@ -1,0 +1,22 @@
+# Serein recommended Git defaults - a TEMPLATE, never applied automatically.
+#
+# Serein never writes to ~/.gitconfig. If a user wants these, they can
+# review and apply them themselves, e.g.:
+#   git config --global include.path /path/to/this/file
+# or copy individual lines into their own config.
+#
+# Deliberately excluded from this file: user.name, user.email, any
+# signing key, and any credential.helper - those are exclusively the
+# user's own choice and Serein never sets them.
+
+[init]
+	defaultBranch = main
+
+[pull]
+	rebase = false
+
+[rerere]
+	enabled = true
+
+[core]
+	autocrlf = input

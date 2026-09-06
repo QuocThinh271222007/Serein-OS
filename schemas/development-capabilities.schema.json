@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/development-capabilities.schema.json",
+  "title": "Serein Development Capabilities",
+  "description": "Output of `serein dev capabilities --json` - which development stacks Serein can safely provision/manage, distinct from what is already installed (serein dev status).",
+  "type": "object",
+  "required": ["schema_version", "capabilities"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "available", "installed", "mechanism", "source", "confidence", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "available": { "type": ["boolean", "null"] },
+          "installed": { "type": "boolean" },
+          "mechanism": { "type": ["string", "null"] },
+          "source": { "type": ["string", "null"] },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}
