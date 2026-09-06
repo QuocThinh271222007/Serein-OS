@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted
+Accepted. Reviewed during S2R (a live-validation corrective pass, see
+`docs/validation/s2r/`) — the three-layer architecture itself held up;
+S2R's five fixes (ZRAM syntax/detection, GPU classification confidence,
+removed speculative NVMe tuning) were all corrections *within* this
+model (mostly in the `*_policy.py`/`planner.py`/`capabilities.py`
+layers), not changes to the model's shape.
 
 ## Context
 

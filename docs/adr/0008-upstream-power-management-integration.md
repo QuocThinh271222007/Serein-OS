@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted
+Accepted. Live-validated during S2R: `power-profiles-daemon` 0.30-2 is
+confirmed available in the Ubuntu 26.04 archive, and its real installed
+marker paths (`/usr/bin/powerprofilesctl`, `/usr/lib/systemd/system/
+power-profiles-daemon.service`) exactly match what `power_policy.py`
+already checked — no code change was needed here (see
+`docs/validation/s2r/known-blockers.md`). The `ai`-profile design
+decision below (no PPD `performance` request) was reviewed and is
+provisionally reconfirmed, not changed.
 
 ## Context
 

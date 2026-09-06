@@ -1,4 +1,17 @@
-# Hardware Subsystem Architecture (S2)
+# Hardware Subsystem Architecture (S2 / S2R)
+
+## S2R corrective pass
+
+A live-validation pass (S2R, methodology mirroring S1R) found and fixed
+five concrete defects in the S2 design: obsolete ZRAM config syntax and
+an incorrect "upstream default" claim, a false-positive existing-ZRAM
+detector, an overconfident `zram_configurable` capability, a
+vendor-only GPU integrated/discrete heuristic, and speculative
+unconditional NVMe scheduler tuning. See `docs/validation/s2r/` for the
+live evidence and `docs/hardware/memory-policy.md`, `storage-policy.md`,
+and `gpu-policy.md` for the corrected designs. Nothing below this
+section changed as a result — the three-layer architecture itself held
+up under review.
 
 ## Governing question
 
@@ -44,10 +57,11 @@ src/serein/hardware/
 ```
 
 `models.py` gained new dataclasses (`CPUPolicyInfo`, `MemoryPolicyInfo`,
-`StoragePolicyInfo`, `PowerPolicyInfo`, `GPUPolicyInfo`, `ThermalInfo`,
-`Capability`/`CapabilitiesReport`, `PlanAction`/`HardwarePlan`) alongside
-the S0 ones — one models module per subsystem, matching the convention
-`desktop/models.py` and `profiles/models.py` already set.
+`StoragePolicyInfo`, `PowerPolicyInfo`, `GPUPolicyInfo`,
+`GPUClassification`, `ThermalInfo`, `Capability`/`CapabilitiesReport`,
+`PlanAction`/`HardwarePlan`) alongside the S0 ones — one models module
+per subsystem, matching the convention `desktop/models.py` and
+`profiles/models.py` already set.
 
 ## No Apply mechanism in S2
 

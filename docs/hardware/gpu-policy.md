@@ -1,63 +1,85 @@
 # GPU Policy
 
-## Detection
+## S2R correction notice
 
-`src/serein/hardware/gpu_policy.py` builds on S0's
-`serein.hardware.gpu.detect_gpus()` (vendor + integrated/discrete guess
-per `/sys/class/drm` node) rather than re-scanning PCI devices itself, and
-adds:
+S2's classification (`Intel == integrated`, `AMD == discrete`,
+`NVIDIA == discrete`) was a real defect: both AMD and Intel ship
+integrated *and* discrete parts (Ryzen/Core APUs, Radeon/Arc discrete
+cards), so vendor alone let the probe report confidently *wrong*
+classifications (e.g. a solo AMD discrete desktop GPU, or an Intel Arc
+card, both previously reported as their opposite kind by construction).
+Corrected in two layers — see `docs/validation/s2r/gpu-corrective.md`.
 
-- **Hybrid detection:** `hybrid = True` when at least one integrated and
-  one discrete GPU are both present (e.g. Intel iGPU + NVIDIA dGPU, AMD
-  iGPU + AMD/NVIDIA dGPU).
-- **NVIDIA kernel module state:** `/proc/modules` and `/sys/module/nvidia`
-  checked independently of whether a DRM node was already classified as
-  NVIDIA — a genuinely separate, real signal.
-- **amdgpu kernel module state:** same mechanism, for `amdgpu`.
+## Layer 1 — `serein.hardware.gpu` (S0, schema-locked `GPUDevice.kind`)
 
-No PCI device/vendor ID beyond what S0 already reads is collected. No
-serial numbers, no VRAM totals, no driver version strings.
+Uses only vendor-independent, structural PCI evidence — the PCI class
+code at `device/class` (a stable PCI SIG convention, not vendor-specific):
 
-## What S2 deliberately does not implement
+- Subclass `02` ("3D controller") means the device cannot drive a
+  display directly — real, structural proof it's a render/compute-offload
+  part, regardless of vendor. Classified `"discrete"`, unconditionally.
+- `NVIDIA` remains classified `"discrete"` on vendor alone — a
+  documented target-market assumption (NVIDIA does not currently ship
+  integrated GPUs Serein would encounter on an Ubuntu workstation), not
+  structural proof.
+- Everything else — including a solo Intel or AMD GPU with ordinary
+  VGA-compatible class (`00`) and no sibling — is honestly `"unknown"`.
+  This is a deliberate behavior change: a solo Intel/AMD GPU cannot be
+  proven integrated-or-discrete from PCI class alone, and Serein no
+  longer guesses. `serein hardware probe`'s output is unchanged in
+  *shape* (still `kind: "integrated"|"discrete"|"unknown"|null`, zero
+  schema version bump needed) but is now more conservative and more
+  honest in *content*.
 
-Per the S2 brief's explicit boundary (Sections 33–37), none of the
-following exist anywhere in this phase:
+## Layer 2 — `serein.hardware.gpu_policy` (S2-only, confidence-scored)
 
-- Driver installation (NVIDIA proprietary driver, AMD ROCm) — S4/S7.
-- CUDA/ROCm/PyTorch/Ollama/llama.cpp — S4.
-- GPU overclocking, power-limit changes, or voltage changes — never, at
-  any phase, per the S2 brief's explicit forbidden-optimizations list.
-- Forced GPU switching (PRIME/Bumblebee-style), unloading the NVIDIA
-  module, or killing a display session — never in S2.
-- `nvidia-smi` execution, or any other subprocess call. Serein's hardware
-  layer has never shelled out to an external tool anywhere in S0–S2; GPU
-  detection is sysfs/procfs-only, same as everything else here. This is
-  why "persistence mode," "power state," and "VRAM total" from the S2
-  brief's NVIDIA wishlist are **not** implemented: none of them are
-  readable without either `nvidia-smi` or the (closed) NVIDIA kernel
-  module's own non-standard sysfs extensions, and Serein does not invoke
-  external tools to find out.
+Adds one more heuristic signal not used by Layer 1: `device/boot_vga` —
+which device the firmware recorded as driving the boot display. This
+*can* help disambiguate roles **in a multi-GPU system** (conventionally,
+the boot-display device in a laptop with a discrete sibling is the
+integrated part), but is worthless in a solo-GPU system (a lone discrete
+desktop GPU is `boot_vga=1` and VGA-class too, identical to a lone
+integrated GPU) — so it is only applied when more than one GPU is
+present. Every classification carries an explicit `confidence`
+(`"high"`/`"medium"`/`"low"`), and `hybrid` is a genuine tri-state:
 
-## Hybrid graphics and the `battery` profile
+| Scenario | `hybrid` | `hybrid_confidence` |
+|---|---|---|
+| ≥1 confidently-integrated + ≥1 confidently-discrete, no unresolved devices | `True` | `"high"` (or `"medium"` if any contributing device was itself only medium-confidence) |
+| 0 or 1 GPU total | `False` | `"high"` — a solo GPU can never be hybrid regardless of its own kind |
+| Multiple GPUs, at least one `"unknown"` | `None` | `"low"` — genuinely unresolved, never guessed |
+| Multiple GPUs, all confidently classified, same kind (e.g. dual-NVIDIA) | `False` | `"high"` |
 
-The only place GPU topology influences a plan action is
-`gpu.compute_topology` (informational, `status: "NOOP"` always) under the
-`battery` profile: if hybrid graphics are detected, the reason notes that
-"the battery profile prefers integrated graphics where the desktop
-environment already supports it" — a description of the *intended
-outcome*, not an instruction Serein enforces itself. No switching happens
-here; if/when Serein integrates with the desktop environment's own
-switching mechanism (e.g. `switcheroo-control`, KDE's own PRIME support),
-that belongs to S1's desktop layer or a future phase, once measured.
+`None` (not `False`) is the honest answer for unresolved multi-GPU
+topology — Section 18–21 of the S2R brief's core requirement: uncertainty
+is never represented as false certainty.
 
-## GPU switching capability: reported as unknown, not guessed
+## What S2R deliberately does not do
 
-`serein hardware capabilities`' `gpu_switching` entry always reports
-`available: null` (not `true`/`false`) with `confidence: "low"`: there is
-no standard, safely-readable sysfs interface that reliably indicates
-whether hybrid-GPU switching (PRIME offloading, `switcheroo-control`) is
-actually usable on a given system without invoking vendor tooling or a
-desktop-session-specific mechanism Serein does not have access to at the
-hardware-probe layer. Reporting `false` here would be a guess dressed up
-as a fact — the S2 brief's "do not simply return booleans when ambiguity
-exists" applies directly.
+- **No PCI ID database.** Distinguishing a solo Intel Arc discrete GPU
+  from a solo Intel integrated GPU would require one; Section 19 of the
+  S2R brief explicitly rules this out. The residual ambiguity is
+  accepted and documented, not hidden.
+- **No `nvidia-smi`, no subprocess calls, ever.** GPU detection remains
+  entirely sysfs/procfs-based, consistent with every other detector in
+  this project.
+- **No driver installation, no CUDA/ROCm, no overclocking, no forced GPU
+  switching, no unloading drivers, no killing sessions.** Unchanged from
+  S2 — these are S4/S7 scope or permanently forbidden.
+
+## NVIDIA compute capability language
+
+`nvidia_compute_gpu` (in `serein hardware capabilities`) means exactly
+**"NVIDIA hardware is present"** — confirmed by PCI vendor ID `0x10de` at
+a real DRM node. It does **not** mean CUDA is installed, the CUDA runtime
+is functional, or a usable compute stack exists — those are S4's
+responsibility to establish and verify. The capability's `reason` text is
+written to make this distinction unambiguous.
+
+## GPU switching capability: still reported as unknown
+
+`gpu_switching` continues to report `available: null` — no standard,
+safely-readable sysfs interface reliably indicates hybrid-GPU switching
+support (PRIME/`switcheroo-control`) without invoking vendor tooling or a
+desktop-session-specific mechanism outside the hardware-probe layer's
+reach.

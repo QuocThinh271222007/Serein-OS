@@ -1,5 +1,23 @@
 # Memory Policy: ZRAM and Swap
 
+## S2R correction notice
+
+S2's original claims about `systemd-zram-generator`'s defaults were
+**wrong on two points**, found during S2R live validation against the
+real package (`systemd-zram-generator` 1.2.1-2, Ubuntu 26.04 archive —
+see `docs/validation/s2r/zram-validation.md` for exact evidence):
+
+1. `zram-fraction`/`max-zram-size` are **obsolete options** — the real,
+   installed `zram-generator.conf(5)` man page lists them under an
+   "OBSOLETE OPTIONS" heading. The current option is `zram-size`, an
+   arithmetic expression over a `ram` variable.
+2. `compression-algorithm = zstd` was **not** actually upstream's
+   default — the real man page states "If unset, none will be
+   configured and the kernel's default will be used." S2 forced zstd
+   and described it as matching upstream; that claim is removed.
+
+Both are corrected below and in `hardware/defaults/zram-generator.conf`.
+
 ## Detection
 
 `src/serein/hardware/memory_policy.py` reads:
@@ -10,47 +28,77 @@
   partition by the `Type` column alone).
 - `/sys/block/zram*/{disksize,comp_algorithm}` — existing ZRAM device
   size and active compression algorithm.
-- `/etc/systemd/zram-generator.conf` / `.conf.d/` — existing
-  `systemd-zram-generator` configuration, even before any `zram*` device
-  has actually materialized from it.
+- **Every real `systemd-zram-generator` config search path** (verified
+  against the installed `zram-generator.conf(5)` SYNOPSIS), not just
+  `/etc/systemd/`:
+
+  ```
+  /usr/lib/systemd/zram-generator.conf
+  /usr/local/lib/systemd/zram-generator.conf
+  /etc/systemd/zram-generator.conf
+  /run/systemd/zram-generator.conf
+
+  /usr/lib/systemd/zram-generator.conf.d/*.conf
+  /usr/local/lib/systemd/zram-generator.conf.d/*.conf
+  /etc/systemd/zram-generator.conf.d/*.conf
+  /run/systemd/zram-generator.conf.d/*.conf
+  ```
+
+  A file is only counted as real configuration if it actually contains
+  a `[zramN]` section header — **a directory existing (even a
+  `conf.d/` with only unrelated files in it) is not configuration**,
+  fixing a real S2 false-positive (see
+  `docs/validation/s2r/zram-validation.md`). `MemoryPolicyInfo.
+  zram_generator_config_sources` lists every real source found (empty
+  means genuinely unconfigured); `zram_generator_config_ambiguous` is
+  `True` when more than one source exists — Serein does not attempt to
+  resolve final precedence, it just treats that as "already configured,
+  do not add a third layer" rather than guessing which one wins.
 
 Nothing here ever modifies swap. `serein hardware plan`'s `memory.zram`
 action is the only place a ZRAM *recommendation* appears, and it is
-read-only (`status: "APPLY"` is a proposal, not an action taken).
+read-only.
 
 ## Why ZRAM, not "swap is bad"
 
 Serein treats RAM, ZRAM, and disk-backed swap as three complementary
-mechanisms, not a hierarchy where one replaces the others:
+mechanisms, not a hierarchy where one replaces the others. Serein never
+disables or removes existing disk swap.
 
-- **RAM** is fastest and finite.
-- **ZRAM** is a compressed, in-RAM swap device — much faster than disk,
-  costs CPU time for compression, and is a good buffer for short memory
-  pressure spikes.
-- **Disk-backed swap** is slower but has no RAM cost and is the correct
-  backstop for genuinely running out of both RAM and ZRAM's compressed
-  capacity.
+## Sizing policy: upstream's own defaults, current syntax
 
-Serein never disables or removes existing disk swap. If disk swap is
-already present, the plan reports it and leaves it exactly as is.
-
-## Sizing policy: upstream's own defaults, not an invented ratio
-
-`hardware/defaults/zram-generator.conf` (a planning-only repository
-artifact, not installed anywhere in S2 — see `resources.py`):
+`hardware/defaults/zram-generator.conf` (planning-only in S2/S2R — see
+`resources.py`; never installed by this repository):
 
 ```ini
 [zram0]
-zram-fraction = 0.5
-max-zram-size = 4096
-compression-algorithm = zstd
+zram-size = min(ram / 2, 4096)
 swap-priority = 100
-fs-type = swap
 ```
 
-These are **exactly `systemd-zram-generator`'s own documented defaults**
-(`zram-generator.conf(5)`), not a Serein invention. The reasoning, worked
-through by RAM tier (`zram-fraction * RAM`, capped at `max-zram-size`):
+- **`zram-size = min(ram / 2, 4096)`** — this is the tool's own
+  documented default (`zram-generator.conf(5)`: "Defaults to
+  `min(ram / 2, 4096)`"). Serein pins it explicitly for
+  self-documentation and robustness against a future upstream default
+  change, not because the value differs from upstream. Verified by
+  actually creating a real zram device with this exact expression in a
+  disposable Ubuntu 26.04 VM (`--setup-device`, since the full generator
+  refuses to run under container-detected virtualization — see
+  `docs/validation/s2r/zram-validation.md`) — the resulting device size
+  matched the formula exactly against the VM's real RAM.
+- **`compression-algorithm` is intentionally not set.** The real man
+  page: "If unset, none will be configured and the kernel's default
+  will be used." Serein defers to the kernel default until a real
+  benchmark (`docs/hardware/planning-and-safety.md`'s benchmark
+  contract) shows a measured reason to pin `zstd`, `lz4`, or any other
+  algorithm.
+- **`swap-priority = 100`** — also the tool's own documented default
+  ("If unset, 100 is used"). Pinned here for the same
+  self-documentation reason as `zram-size`, not because Serein
+  overrides upstream's choice.
+
+Resulting size by RAM tier (unchanged from S2 — the *value* was never
+wrong, only the option names used to express it):
 
 | RAM tier | `RAM / 2` | Capped at 4096 MiB | Resulting ZRAM | As % of RAM |
 |---|---|---|---|---|
@@ -59,44 +107,55 @@ through by RAM tier (`zram-fraction * RAM`, capped at `max-zram-size`):
 | 32 GiB | 16384 MiB | capped | 4 GiB | 12.5% |
 | 64+ GiB | 32768+ MiB | capped | 4 GiB | ≤ 6.25% |
 
-This tapers exactly the way a sound policy should: aggressive relative
-protection on memory-constrained machines, a small, low-overhead safety
-net on machines where memory pressure is rare. Choosing to follow
-upstream's own formula (rather than a competing ratio) is itself the
-"Integrate → Measure → Replace" choice — there is no measured evidence
-yet that Serein's own users need a different curve, so there is no
-reason to diverge from the tool's own maintainers' guidance.
+## An important finding: installing the package alone may be sufficient
 
-**Compression algorithm:** `zstd`, matching `systemd-zram-generator`'s own
-default and offering the best compression ratio of the commonly-available
-in-kernel algorithms (`lzo`, `lz4`, `zstd`). Actual kernel-module
-availability is not verified live in S2 (documented in
-`docs/hardware/known-limitations.md`) — a future Apply step would need to
-confirm `zstd` is present in `/sys/block/zram0/comp_algorithm`'s available
-list before writing the config, falling back to `lz4` if not.
+Live validation found that Ubuntu 26.04's `systemd-zram-generator`
+package ships its own default config at `/usr/lib/systemd/
+zram-generator.conf` containing a bare `[zram0]` section — which, per
+the documented defaults above, **already produces exactly Serein's
+intended policy with zero additional configuration**. Serein's own
+drop-in (a future `/etc/systemd/zram-generator.conf.d/90-serein.conf`)
+therefore exists mainly for:
 
-**Priority:** `100`, high enough that the kernel prefers ZRAM over any
-existing disk swap (which typically defaults to priority `-2`) without
-needing to touch the disk swap's own priority at all.
+1. Self-documentation — Serein's intended policy is explicit and
+   readable, not silently inherited from whatever upstream's default
+   happens to be today.
+2. Robustness against a future upstream default change.
+3. Establishing the mechanism for a later, deliberate divergence (e.g.
+   the `ai` profile eventually wanting a different ratio), without
+   relying on implicit inheritance.
 
-## Conflict avoidance (Section 22 of the S2 brief)
+This is recorded as a genuine, positive finding, not a reason to change
+the plan's behavior — see `docs/validation/s2r/zram-validation.md`.
 
-`planner._zram_action()` checks for an existing ZRAM device **or** an
-existing `zram-generator.conf`/`.conf.d` *before* proposing anything. If
-either is present, the action is `NOOP` with the detail "ZRAM already
-configured on this host; Serein will not layer a second, competing
-implementation" — Serein never recommends installing a second ZRAM tool
-on top of Ubuntu's own. `serein hardware doctor`'s
-`hardware_existing_zram` check reports the same fact independently
-(`PASS` if found, `SKIP` if not configured at all — never `FAIL` for
-simply not having ZRAM yet).
+## Conflict avoidance
+
+`planner._zram_action()` checks, in order: an existing active `/sys/
+block/zram*` device (strongest evidence) → any real config source found
+above → whether the current environment is WSL/a container (see below)
+→ RAM size availability. If either of the first two is present, the
+action is `NOOP`, explicitly stating Serein will not layer a second,
+competing implementation. `serein hardware doctor`'s
+`hardware_existing_zram` check mirrors this: `PASS` if found, `WARN` if
+ambiguous (multiple sources), `SKIP` if genuinely unconfigured — never
+`FAIL` for simply not having ZRAM yet.
+
+## Virtualization: a verified, not assumed, guard
+
+Live validation found that `systemd-zram-generator`'s own generator
+**refuses to create any device when `systemd-detect-virt --container`
+reports a container context** — which includes WSL2 (`systemd-detect-virt`
+identifies it as `"wsl"`). This was observed directly: running the real
+generator inside a disposable Ubuntu 26.04 WSL2 instance printed
+`"Running in a container, exiting."` and produced no output, while the
+same config parsed and created a real device successfully via the
+lower-level `--setup-device` path. Serein's `zram_configurable`
+capability and the planner's `memory.zram` action both report
+unavailable/`SKIP` under WSL/containers on this **verified**, not
+guessed, basis (see `docs/validation/s2r/zram-validation.md`).
 
 ## Swappiness
 
-S2 deliberately makes **no swappiness recommendation of any kind** —
-neither a global change nor a profile-specific one. `vm.swappiness`'s
-interaction with ZRAM is genuinely workload- and kernel-version-dependent,
-and no measurement exists yet to justify a specific value over the kernel
-default. Per the S2 brief: "it is acceptable for S2 to leave kernel
-default unchanged," and there is no folklore constant here to be found —
-this is intentional, not an oversight.
+S2/S2R make **no swappiness recommendation of any kind** — neither a
+global change nor a profile-specific one. No measurement exists yet to
+justify a specific value over the kernel default.

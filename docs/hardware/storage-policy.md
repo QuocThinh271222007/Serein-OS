@@ -1,62 +1,65 @@
 # Storage Policy: I/O Schedulers
 
-## Detection
+## S2R correction notice
+
+S2 proposed automatically switching an NVMe device to the `none`
+scheduler whenever it was available and not already selected. **This
+has been removed.** It was speculative tuning: Serein had (and still
+has) no Serein-specific benchmark evidence that this measurably helps
+the mixed workstation workloads Serein targets. Per the governing
+principle ("if evidence is insufficient, do not enable it"), the
+corrected default is to leave every device's scheduler exactly as the
+kernel/upstream set it, on every bus.
+
+## Detection (unchanged)
 
 `src/serein/hardware/storage_policy.py` reads
 `/sys/block/<dev>/queue/scheduler` for every physical block device (same
 exclusion list as S0's `storage.py`: loopback, ramdisk, optical,
-device-mapper, software-RAID, and ZRAM devices are not physical storage).
-The kernel exposes this as one line with the active scheduler in
-brackets, e.g. `"mq-deadline [none] bfq"` — both the current value and the
-full available list are parsed from that single read.
+device-mapper, software-RAID, and ZRAM devices are not physical
+storage). Both the current scheduler and the full available list are
+still detected and exposed — this remains useful, real information for
+`serein hardware status`/`capabilities` and for a future S8 benchmark
+pass to consume. **Detecting is not the same as recommending changing
+it** — see `docs/hardware/planning-and-safety.md`.
 
-## Why Serein does not force one scheduler globally
+## Current default policy: NOOP, always
 
-Modern Linux storage is not one thing: an NVMe SSD's own hardware queuing
-makes an additional software scheduler largely redundant, a SATA SSD
-benefits from a lightweight scheduler like `mq-deadline`, and a spinning
-HDD's seek-time characteristics are exactly what `bfq`/`mq-deadline` were
-designed to manage well. Blanket-applying one scheduler to every device
-(the classic "just use BFQ everywhere" desktop-optimization-guide advice)
-ignores this and can measurably hurt NVMe latency for no benefit.
+Every device with a real `queue/scheduler` interface, regardless of bus
+(NVMe, SATA SSD, HDD, virtual/mapped), now produces a `NOOP` plan action:
+*"No measured Serein-specific evidence justifies replacing the current
+upstream scheduler."* A device with no `queue/scheduler` interface at
+all (common for virtual/mapped block devices) produces `SKIP`, and a
+device under WSL/container virtualization also produces `SKIP` — I/O
+scheduling is host-controlled there.
 
-## The one evidence-backed rule Serein does apply
+This is deliberately a null policy today. It exists so that:
 
-**NVMe devices with `none` in their available scheduler list, not
-already set to `none`:** Serein proposes switching to `none`. This is not
-a guess — it follows directly from the Linux kernel's own block-layer
-documentation: NVMe drives already do their own internal, hardware-level
-command queuing and reordering, so an additional software I/O scheduler
-adds CPU overhead and latency without improving on what the device
-firmware already does at much finer granularity. The action is marked
-`confidence: "medium"` (not `"high"`) because Serein cannot verify this
-NVMe device's own firmware/queue-depth characteristics — only that `none`
-is offered as an option, which on essentially all modern NVMe stacks is a
-deliberate signal that it's the intended low-overhead choice.
+- The capability (*can* Serein change this) stays visible and testable,
+  distinct from the policy (*should* Serein change this) — see
+  `docs/hardware/planning-and-safety.md`'s capability-vs-policy section.
+- A future, evidence-backed scheduler recommendation (built on real
+  benchmark data, per S8) has a real place to plug in without a
+  redesign.
 
-**Every other case — SATA SSD, HDD, virtual/mapped block devices, or an
-NVMe device already at `none`** — the action is always `NOOP`: "no
-evidence-backed reason to change this device's current scheduler." There
-is no universal "right" scheduler for a SATA SSD or HDD that would
-justify Serein overriding whatever Ubuntu's own kernel/udev defaults
-already chose.
+## S8 benchmark debt
 
-## Virtualization guard
+Scheduler tuning is recorded as a concrete S8 (Refinement & Benchmarking)
+topic. Candidate workloads a future benchmark pass should measure before
+any scheduler default changes:
 
-Under WSL or a container, every `storage.scheduler.<dev>` action reports
-`SKIP` — I/O scheduling belongs to the host in both cases. A bare VM
-(KVM/VMware/VirtualBox/Hyper-V) is **not** blanket-guarded the same way:
-per Section 38 of the S2 brief, a VM's guest-visible block devices (e.g.
-a `vda` virtio disk) are treated on their own merits — if the device
-exposes a real `queue/scheduler` file, Serein reads and reasons about it
-normally (virtio disks are not NVMe-named, so they fall into the
-always-`NOOP` bucket above, not the NVMe rule).
+```
+random read/write IOPS         sequential throughput
+compiler workload               AI model loading
+desktop responsiveness under I/O    container/database mixed workload
+```
 
-## What S2 explicitly does not do
+No such benchmark is implemented in S2/S2R.
 
-- No mount-option changes, no Btrfs subvolume design, no partitioning, no
-  TRIM-schedule changes — all out of S2 scope (mostly S7's).
-- No filesystem-type-specific policy — "filesystem-aware limits" from the
-  S2 brief are deliberately not implemented; nothing here reads
-  `/proc/mounts` or a filesystem's own tuning knobs.
-- No serial numbers, WWNs, or filesystem UUIDs are ever read or reported.
+## What S2/S2R still does not do
+
+- No mount-option changes, no Btrfs subvolume design, no partitioning,
+  no TRIM-schedule changes.
+- No filesystem-type-specific policy.
+- No serial numbers, WWNs, or filesystem UUIDs are ever read or
+  reported.

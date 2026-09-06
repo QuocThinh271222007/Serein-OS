@@ -1,67 +1,94 @@
-# Known Limitations (S2)
+# Known Limitations (S2 / S2R)
 
-Explicit per the same "don't overstate what's validated" discipline S1
-and S1R established.
+Explicit per the same "don't overstate what's validated" discipline S1,
+S1R, and S2 established.
 
-## Not live-tested against a real Ubuntu 26.04 + kernel combination
+## Resolved by S2R (live validation)
 
-This phase was developed and tested entirely against fixture trees (this
-repository's own Windows/CI development environment has no real
-`cpufreq`, `power_supply`, `thermal`, or `zram` sysfs interfaces).
-Specifically unverified against live hardware:
+The items below were flagged as unverified in S2 and have since been
+resolved against a real Ubuntu 26.04 environment (a disposable, isolated
+WSL2 instance — see `docs/validation/s2r/`):
 
-- That real `amd-pstate-epp`/`intel_pstate`(active)/`acpi-cpufreq` sysfs
-  content matches the exact shape the fixtures model (governor lists,
-  EPP value spelling, driver name strings). These are based on
+- `systemd-zram-generator`'s real package version (1.2.1-2), its actual
+  config syntax (`zram-size`, not the obsolete `zram-fraction`/
+  `max-zram-size`), its real default values (confirmed matching what
+  Serein pins explicitly), and its real config search paths (all 8,
+  confirmed against the installed man page) — `docs/validation/s2r/
+  zram-validation.md`.
+- Whether `/etc/systemd/zram-generator.conf.d/90-serein.conf` collides
+  with a package-owned file — confirmed unowned, both via `dpkg-query -S`
+  after a real install and via an archive-wide `apt-file` search —
+  `docs/validation/s2r/zram-validation.md`.
+- Real config-parsing validation: Serein's corrected `zram-size = min(ram
+  / 2, 4096)` syntax was used to actually create a real zram device via
+  `zram-generator --setup-device`, with the resulting size matching the
+  formula against the VM's real RAM.
+- Whether `systemd-zram-generator` runs under WSL/containers — confirmed
+  it does not (`systemd-detect-virt` reports a container context, and
+  the generator declines to run), which is now the basis for Serein's
+  own WSL/container ZRAM guard.
+- `power-profiles-daemon`'s real package name/version (0.30-2) and exact
+  installed marker paths (`/usr/bin/powerprofilesctl`, `/usr/lib/systemd/
+  system/power-profiles-daemon.service`) — confirmed to exactly match
+  what `power_policy.py` already checked; no code change needed there.
+
+## Still not live-tested
+
+- **Bare-metal `cpufreq` sysfs** (`amd-pstate-epp`/`intel_pstate`(active)/
+  `acpi-cpufreq` governor lists, EPP value spelling, driver name
+  strings): WSL2 exposes no `cpufreq` sysfs at all (confirmed absent —
+  `docs/validation/s2r/cpu-validation.md`), so this remains based on
   well-documented, stable kernel ABI conventions, not a live read.
-- That `zstd` is actually available as a ZRAM compression algorithm on a
-  target Ubuntu 26.04 kernel build (`docs/hardware/memory-policy.md`
-  already flags this as unverified and names the fallback).
-- Collision risk for `/etc/systemd/zram-generator.conf.d/90-serein.conf`
-  against real Ubuntu 26.04 packages — S1R's `dpkg-query -S` method
-  would resolve this the same way it resolved the desktop layer's
-  `/etc/xdg` question, but has not been run for this path.
-- Real NVMe/SATA/HDD scheduler defaults on current Ubuntu 26.04 kernels —
-  the `none`-for-NVMe recommendation follows generic kernel-documentation
-  reasoning (`docs/hardware/storage-policy.md`), not a live device read.
+- **Physical NVMe/SATA/HDD scheduler defaults on real hardware**: WSL2's
+  virtual disks expose no `queue/scheduler` file at all (confirmed
+  absent), so real-device scheduler *contents* remain unverified —
+  though this is now moot for the *policy*, since S2R removed the only
+  scheduler recommendation that depended on it (see
+  `docs/hardware/storage-policy.md`).
+- **Real GPU sysfs** (`device/class`, `device/boot_vga`): WSL2 exposes no
+  `/sys/class/drm` card nodes at all, so the corrected classification
+  model's structural signals (PCI class `02`, `boot_vga`) are verified
+  against documented, stable PCI SIG/kernel conventions, not a live
+  read. A physical hybrid-GPU laptop (Intel/AMD iGPU + NVIDIA/AMD dGPU)
+  or an Intel Arc system would be needed to close this gap.
 - Whether `power-profiles-daemon`'s `performance` profile is actually
-  offered on any specific real hardware — by design, Serein never assumes
-  this (`docs/hardware/power-policy.md`), so this isn't a gap in a claim,
-  but it does mean the `ai` profile's PPD mapping is deliberately
-  conservative rather than validated as "could have been more specific."
+  offered on any specific real hardware — by design, Serein never
+  assumes this, so this isn't a gap in a claim Serein makes.
 
-A live-VM validation pass (mirroring S1R's methodology — a disposable,
-isolated environment, never the developer's host) is the natural next
-step before any hardware plan action graduates to a real Apply mechanism.
+A live-VM or physical-hardware validation pass remains the natural next
+step for the three bare-metal-only items above before any hardware plan
+action graduates to a real Apply mechanism.
 
 ## No Apply mechanism exists
 
 `serein hardware plan` is entirely read-only. There is no `serein
 hardware apply` command, and none is planned until a dedicated,
 sandboxed Apply/Verify/Rollback mechanism is designed and validated in
-isolation (see `docs/hardware/planning-and-safety.md`).
+isolation.
 
 ## Per-core CPU heterogeneity is not modeled
 
 Intel P/E-core topology, if present, is not detected or exposed
-separately — `cpu_policy.py` reads only `cpu0`. This is an accepted S2
-simplification, not a hidden gap: Section 17 of the S2 brief explicitly
-defers any P/E-core-aware behavior (including process pinning) past S2.
+separately — `cpu_policy.py` reads only `cpu0`. Deferred past S2/S2R by
+design.
 
 ## Swappiness is unaddressed by design, not oversight
 
-See `docs/hardware/memory-policy.md`'s swappiness section — no value is
-proposed, at any RAM tier, for any profile.
+No value is proposed, at any RAM tier, for any profile.
 
-## GPU switching capability is reported as unknown, not partially guessed
+## GPU topology: two residual, documented ambiguities
 
-See `docs/hardware/gpu-policy.md` — `gpu_switching` always reports
-`available: null`. This is the intended, honest behavior for a mechanism
-Serein has no safe, sysfs-only way to verify.
+1. **A solo Intel/AMD GPU cannot be classified integrated-vs-discrete**
+   without a PCI ID database, which S2R deliberately does not build
+   (Section 19 of the S2R brief). It is honestly reported `"unknown"`
+   rather than guessed either way.
+2. **`gpu_switching`** always reports `available: null` — no safe,
+   sysfs-only mechanism exists to verify PRIME/`switcheroo-control`
+   support.
 
 ## `serein hardware status`/`doctor`/`plan` on this development host
 
 This repository was developed and tested on a Windows machine with none
-of the Linux-specific interfaces S2 reads. Every command degrades
+of the Linux-specific interfaces S2/S2R reads. Every command degrades
 honestly (`not detected`/`unavailable`/`SKIP`) rather than raising — see
-the S2 completion report for the exact recorded output on this host.
+the S2R completion report for the exact recorded output on this host.
