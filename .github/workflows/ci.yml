@@ -44,9 +44,13 @@ jobs:
           serein desktop plan
           serein desktop plan --json | python -c "import json,sys; json.load(sys.stdin)"
           serein desktop config status
-          # desktop doctor may legitimately exit non-zero on a CI image with
-          # no KDE Plasma installed (SKIP/WARN checks are expected there) —
-          # what matters is that it runs cleanly and emits valid JSON, not
-          # that every check PASSes. See docs/architecture/doctor-contract.md.
-          serein desktop doctor || true
+          # desktop doctor's exit code is 1 only if a FAIL check fires
+          # ("Serein-managed but the component is missing" — a broken
+          # install); SKIP/WARN never affect it. A stock CI runner with no
+          # KDE Plasma installed and no Serein config marker present should
+          # always report SKIP/WARN/PASS only, so this is expected to exit
+          # 0 here — a non-zero exit means a real FAIL (or a crash), which
+          # this step should NOT swallow. See
+          # docs/architecture/doctor-contract.md.
+          serein desktop doctor
           serein desktop doctor --json | python -c "import json,sys; json.load(sys.stdin)"
