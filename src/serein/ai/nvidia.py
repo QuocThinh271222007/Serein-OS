@@ -1,16 +1,24 @@
 """NVIDIA GPU/driver/CUDA detection.
 
 Every signal here is read-only and safe: ``nvidia-smi`` (no args, plus
-one narrow ``--query-gpu`` call) never mutates GPU state, and the CUDA
-Toolkit marker check is a plain filesystem existence test (never a
-content scan, never arbitrary user files). The driver-reported CUDA
-*driver API* version and the separately-installed CUDA *Toolkit* are
+one narrow ``--query-gpu`` call) never mutates GPU state, and every
+filesystem check is a plain existence/listing test (never a content
+scan, never arbitrary user files). The driver-reported CUDA *driver
+API* version and the separately-installed CUDA *Toolkit* are
 deliberately kept in two different fields on ``NvidiaStatus`` —
 conflating them is the single most common mistake in this space (S4
-brief Section 16), and this module exists specifically to not make it:
-``cuda_toolkit_installed`` is computed from ``nvcc``/a real
-``/usr/local/cuda`` marker only, never from
-``cuda_driver_api_version``.
+brief Section 16), and this module exists specifically to not make it.
+
+``cuda_toolkit_installed`` is computed from STRONG evidence only —
+``nvcc --version`` succeeding, or dpkg reporting the ``cuda-toolkit``
+package genuinely installed (reusing ``serein.development.dpkg``
+rather than duplicating package-query infrastructure, S4R Section 17).
+A bare ``/usr/local/cuda*`` marker existing is real but weaker
+evidence — an empty directory or a stale symlink left over from a
+partial/removed install previously produced a false positive here
+(S4R Section 16/19 corrective) — so it is tracked separately as
+``cuda_toolkit_marker_present`` and never on its own sets
+``cuda_toolkit_installed``.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ import re
 from pathlib import Path
 
 from serein.ai.models import NvidiaStatus, VRAMInfo, classify_vram_tier
+from serein.development.dpkg import apt_package_installed
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.development.toolchains import probe_tool
 from serein.hardware._util import DEFAULT_ROOT
@@ -68,7 +77,8 @@ def _query_vram(runner: CommandRunner) -> list[VRAMInfo]:
 def _cuda_toolkit_marker_present(root: Path) -> bool:
     """A CUDA Toolkit install marker: the canonical ``/usr/local/cuda``
     symlink (or a real directory in its place). Existence only — never
-    read for contents."""
+    read for contents. Auxiliary evidence only; see module docstring -
+    never sufficient on its own to prove the toolkit is installed."""
     return (root / "usr" / "local" / "cuda").exists()
 
 
@@ -95,7 +105,9 @@ def detect_nvidia_status(
     driver_usable = driver_version is not None
 
     nvcc = probe_tool("nvcc", "nvcc", version_args=("--version",), runner=runner)
-    cuda_toolkit_installed = nvcc.installed or _cuda_toolkit_marker_present(root)
+    toolkit_package_installed = apt_package_installed("cuda-toolkit", runner=runner)
+    cuda_toolkit_installed = nvcc.installed or toolkit_package_installed
+    marker_present = _cuda_toolkit_marker_present(root)
 
     nvidia_ctk = probe_tool("nvidia-ctk", "nvidia-ctk", runner=runner)
 
@@ -107,6 +119,7 @@ def detect_nvidia_status(
         cuda_driver_api_version=cuda_driver_api_version,
         nvcc=nvcc,
         cuda_toolkit_installed=cuda_toolkit_installed,
+        cuda_toolkit_marker_present=marker_present,
         cuda_toolkit_dirs=_cuda_toolkit_dirs(root),
         nvidia_ctk=nvidia_ctk,
         vram=_query_vram(runner) if driver_usable else [],

@@ -121,10 +121,20 @@ class NvidiaStatus:
     #: conflated by a caller reading this struct.
     cuda_driver_api_version: str | None = None
     nvcc: ToolStatus = field(default_factory=lambda: ToolStatus(id="nvcc"))
-    #: True only if independent toolkit evidence exists (nvcc, or a
-    #: real /usr/local/cuda marker) — never inferred from
-    #: cuda_driver_api_version.
+    #: True only from STRONG evidence: `nvcc --version` succeeding, or
+    #: dpkg reporting the `cuda-toolkit` package genuinely installed
+    #: (S4R Section 17/18 — a real regression fixed here: a bare
+    #: `/usr/local/cuda*` directory/symlink existing is NOT, by itself,
+    #: sufficient — an empty or stale marker previously produced a
+    #: false positive). See `cuda_toolkit_marker_present` for that
+    #: weaker, auxiliary-only signal.
     cuda_toolkit_installed: bool = False
+    #: A `/usr/local/cuda` marker (symlink or directory) exists —
+    #: existence only, contents never read. Auxiliary evidence only:
+    #: never sufficient on its own to set `cuda_toolkit_installed`.
+    #: True with `cuda_toolkit_installed=False` is itself a real,
+    #: doctor-worthy signal (a stale/incomplete install).
+    cuda_toolkit_marker_present: bool = False
     #: Real versioned `/usr/local/cuda-*` directory names found
     #: (existence/listing only, never contents) — more than one is a
     #: real "multiple toolkit indicators" signal for the doctor, not a
@@ -138,11 +148,24 @@ class NvidiaStatus:
 
 @dataclass
 class RocmSupportInfo:
-    """True/False only when real runtime evidence exists (rocminfo
-    actually enumerating or failing to enumerate a GPU agent) — vendor
-    presence alone is never enough (S4 brief Section 34/35)."""
+    """Distinguishes three different questions Serein must never
+    conflate (S4R Section 11/12): whether ROCm's own runtime tooling is
+    installed at all, whether that runtime enumerates a GPU agent (real
+    local evidence ROCm/HSA recognizes this hardware), and whether
+    PyTorch's own ROCm-wheel/MIOpen/framework-level compatibility is
+    established for this exact combination — the last of which this
+    struct deliberately does NOT claim to answer (see pytorch.py's
+    ``select_pytorch_backend``, which treats framework compatibility as
+    a separate, always-conservative question even when
+    ``gpu_enumerated`` is True)."""
 
-    supported: bool | None = None  # None = genuinely unknown, never guessed True
+    runtime_installed: bool = False
+    #: True only when `rocminfo` actually enumerates a `Device Type:
+    #: GPU` agent; False when it runs but reports none; None when the
+    #: runtime isn't installed (nothing to query). This proves ROCm's
+    #: own runtime recognizes the hardware — it does NOT by itself
+    #: prove PyTorch/MIOpen/framework-level compatibility.
+    gpu_enumerated: bool | None = None
     confidence: str = "low"  # "high" | "medium" | "low"
     reason: str = "No ROCm runtime installed to query."
 
@@ -160,10 +183,38 @@ class AmdStatus:
 class IntelAIStatus:
     hardware_present: bool = False
     kind: str | None = None  # "integrated" | "discrete" | "unknown", from S2
-    #: Deliberately a free-form maturity label, never a boolean claim
-    #: of "usable" — see docs/ai/intel-strategy.md. One of
-    #: "unknown" | "experimental" | "unverified" pending live evidence.
-    compute_stack_maturity: str = "unknown"
+    #: PyTorch's native XPU backend compatibility for this specific
+    #: hardware. Always "unknown" as of this pass — Serein has no
+    #: live-verified evidence either way and will not claim
+    #: "supported" without it (S4R Section 34; see
+    #: docs/ai/intel-strategy.md). "unsupported" is reserved for a
+    #: future pass that gains real negative evidence.
+    xpu_compatibility: str = "unknown"  # "unknown" | "unsupported"
+
+
+@dataclass(frozen=True)
+class PyTorchBackendDecision:
+    """The single shared computation of "what PyTorch backend should
+    be planned" — consumed identically by planner.py and
+    capabilities.py so the two can never derive incompatible
+    conclusions (S4R Section 9, the S2RM/S3R lesson applied here before
+    an S4-native version of that defect could ship). See
+    ``pytorch.select_pytorch_backend``.
+
+    ``status="APPLY"`` means ``target`` is immediately actionable
+    (either a proven-ready accelerator build, or the always-ready CPU
+    fallback). ``status="BLOCKED"`` means an accelerator hardware
+    candidate exists but its runtime/framework-compatibility could not
+    be confirmed — Serein deliberately does not silently substitute a
+    CPU build in that case (S4R Section 5); it also does not install a
+    second, unproven accelerator build. Other AI actions (Ollama,
+    llama.cpp) remain independently plannable regardless — this never
+    blocks the whole AI profile, only the PyTorch-specific action."""
+
+    target: str  # "cpu" | "cuda" | "rocm" | "xpu"
+    status: str  # "APPLY" | "BLOCKED"
+    confidence: str  # "high" | "medium" | "low"
+    reason: str
 
 
 @dataclass
@@ -234,9 +285,14 @@ class AIContainerStatusInfo:
     nvidia_container_toolkit: ToolStatus = field(
         default_factory=lambda: ToolStatus(id="nvidia-container-toolkit")
     )
-    #: Whether a real CDI spec file for NVIDIA was found
-    #: (`/etc/cdi/nvidia.yaml` or `/var/run/cdi/nvidia.yaml`) —
-    #: existence only, contents never read.
+    #: Whether NVIDIA CDI integration for containers is evidenced —
+    #: either a real spec file (`/etc/cdi/nvidia.yaml` or
+    #: `/var/run/cdi/nvidia.yaml`, existence only, contents never read)
+    #: or a successful, read-only `nvidia-ctk cdi list` reporting a
+    #: real device entry (current NVIDIA Container Toolkit releases can
+    #: generate/manage CDI specs automatically, so a static file is not
+    #: the only valid evidence — S4R Section 27/28). Never generated,
+    #: listed, or mutated by Serein beyond this read-only check.
     cdi_nvidia_generated: bool = False
 
 
@@ -343,6 +399,7 @@ class AIStatusReport:
     amd: AmdStatus
     intel: IntelAIStatus
     pytorch: PyTorchStatus
+    pytorch_decision: PyTorchBackendDecision
     python_packages: PythonAIPackagesStatus
     inference: InferenceStatus
     containers: AIContainerStatusInfo
