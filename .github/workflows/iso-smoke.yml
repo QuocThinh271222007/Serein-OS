@@ -1,23 +1,75 @@
 name: ISO Smoke (real build + boot validation)
 
-# Layer B (Section 50-51 of the S7.0 distribution contract): the real,
-# multi-GB download / build / boot validation path. Deliberately NEVER
-# runs on every push/PR (that stays in ci.yml as Layer A, fixture-only)
-# - only on an explicit manual trigger, so no PR is ever forced to pay
-# for a ~6 GB Ubuntu download.
+# Layer B (S7.0 Section 50-51; PR trigger added by S7.0R Corrective A):
+# the real, multi-GB download / build / boot validation path.
 #
-# Uploads the built ISO as a private, internal Actions artifact with
-# modest retention (Section 100) - never a GitHub Release, never a
-# public download link (Section 101).
+# Two ways to run it:
+#   - workflow_dispatch: manual, any time, optionally pinned to an exact
+#     SHA via the `sha` input.
+#   - pull_request (labeled/synchronize/reopened) + the `run-iso-smoke`
+#     label present: opt-in per PR. A normal PR commit never triggers
+#     this - only a PR that has been explicitly labeled, and only for
+#     as long as the label remains, does the expensive job run (it
+#     re-runs on every subsequent `synchronize` while the label is
+#     still attached, so a corrected HEAD gets re-validated).
+#
+# Deliberately `pull_request`, never `pull_request_target` (Section 5) -
+# this workflow executes code from the feature branch and must never
+# run with write-capable repository secrets. `permissions: contents:
+# read` is the only permission granted; no repository secret is
+# required for S7.0 Layer B.
+#
+# Uploads only compact evidence (build manifests, sha256 sidecars, a
+# Layer-B evidence JSON) as a private, internal Actions artifact with
+# modest retention (Section 100) - never the ~6 GB ISO itself, never a
+# GitHub Release, never a public download link (Section 101).
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Exact commit SHA to build (defaults to the current ref's HEAD)"
+        required: false
+        default: ""
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
 
 jobs:
   iso-smoke:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'run-iso-smoke'))
     runs-on: ubuntu-latest
     steps:
+      - name: Determine expected source SHA
+        id: expected-sha
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ inputs.sha != '' && inputs.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.expected-sha.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact-head checkout
+        run: |
+          EXPECTED_SOURCE_SHA="${{ steps.expected-sha.outputs.sha }}"
+          ACTUAL_CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          echo "EXPECTED_SOURCE_SHA=${EXPECTED_SOURCE_SHA}"
+          echo "ACTUAL_CHECKED_OUT_SHA=${ACTUAL_CHECKED_OUT_SHA}"
+          if [ "${EXPECTED_SOURCE_SHA}" != "${ACTUAL_CHECKED_OUT_SHA}" ]; then
+            echo "::error::checked-out SHA does not match the expected feature-head SHA - refusing to build"
+            exit 1
+          fi
+          echo "SOURCE_COMMIT=${ACTUAL_CHECKED_OUT_SHA}" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -33,31 +85,100 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xorriso jq qemu-system-x86 ovmf
 
+      - name: Disk space preflight
+        run: |
+          df -h .
+          AVAILABLE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
+          REQUIRED_KB=$((20 * 1024 * 1024))
+          if [ "${AVAILABLE_KB}" -lt "${REQUIRED_KB}" ]; then
+            echo "::error::insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required (base ISO + extracted tree + two rebuilt ISOs)"
+            exit 1
+          fi
+
       - name: Fetch pinned base image (explicit, this job only)
         run: ./distribution/scripts/fetch-base-image.sh
 
-      - name: Verify base image (fail-closed)
+      - name: Verify base image (fail-closed, checksum + signature)
         run: ./distribution/scripts/verify-base-image.sh
 
-      - name: Build Serein Alpha ISO
+      - name: Record actual base ISO sha256
+        id: base-sha
+        run: |
+          BASE_FILENAME="$(jq -r '.filename' distribution/base-image.json)"
+          EXPECTED_SHA="$(jq -r '.sha256' distribution/base-image.json)"
+          ACTUAL_SHA="$(sha256sum "cache/upstream/${BASE_FILENAME}" | cut -d' ' -f1)"
+          echo "ACTUAL_BASE_SHA256=${ACTUAL_SHA}"
+          echo "EXPECTED_BASE_SHA256=${EXPECTED_SHA}"
+          echo "filename=${BASE_FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "expected=${EXPECTED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "actual=${ACTUAL_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Serein Alpha ISO (production + QA variant)
         run: ./distribution/scripts/build-iso.sh
 
-      - name: Inspect built ISO
+      - name: Save real el-torito report (evidence)
         run: |
-          ISO_PATH="$(ls dist/serein-*.iso | head -1)"
-          ./distribution/scripts/inspect-iso.sh "${ISO_PATH}"
+          BASE_FILENAME="$(jq -r '.filename' distribution/base-image.json)"
+          xorriso -indev "cache/upstream/${BASE_FILENAME}" -report_el_torito as_mkisofs \
+            > dist/el-torito-base-report.txt
 
-      - name: QEMU boot smoke (no target disk, bounded timeout)
+      - name: Strict-inspect production ISO
+        id: inspect-prod
         run: |
-          ISO_PATH="$(ls dist/serein-*.iso | head -1)"
-          OVMF_CODE="$(find /usr/share/OVMF -iname 'OVMF_CODE*.fd' | head -1)"
-          ./distribution/scripts/boot-smoke.sh "${ISO_PATH}" --ovmf-code "${OVMF_CODE}"
+          PROD_ISO="dist/serein-alpha-26.04-amd64.iso"
+          if python -m serein.distribution inspect "${PROD_ISO}" --strict \
+              --expected-source-commit "${SOURCE_COMMIT}"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
-      - name: Upload build manifest + sha256 (never the multi-GB ISO itself)
+      - name: Strict-inspect QA ISO
+        id: inspect-qa
+        run: |
+          QA_ISO="dist/serein-alpha-26.04-amd64-qa.iso"
+          if python -m serein.distribution inspect "${QA_ISO}" --strict \
+              --expected-source-commit "${SOURCE_COMMIT}"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: QEMU boot smoke (QA variant, no target disk, bounded timeout)
+        id: boot-smoke
+        run: |
+          QA_ISO="dist/serein-alpha-26.04-amd64-qa.iso"
+          if ./distribution/scripts/boot-smoke.sh "${QA_ISO}"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assemble Layer-B evidence
+        if: always()
+        run: |
+          python -m serein.distribution evidence \
+            --production-manifest dist/serein-alpha-26.04-amd64.iso.manifest.json \
+            --qa-manifest dist/serein-alpha-26.04-amd64-qa.iso.manifest.json \
+            --base-filename "${{ steps.base-sha.outputs.filename }}" \
+            --base-sha256-expected "${{ steps.base-sha.outputs.expected }}" \
+            --base-sha256-actual "${{ steps.base-sha.outputs.actual }}" \
+            --production-inspection-status "${{ steps.inspect-prod.outputs.status || 'fail' }}" \
+            --qemu-boot-status "${{ steps.boot-smoke.outputs.status || 'fail' }}" \
+            --qemu-boot-mode uefi \
+            --out dist/s7-0-layer-b-evidence.json
+          cat dist/s7-0-layer-b-evidence.json
+
+      - name: Upload compact Layer-B evidence (never the ISO itself)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: serein-alpha-build-evidence
+          name: serein-s7-0-layer-b-evidence
           path: |
             dist/*.manifest.json
             dist/*.sha256
+            dist/el-torito-base-report.txt
+            dist/s7-0-layer-b-evidence.json
           retention-days: 14

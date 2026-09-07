@@ -35,5 +35,24 @@ if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
     ACCEL="kvm"
 fi
 
+# Deterministic OVMF firmware candidate rule (Section 46 of the S7.0R
+# corrective) - never "whatever `find` happens to return first".
+# Auto-selected only if the caller did not already pass --ovmf-code.
+OVMF_CANDIDATES=(
+    "/usr/share/OVMF/OVMF_CODE_4M.fd"
+    "/usr/share/OVMF/OVMF_CODE.fd"
+    "/usr/share/edk2/ovmf/OVMF_CODE.fd"
+    "/usr/share/qemu/OVMF_CODE.fd"
+)
+EXTRA_ARGS=("$@")
+if [[ ! " ${EXTRA_ARGS[*]:-} " == *"--ovmf-code"* ]]; then
+    for candidate in "${OVMF_CANDIDATES[@]}"; do
+        if [ -f "${candidate}" ]; then
+            EXTRA_ARGS+=(--ovmf-code "${candidate}")
+            break
+        fi
+    done
+fi
+
 echo "==> Boot-smoke validating ${ISO_PATH} (accel=${ACCEL})"
-"${PYTHON_BIN}" -m serein.distribution boot-smoke --iso "${ISO_PATH}" --accel "${ACCEL}" "$@"
+"${PYTHON_BIN}" -m serein.distribution boot-smoke --iso "${ISO_PATH}" --accel "${ACCEL}" "${EXTRA_ARGS[@]}"
