@@ -8,10 +8,12 @@ mutation."""
 
 from __future__ import annotations
 
+import dataclasses
 import json
 
 import pytest
 
+from serein.ai.models import AICapabilitiesReport
 from serein.development.runner import CommandResult
 from serein.doctor.models import CheckStatus
 from serein.focus.capabilities import build_focus_capabilities
@@ -23,6 +25,7 @@ from serein.focus.models import (
     FOCUS_DOMAINS,
     FOCUS_TARGETS,
     GPU_LEASE_MODES,
+    INSTANCE_LEVEL_INTENTS,
     PRIORITY_LEVELS,
     READINESS_STATES,
     RELATIVE_WEIGHTS,
@@ -30,8 +33,11 @@ from serein.focus.models import (
 )
 from serein.focus.planner import build_focus_plan
 from serein.focus.policy import build_focus_policy, evaluate_domain_readiness, evaluate_domain_roles
+from serein.focus.resources import usable_ai_gpu_backend
 from serein.focus.status import build_focus_status
 from serein.focus.transition import build_focus_transition, build_focus_transition_plan
+from serein.hardware.models import GPUDevice
+from serein.veil.models import VeilCapabilitiesReport
 
 
 class FakeCommandRunner:
@@ -76,6 +82,41 @@ def _evidence(tmp_path, runner=None) -> FocusEvidence:
         root=_empty_root(tmp_path), runner=runner or FakeCommandRunner({}),
         home=_empty_home(tmp_path),
     )
+
+
+def _with_ai_capabilities(evidence: FocusEvidence, overrides: dict) -> FocusEvidence:
+    """Returns a copy of ``evidence`` with the named AI capability ids
+    (by id) replaced per ``overrides`` (a dict of id -> field overrides)
+    - used only to exercise focus's own policy logic against evidence
+    shapes S4's real detectors may not currently produce, exactly as
+    the S6.5R corrective's GPU-backend test matrix requires."""
+    capabilities = [
+        dataclasses.replace(c, **overrides[c.id]) if c.id in overrides else c
+        for c in evidence.ai_capabilities.capabilities
+    ]
+    report = AICapabilitiesReport(
+        schema_version=evidence.ai_capabilities.schema_version, capabilities=capabilities
+    )
+    return dataclasses.replace(evidence, ai_capabilities=report)
+
+
+def _with_veil_capabilities(evidence: FocusEvidence, overrides: dict) -> FocusEvidence:
+    capabilities = [
+        dataclasses.replace(c, **overrides[c.id]) if c.id in overrides else c
+        for c in evidence.veil_capabilities.capabilities
+    ]
+    report = VeilCapabilitiesReport(
+        schema_version=evidence.veil_capabilities.schema_version, capabilities=capabilities
+    )
+    return dataclasses.replace(evidence, veil_capabilities=report)
+
+
+def _with_gpu(evidence: FocusEvidence) -> FocusEvidence:
+    hardware = dataclasses.replace(
+        evidence.hardware,
+        gpu=[GPUDevice(vendor="nvidia", model="RTX 4090", kind="discrete")],
+    )
+    return dataclasses.replace(evidence, hardware=hardware)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +310,73 @@ class TestDomainReadiness:
 
 
 # ---------------------------------------------------------------------------
+# Private readiness fidelity (S6.5R Corrective D, Section 25-31/34/62)
+# ---------------------------------------------------------------------------
+
+
+class TestPrivateReadinessFidelity:
+    def test_nothing_present_is_blocked(self, tmp_path):
+        evidence = _evidence(tmp_path)
+        state, _reason = evaluate_domain_readiness(evidence)["private"]
+        assert state == "blocked"
+
+    def test_tor_client_usable_only_is_limited_not_available(self, tmp_path):
+        # The exact regression S6.5R was filed to prevent: Tor client
+        # usability alone must never upgrade readiness to "available".
+        evidence = _with_veil_capabilities(
+            _evidence(tmp_path), {"tor_client": {"installed": True, "usable": True}}
+        )
+        state, reason = evaluate_domain_readiness(evidence)["private"]
+        assert state == "limited"
+        assert "tor client" in reason.lower()
+
+    def test_tor_browser_installed_usability_unknown_is_limited(self, tmp_path):
+        evidence = _with_veil_capabilities(
+            _evidence(tmp_path), {"tor_browser": {"installed": True, "usable": None}}
+        )
+        state, _reason = evaluate_domain_readiness(evidence)["private"]
+        assert state == "limited"
+
+    def test_whonix_artifacts_present_only_is_limited(self, tmp_path):
+        evidence = _with_veil_capabilities(
+            _evidence(tmp_path), {"whonix_vm": {"installed": True, "usable": None}}
+        )
+        state, _reason = evaluate_domain_readiness(evidence)["private"]
+        assert state == "limited"
+
+    def test_private_workspace_usable_is_available(self, tmp_path):
+        evidence = _with_veil_capabilities(
+            _evidence(tmp_path), {"private_workspace": {"usable": True}}
+        )
+        state, _reason = evaluate_domain_readiness(evidence)["private"]
+        assert state == "available"
+
+    def test_whonix_usable_is_available(self, tmp_path):
+        evidence = _with_veil_capabilities(
+            _evidence(tmp_path), {"whonix_vm": {"installed": True, "usable": True}}
+        )
+        state, _reason = evaluate_domain_readiness(evidence)["private"]
+        assert state == "available"
+
+    def test_tor_browser_usable_is_available(self, tmp_path):
+        evidence = _with_veil_capabilities(
+            _evidence(tmp_path), {"tor_browser": {"installed": True, "usable": True}}
+        )
+        state, _reason = evaluate_domain_readiness(evidence)["private"]
+        assert state == "available"
+
+    def test_private_transition_stays_plannable_when_limited(self, tmp_path):
+        # Section 32: a "limited" (not "blocked") private readiness may
+        # still yield a PLANNABLE transition, with prerequisites/warnings.
+        evidence = _with_veil_capabilities(
+            _evidence(tmp_path), {"tor_client": {"installed": True, "usable": True}}
+        )
+        plan = build_focus_transition("ai", "private", evidence)
+        assert plan.status == "PLANNABLE"
+        assert plan.prerequisites
+
+
+# ---------------------------------------------------------------------------
 # CPU/IO weight model (Section 19-22, 102)
 # ---------------------------------------------------------------------------
 
@@ -395,6 +503,89 @@ class TestGpuLeaseIntent:
 
 
 # ---------------------------------------------------------------------------
+# AI GPU backend gating (S6.5R Corrective C, Section 17-24/44-46/61)
+# ---------------------------------------------------------------------------
+
+
+class TestAiGpuBackendGating:
+    def test_no_gpu_is_unavailable(self, tmp_path):
+        evidence = _evidence(tmp_path)
+        policy = build_focus_policy("ai", evidence)
+        assert policy.gpu_intent.mode == "unavailable"
+        assert policy.gpu_intent.preferred_domain is None
+
+    def test_gpu_present_no_usable_backend_is_not_preferred(self, tmp_path):
+        evidence = _with_gpu(_evidence(tmp_path))
+        policy = build_focus_policy("ai", evidence)
+        assert policy.gpu_intent.preferred_domain is None
+        assert policy.gpu_intent.mode == "shared"
+
+    def test_gpu_present_hardware_only_is_not_enough(self, tmp_path):
+        # Section 45: generic hardware presence alone must never gate
+        # AI GPU preference.
+        evidence = _with_ai_capabilities(
+            _with_gpu(_evidence(tmp_path)),
+            {"nvidia_hardware": {"installed": True, "usable": None}},
+        )
+        policy = build_focus_policy("ai", evidence)
+        assert policy.gpu_intent.preferred_domain is None
+
+    def test_gpu_present_driver_and_cuda_runtime_only_is_not_enough(self, tmp_path):
+        # Driver + CUDA driver-API runtime presence, without a usable
+        # PyTorch CUDA build, must never be sufficient (Section 24/45).
+        evidence = _with_ai_capabilities(
+            _with_gpu(_evidence(tmp_path)),
+            {
+                "nvidia_driver": {"installed": True, "usable": True},
+                "cuda_runtime": {"installed": True, "usable": True},
+                "pytorch_cuda": {"installed": False, "usable": False},
+            },
+        )
+        policy = build_focus_policy("ai", evidence)
+        assert policy.gpu_intent.preferred_domain is None
+        assert policy.gpu_intent.mode == "shared"
+
+    def test_gpu_present_pytorch_cuda_usable_is_preferred(self, tmp_path):
+        evidence = _with_ai_capabilities(
+            _with_gpu(_evidence(tmp_path)),
+            {"pytorch_cuda": {"installed": True, "usable": True}},
+        )
+        policy = build_focus_policy("ai", evidence)
+        assert policy.gpu_intent.preferred_domain == "ai"
+        assert policy.gpu_intent.mode == "preferred"
+        assert policy.gpu_intent.enforceable is False
+
+    def test_gpu_present_pytorch_rocm_usable_is_preferred(self, tmp_path):
+        evidence = _with_ai_capabilities(
+            _with_gpu(_evidence(tmp_path)),
+            {"pytorch_rocm": {"installed": True, "usable": True}},
+        )
+        policy = build_focus_policy("ai", evidence)
+        assert policy.gpu_intent.preferred_domain == "ai"
+        assert policy.gpu_intent.mode == "preferred"
+
+    def test_cpu_only_ai_never_prefers_gpu(self, tmp_path):
+        # Section 22: AI focus stays valid CPU-only; that must never
+        # imply a GPU preference exists.
+        evidence = _with_ai_capabilities(
+            _evidence(tmp_path), {"pytorch_cpu": {"installed": True, "usable": True}}
+        )
+        policy = build_focus_policy("ai", evidence)
+        assert policy.readiness in ("available", "limited")
+        assert policy.gpu_intent.preferred_domain is None
+        assert policy.gpu_intent.mode == "unavailable"  # no GPU device at all
+
+    def test_usable_ai_gpu_backend_helper_matches_gpu_intent(self, tmp_path):
+        evidence = _with_ai_capabilities(
+            _with_gpu(_evidence(tmp_path)),
+            {"pytorch_cuda": {"installed": True, "usable": True}},
+        )
+        policy = build_focus_policy("ai", evidence)
+        assert usable_ai_gpu_backend(evidence) is True
+        assert policy.gpu_intent.preferred_domain == "ai"
+
+
+# ---------------------------------------------------------------------------
 # Service/container/VM lifecycle (Section 36-40, 117)
 # ---------------------------------------------------------------------------
 
@@ -421,6 +612,168 @@ class TestLifecycleIntents:
         ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
         assert ai_runtime.status == "SKIP"
         assert ai_runtime.target_intent == "KEEP"
+
+    def test_ai_runtime_binary_installed_instance_present_running_unknown(self, tmp_path):
+        # S6.5R Corrective A, Section 5/38/58: binary presence is
+        # acceptable evidence of instance_present for ai_runtime
+        # specifically - it is the recognized instance itself; running
+        # state stays unknown regardless (Section 37).
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("ai", evidence)
+        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
+        assert ai_runtime.mechanism_available is True
+        assert ai_runtime.instance_present is True
+        assert ai_runtime.instance_running is None
+
+    def test_cyber_toolbox_mechanism_available_but_no_instance_action(self, tmp_path):
+        # S6.5R Corrective A, Section 6/39/58: Podman+Distrobox present
+        # proves mechanism only - never a toolbox container instance.
+        runner = FakeCommandRunner({
+            "podman": _ok("podman version 5.7.0"),
+            "distrobox": _ok("distrobox: 1.8.2.4"),
+        })
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("cyber", evidence)
+        toolbox = next(lc for lc in policy.lifecycle_intents if lc.target == "cyber_toolbox")
+        assert toolbox.mechanism_available is True
+        assert toolbox.instance_present is None
+        assert toolbox.target_intent == "KEEP"
+        assert toolbox.target_intent not in INSTANCE_LEVEL_INTENTS
+        assert toolbox.status in ("NOOP", "SKIP")
+
+    def test_cyber_vm_mechanism_ready_but_no_instance_action(self, tmp_path, monkeypatch):
+        # S6.5R Corrective A, Section 7/40/58: KVM/QEMU/libvirt
+        # readiness proves mechanism only - never a cyber VM instance.
+        root = _empty_root(tmp_path)
+        (root / "dev").mkdir(parents=True, exist_ok=True)
+        (root / "dev" / "kvm").write_text("", encoding="utf-8")
+        (root / "proc").mkdir(parents=True, exist_ok=True)
+        (root / "proc" / "modules").write_text("kvm 12345 0 - Live 0x0\n", encoding="utf-8")
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        runner = FakeCommandRunner({
+            "qemu-system-x86_64": _ok("QEMU emulator version 8.2.2"),
+            "virsh": _ok("6.0.0"),
+        })
+        evidence = gather_focus_evidence(root=root, runner=runner, home=_empty_home(tmp_path))
+        policy = build_focus_policy("cyber", evidence)
+        vm = next(lc for lc in policy.lifecycle_intents if lc.target == "cyber_vm")
+        assert vm.mechanism_available is True
+        assert vm.instance_present is None
+        assert vm.target_intent == "KEEP"
+        assert vm.target_intent not in INSTANCE_LEVEL_INTENTS
+
+    def test_whonix_artifacts_present_but_no_instance_action(self, tmp_path, monkeypatch):
+        # S6.5R Corrective A, Section 8-9/41/58: qcow2 artifact presence
+        # never proves VM import/definition/running-instance existence.
+        root = _empty_root(tmp_path)
+        (root / "dev").mkdir(parents=True, exist_ok=True)
+        (root / "dev" / "kvm").write_text("", encoding="utf-8")
+        (root / "proc").mkdir(parents=True, exist_ok=True)
+        (root / "proc" / "modules").write_text("kvm 12345 0 - Live 0x0\n", encoding="utf-8")
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        home = _empty_home(tmp_path)
+        images_dir = home / ".local" / "share" / "images"
+        images_dir.mkdir(parents=True, exist_ok=True)
+        (images_dir / "Whonix-Gateway.qcow2").write_text("", encoding="utf-8")
+        (images_dir / "Whonix-Workstation.qcow2").write_text("", encoding="utf-8")
+        runner = FakeCommandRunner({
+            "qemu-system-x86_64": _ok("QEMU emulator version 8.2.2"),
+            "virsh": _ok("6.0.0"),
+        })
+        evidence = gather_focus_evidence(root=root, runner=runner, home=home)
+        policy = build_focus_policy("private", evidence)
+        whonix = next(lc for lc in policy.lifecycle_intents if lc.target == "whonix")
+        assert whonix.instance_present is None
+        assert whonix.target_intent == "KEEP"
+        assert whonix.target_intent not in INSTANCE_LEVEL_INTENTS
+
+
+# ---------------------------------------------------------------------------
+# Ownership semantics (S6.5R Corrective B, Section 12-16/59)
+# ---------------------------------------------------------------------------
+
+
+class TestOwnershipSemantics:
+    def test_ai_runtime_recognized_but_not_managed(self, tmp_path):
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("ai", evidence)
+        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
+        assert ai_runtime.recognized_by_serein is True
+        assert ai_runtime.managed_by_serein is False
+
+    def test_cyber_toolbox_recognized_but_not_managed(self, tmp_path):
+        runner = FakeCommandRunner({
+            "podman": _ok("podman version 5.7.0"),
+            "distrobox": _ok("distrobox: 1.8.2.4"),
+        })
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("cyber", evidence)
+        toolbox = next(lc for lc in policy.lifecycle_intents if lc.target == "cyber_toolbox")
+        assert toolbox.recognized_by_serein is True
+        assert toolbox.managed_by_serein is False
+
+    def test_cyber_vm_recognized_but_not_managed(self, tmp_path, monkeypatch):
+        root = _empty_root(tmp_path)
+        (root / "dev").mkdir(parents=True, exist_ok=True)
+        (root / "dev" / "kvm").write_text("", encoding="utf-8")
+        (root / "proc").mkdir(parents=True, exist_ok=True)
+        (root / "proc" / "modules").write_text("kvm 12345 0 - Live 0x0\n", encoding="utf-8")
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        runner = FakeCommandRunner({
+            "qemu-system-x86_64": _ok("QEMU emulator version 8.2.2"),
+            "virsh": _ok("6.0.0"),
+        })
+        evidence = gather_focus_evidence(root=root, runner=runner, home=_empty_home(tmp_path))
+        policy = build_focus_policy("cyber", evidence)
+        vm = next(lc for lc in policy.lifecycle_intents if lc.target == "cyber_vm")
+        assert vm.recognized_by_serein is True
+        assert vm.managed_by_serein is False
+
+    def test_whonix_recognized_but_not_managed(self, tmp_path):
+        evidence = _evidence(tmp_path)
+        policy = build_focus_policy("private", evidence)
+        whonix = next(lc for lc in policy.lifecycle_intents if lc.target == "whonix")
+        assert whonix.recognized_by_serein is True
+        assert whonix.managed_by_serein is False
+
+    def test_no_lifecycle_target_ever_managed_by_serein(self, tmp_path):
+        evidence = _evidence(tmp_path)
+        for target in FOCUS_TARGETS:
+            policy = build_focus_policy(target, evidence)
+            for lc in policy.lifecycle_intents:
+                assert lc.managed_by_serein is False, (
+                    f"{target}: {lc.kind}.{lc.target} overclaims managed_by_serein"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Instance-action invariant (S6.5R Corrective A, Section 36/60)
+# ---------------------------------------------------------------------------
+
+
+class TestInstanceActionInvariant:
+    def test_instance_level_intent_requires_instance_present_true(self, tmp_path):
+        evidence = _evidence(tmp_path)
+        for target in FOCUS_TARGETS:
+            policy = build_focus_policy(target, evidence)
+            for lc in policy.lifecycle_intents:
+                if lc.target_intent in INSTANCE_LEVEL_INTENTS:
+                    assert lc.instance_present is True, (
+                        f"{target}: {lc.kind}.{lc.target} proposes {lc.target_intent} "
+                        f"with instance_present={lc.instance_present!r}"
+                    )
+
+    def test_ai_runtime_idle_with_instance_present_is_a_valid_quiesce_candidate(self, tmp_path):
+        # Confirms the invariant is not simply "never propose instance
+        # actions" - it is "only propose them with real evidence."
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("cyber", evidence)  # ai is idle under cyber focus
+        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
+        assert ai_runtime.target_intent == "QUIESCE_CANDIDATE"
+        assert ai_runtime.instance_present is True
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +1019,7 @@ class TestDoctor:
         )
         assert all(c.status is not CheckStatus.FAIL for c in report.checks)
 
-    def test_all_seven_checks_present(self, tmp_path):
+    def test_all_eleven_checks_present(self, tmp_path):
         report = run_focus_checks(
             root=_empty_root(tmp_path), runner=FakeCommandRunner({}), home=_empty_home(tmp_path)
         )
@@ -674,7 +1027,9 @@ class TestDoctor:
             "focus_one_primary_invariant", "focus_policy_determinism",
             "focus_system_reserve_present", "focus_gpu_not_overclaimed",
             "focus_private_preserves_veil_invariants", "focus_plan_no_mutation",
-            "focus_transition_graph_complete",
+            "focus_transition_graph_complete", "focus_lifecycle_instance_evidence",
+            "focus_lifecycle_ownership_not_overclaimed", "focus_ai_gpu_backend_gated",
+            "focus_private_readiness_not_tor_only",
         }
         assert set(self._by_id(report).keys()) == expected
 
@@ -683,6 +1038,39 @@ class TestDoctor:
             root=_empty_root(tmp_path), runner=FakeCommandRunner({}), home=_empty_home(tmp_path)
         )
         assert json.dumps(report.to_dict())
+
+    def test_lifecycle_instance_evidence_check_passes_on_clean_and_populated_evidence(
+        self, tmp_path
+    ):
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        report = run_focus_checks(
+            root=_empty_root(tmp_path), runner=runner, home=_empty_home(tmp_path)
+        )
+        assert self._by_id(report)["focus_lifecycle_instance_evidence"].status == CheckStatus.PASS
+
+    def test_lifecycle_ownership_check_passes(self, tmp_path):
+        report = run_focus_checks(
+            root=_empty_root(tmp_path), runner=FakeCommandRunner({}), home=_empty_home(tmp_path)
+        )
+        by_id = self._by_id(report)
+        assert by_id["focus_lifecycle_ownership_not_overclaimed"].status == CheckStatus.PASS
+
+    def test_ai_gpu_backend_gated_check_passes_with_gpu_no_backend(self, tmp_path):
+        # A GPU present with no usable backend must never trip this check
+        # into FAIL (mode stays "shared", not "preferred").
+        runner = FakeCommandRunner({})
+        report = run_focus_checks(
+            root=_empty_root(tmp_path), runner=runner, home=_empty_home(tmp_path)
+        )
+        by_id = self._by_id(report)
+        assert by_id["focus_ai_gpu_backend_gated"].status == CheckStatus.PASS
+
+    def test_private_readiness_not_tor_only_check_passes(self, tmp_path):
+        report = run_focus_checks(
+            root=_empty_root(tmp_path), runner=FakeCommandRunner({}), home=_empty_home(tmp_path)
+        )
+        by_id = self._by_id(report)
+        assert by_id["focus_private_readiness_not_tor_only"].status == CheckStatus.PASS
 
 
 # ---------------------------------------------------------------------------
