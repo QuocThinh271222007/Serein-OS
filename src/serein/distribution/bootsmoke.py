@@ -1,4 +1,5 @@
-"""QEMU boot-smoke harness (S7.0 Sections 44-49, 92, 94-95).
+"""QEMU boot-smoke harness (S7.0 Sections 44-49, 92, 94-95; marker-aware
+live monitoring and UEFI evidence fidelity added by S7.0RM Corrective D/F).
 
 Validates that built media actually boots - never "the QEMU process
 stayed alive for N seconds" (Section 46), always a positive marker read
@@ -8,15 +9,28 @@ environment requires one", and pure boot smoke never does), no physical
 host disk is ever passed through, and the run always has a finite
 timeout that produces a captured diagnostic log on failure (Section 48).
 
+**A running QEMU process is not a failure** (S7.0RM Corrective D): a
+successfully booted live Ubuntu session is *expected* to keep running,
+not exit on its own. The original S7.0R harness used a single blocking
+``subprocess.run(..., timeout=...)`` call, which meant a real, correct
+boot would always be reported as "timed out" - logically backwards for
+a live OS. ``run_boot_smoke`` now polls the growing serial log while
+QEMU keeps running, reports success the moment a positive marker
+appears, and only then deliberately terminates the process - a genuine
+process-exit-before-marker or a deadline with no marker are the only
+failure paths.
+
 A QA-only serial boot entry (``console=ttyS0``) is what makes a
 positive marker observable at all; it is kept structurally separate from
 the normal graphical boot entry (Section 47) - see
-``distribution/boot/qa-serial-entry.cfg``.
+``distribution/boot/qa-serial-entry.cfg`` and
+``serein.distribution.qa_boot`` for the real, build-time derivation.
 """
 
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +38,9 @@ from pathlib import Path
 #: evidence (Section 46) - kernel + initramfs + early userspace really
 #: came up, not merely "the emulator didn't crash". Ordered from the
 #: least to most demanding milestone; callers may pass a narrower tuple
-#: if they specifically need graphical-target evidence.
+#: if they specifically need graphical-target evidence. Real Ubuntu
+#: 26.04.1 Layer-B evidence should confirm which of these actually
+#: appears reliably - see docs/distribution/known-limitations.md.
 DEFAULT_SUCCESS_MARKERS: tuple[str, ...] = (
     "Reached target Basic System",
     "Reached target Multi-User System",
@@ -33,12 +49,28 @@ DEFAULT_SUCCESS_MARKERS: tuple[str, ...] = (
 
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MEMORY_MB = 2048
+DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_TERMINATE_GRACE_SECONDS = 10.0
+
+#: Bounded tail read per poll (Section 26 - "do not repeatedly read
+#: unbounded multi-MB logs") - generous enough to always contain a
+#: marker near the growing end of the file.
+_LOG_TAIL_BYTES = 65_536
 
 
 class BootSmokeError(RuntimeError):
     """Raised for a harness-construction error (never for a boot
     failure itself - that is reported in :class:`BootSmokeResult`, not
     raised, so a real failed boot is captured evidence, not a crash)."""
+
+
+def derive_boot_mode(ovmf_code: Path | None) -> str:
+    """The one place ``boot_mode`` is decided (Section 37 of S7.0RM) -
+    never a caller-supplied string that could disagree with what the
+    QEMU command actually does. ``ovmf_code`` present means a UEFI
+    pflash drive was actually added to the command; its absence means
+    legacy BIOS. Evidence must always read this back, never assume."""
+    return "uefi" if ovmf_code is not None else "bios"
 
 
 def build_qemu_boot_command(
@@ -56,17 +88,18 @@ def build_qemu_boot_command(
     already confirmed KVM is available (Section 49 - never required in
     normal CI); ``"tcg"`` is the software-emulation fallback that always
     works. Passing ``ovmf_code`` selects a UEFI boot path (Section 94);
-    omitting it boots via legacy BIOS (Section 95).
+    omitting it boots via legacy BIOS (Section 95) - see
+    :func:`derive_boot_mode` for how evidence reflects this decision.
     """
     if not iso_path.name:
         raise BootSmokeError("iso_path must name a real ISO file")
 
     # No kernel -append flags here by design: the QA serial boot entry
-    # lives inside the ISO's own GRUB config
-    # (distribution/boot/qa-serial-entry.cfg), selected via the boot
-    # menu default this build sets, not injected from the QEMU command
-    # line - keeping the normal graphical entry and the QA entry
-    # structurally separate (Section 47) even at the harness layer.
+    # lives inside the ISO's own GRUB config, derived and installed as
+    # the auto-selected default by serein.distribution.qa_boot - not
+    # injected from the QEMU command line, keeping the normal graphical
+    # entry and the QA entry structurally separate (Section 47) even at
+    # the harness layer.
     command = [
         "qemu-system-x86_64",
         "-m", str(memory_mb),
@@ -100,58 +133,127 @@ class BootSmokeResult:
     matched_marker: str | None
     reason: str
     log_excerpt: str
+    boot_mode: str = "bios"
+    firmware: str | None = None
+
+    def __post_init__(self) -> None:
+        # Required invariant (Section 29): status == pass implies a
+        # real, non-empty matched marker - never a pass with no
+        # evidence behind it.
+        if self.status == "pass" and not self.matched_marker:
+            raise BootSmokeError("BootSmokeResult status=pass requires a non-empty matched_marker")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "boot_mode": self.boot_mode,
+            "firmware": self.firmware,
+            "matched_marker": self.matched_marker,
+            "target_disk_count": 0,
+        }
+
+
+def _read_tail(path: Path, max_bytes: int = _LOG_TAIL_BYTES) -> str:
+    if not path.is_file():
+        return ""
+    size = path.stat().st_size
+    with path.open("rb") as fh:
+        if size > max_bytes:
+            fh.seek(size - max_bytes)
+        data = fh.read()
+    return data.decode("utf-8", errors="replace")
+
+
+def _terminate(process: object, grace_seconds: float) -> None:
+    """Terminate, wait a bounded grace period, kill if still alive -
+    the one exit path every run_boot_smoke branch uses, so QEMU is
+    never leaked on CI (Section 25)."""
+    if process.poll() is not None:  # type: ignore[attr-defined]
+        return
+    process.terminate()  # type: ignore[attr-defined]
+    try:
+        process.wait(timeout=grace_seconds)  # type: ignore[attr-defined]
+    except subprocess.TimeoutExpired:
+        process.kill()  # type: ignore[attr-defined]
+        try:
+            process.wait(timeout=grace_seconds)  # type: ignore[attr-defined]
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def run_boot_smoke(
     iso_path: Path,
     work_dir: Path,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    terminate_grace_seconds: float = DEFAULT_TERMINATE_GRACE_SECONDS,
     accel: str = "tcg",
     ovmf_code: Path | None = None,
     markers: tuple[str, ...] = DEFAULT_SUCCESS_MARKERS,
-    subprocess_runner: object = subprocess.run,
+    popen_factory: object = subprocess.Popen,
+    time_source: object = time.monotonic,
+    sleep_fn: object = time.sleep,
 ) -> BootSmokeResult:
-    """Run one bounded QEMU boot-smoke attempt and evaluate the result.
+    """Launch QEMU and poll the growing serial log while it keeps
+    running, reporting success the moment a positive marker appears -
+    never inferring anything from the process merely staying alive
+    (Section 46) or merely exiting (a live boot is expected to keep
+    running, not exit - Section 22-23).
 
-    Always finite (Section 48): a ``subprocess.TimeoutExpired`` is
-    caught and reported as ``status="fail"`` with whatever partial
-    serial log was captured, never left to hang.
+    ``popen_factory`` is injectable (must behave like
+    ``subprocess.Popen``: ``.poll()``, ``.terminate()``, ``.kill()``,
+    ``.wait(timeout=...)``) so this whole state machine is unit-testable
+    with a fake process and a fake clock, never a real multi-minute
+    wait (Section 55).
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     serial_log_path = work_dir / "boot-smoke-serial.log"
+    if serial_log_path.exists():
+        serial_log_path.unlink()
+
+    boot_mode = derive_boot_mode(ovmf_code)
     command = build_qemu_boot_command(
         iso_path, serial_log_path, accel=accel, ovmf_code=ovmf_code
     )
 
-    try:
-        subprocess_runner(  # type: ignore[operator]
-            command, capture_output=True, text=True, timeout=timeout_seconds, check=False
-        )
-    except subprocess.TimeoutExpired:
-        excerpt = _read_excerpt(serial_log_path)
-        return BootSmokeResult(
-            status="fail",
-            matched_marker=None,
-            reason=f"boot smoke timed out after {timeout_seconds}s with no success marker",
-            log_excerpt=excerpt,
-        )
-
-    log_text = _read_excerpt(serial_log_path)
-    success, marker = evaluate_boot_log(log_text, markers)
-    if success:
-        return BootSmokeResult(
-            status="pass", matched_marker=marker, reason=f"matched marker: {marker!r}",
-            log_excerpt=log_text,
-        )
-    return BootSmokeResult(
-        status="fail", matched_marker=None,
-        reason="qemu exited before any positive boot marker was observed",
-        log_excerpt=log_text,
+    process = popen_factory(  # type: ignore[operator]
+        command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
+    deadline = time_source() + timeout_seconds  # type: ignore[operator]
+    try:
+        while True:
+            log_text = _read_tail(serial_log_path)
+            success, marker = evaluate_boot_log(log_text, markers)
+            if success:
+                _terminate(process, terminate_grace_seconds)
+                return BootSmokeResult(
+                    status="pass", matched_marker=marker, reason=f"matched marker: {marker!r}",
+                    log_excerpt=log_text[-4000:], boot_mode=boot_mode,
+                    firmware=str(ovmf_code) if ovmf_code else None,
+                )
 
-def _read_excerpt(path: Path, max_chars: int = 4000) -> str:
-    if not path.is_file():
-        return ""
-    text = path.read_text(encoding="utf-8", errors="replace")
-    return text[-max_chars:]
+            if process.poll() is not None:  # type: ignore[attr-defined]
+                returncode = process.returncode  # type: ignore[attr-defined]
+                return BootSmokeResult(
+                    status="fail", matched_marker=None,
+                    reason=(
+                        f"qemu exited (code {returncode}) before any positive "
+                        "boot marker was observed"
+                    ),
+                    log_excerpt=log_text[-4000:], boot_mode=boot_mode,
+                    firmware=str(ovmf_code) if ovmf_code else None,
+                )
+
+            if time_source() >= deadline:  # type: ignore[operator]
+                _terminate(process, terminate_grace_seconds)
+                return BootSmokeResult(
+                    status="fail", matched_marker=None,
+                    reason=f"boot smoke timed out after {timeout_seconds}s with no success marker",
+                    log_excerpt=log_text[-4000:], boot_mode=boot_mode,
+                    firmware=str(ovmf_code) if ovmf_code else None,
+                )
+
+            sleep_fn(poll_interval_seconds)  # type: ignore[operator]
+    finally:
+        _terminate(process, terminate_grace_seconds)

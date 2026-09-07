@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Automated QEMU boot-smoke validation (S7.0 Sections 45-49, 92).
-# No target disk is ever attached; the run is bounded by a finite
-# timeout and reports positive/negative evidence, never "the process
+# Automated QEMU boot-smoke validation (S7.0 Sections 45-49, 92;
+# marker-aware live monitoring - S7.0RM Corrective D).
+# No target disk is ever attached; the run polls the growing serial log
+# while QEMU keeps running (a live boot is expected to stay up, not
+# exit) and reports positive/negative evidence, never "the process
 # stayed alive". Requires qemu-system-x86_64 - not installed in every
 # environment, and never required by normal unit-test CI (Section 49).
 #
-# Usage: ./distribution/scripts/boot-smoke.sh <path-to-iso> [--ovmf-code PATH]
+# Usage: ./distribution/scripts/boot-smoke.sh <path-to-iso> \
+#          [--ovmf-code PATH] [--require-uefi] [--result-json PATH]
+#
+# --require-uefi fails closed *before* launching QEMU if no OVMF
+# candidate was found (Section 34 of the S7.0RM corrective - S7.0
+# closure requires real UEFI evidence, never a silent BIOS fallback).
 
 set -euo pipefail
 
