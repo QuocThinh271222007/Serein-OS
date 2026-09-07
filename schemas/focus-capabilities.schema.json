@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/focus-capabilities.schema.json",
+  "title": "Serein Focus Capabilities",
+  "description": "Output of `serein focus capabilities --json` - which focus planning/lifecycle mechanisms Serein can describe, whether each is plannable, and whether it is enforceable (S6.5 has no Apply engine, so enforceable=false is expected almost everywhere).",
+  "type": "object",
+  "required": ["schema_version", "capabilities"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "available", "plannable", "enforceable", "mechanism", "confidence", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "available": { "type": ["boolean", "null"] },
+          "plannable": { "type": "boolean" },
+          "enforceable": { "type": "boolean" },
+          "mechanism": { "type": ["string", "null"] },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

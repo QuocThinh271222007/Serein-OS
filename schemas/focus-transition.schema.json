@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/focus-transition.schema.json",
+  "title": "Serein Focus Transition Plan",
+  "description": "Output of `serein focus transition --from X --to Y --json` - deterministic transition simulation only. No mutation ever occurs; expected_ram_reclaim_bytes/expected_vram_reclaim_bytes are always null (never a fabricated precise reclaim value).",
+  "type": "object",
+  "required": [
+    "schema_version", "from_focus", "to_focus", "status", "prerequisites",
+    "resource_changes", "lifecycle_changes", "conflicts", "blockers", "warnings",
+    "expected_ram_reclaim_bytes", "expected_vram_reclaim_bytes", "reclaim_confidence",
+    "reversible", "cost", "runtime_enforcement"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "from_focus": { "type": "string", "enum": ["balanced", "dev", "ai", "cyber", "private"] },
+    "to_focus": { "type": "string", "enum": ["balanced", "dev", "ai", "cyber", "private"] },
+    "status": { "type": "string", "enum": ["NOOP", "PLANNABLE", "BLOCKED"] },
+    "prerequisites": { "type": "array", "items": { "type": "string" } },
+    "blockers": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } },
+    "expected_ram_reclaim_bytes": { "const": null },
+    "expected_vram_reclaim_bytes": { "const": null },
+    "reclaim_confidence": { "const": "unknown" },
+    "reversible": { "type": "boolean" },
+    "cost": { "type": "string", "enum": ["low", "medium", "high", "unknown"] },
+    "runtime_enforcement": { "const": false },
+    "resource_changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["resource", "domain", "before", "after", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "resource": { "type": "string", "enum": ["cpu", "memory", "io", "gpu"] },
+          "domain": { "type": "string" },
+          "before": { "type": ["string", "null"] },
+          "after": { "type": ["string", "null"] },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "lifecycle_changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind", "target", "domain", "current_state", "target_intent",
+          "managed_by_serein", "reversible", "cost", "reason", "status"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "kind": { "type": "string", "enum": ["service", "container", "vm"] },
+          "target": { "type": "string", "minLength": 1 },
+          "domain": { "type": "string", "enum": ["dev", "ai", "cyber", "private"] },
+          "current_state": { "type": "string", "minLength": 1 },
+          "target_intent": {
+            "type": "string",
+            "enum": ["KEEP", "QUIESCE_CANDIDATE", "PRIORITY_CANDIDATE", "RESOURCE_INCREASE_CANDIDATE", "RESOURCE_REDUCE_CANDIDATE"]
+          },
+          "managed_by_serein": { "type": "boolean" },
+          "reversible": { "type": ["boolean", "null"] },
+          "cost": { "type": "string", "enum": ["low", "medium", "high", "unknown"] },
+          "reason": { "type": "string", "minLength": 1 },
+          "status": { "type": "string", "enum": ["APPLY", "NOOP", "SKIP", "BLOCKED"] }
+        }
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["resource", "domains", "severity", "resolution", "automatic", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "resource": { "type": "string", "minLength": 1 },
+          "domains": { "type": "array", "items": { "type": "string" } },
+          "severity": { "type": "string", "enum": ["low", "medium", "high"] },
+          "resolution": { "type": "string", "minLength": 1 },
+          "automatic": { "type": "boolean" },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

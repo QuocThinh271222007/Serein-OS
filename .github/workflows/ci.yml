@@ -143,3 +143,27 @@ jobs:
           # KVM, browser, root, or Whonix image is required.
           serein veil doctor
           serein veil doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: Focus CLI smoke test
+        run: |
+          serein focus status
+          serein focus domains
+          serein focus capabilities
+          serein focus capabilities --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein focus plan balanced
+          serein focus plan dev
+          serein focus plan ai
+          serein focus plan cyber
+          serein focus plan private
+          serein focus plan ai --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein focus transition --from ai --to cyber
+          serein focus transition --from ai --to cyber --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein focus transition --from cyber --to private
+          serein focus transition --from balanced --to ai
+          # focus doctor never FAILs merely because no GPU/Tor/KVM/
+          # container tooling is installed (see docs/focus/architecture.md)
+          # - a stock CI runner should always exit 0 here. S6.5 has no
+          # Apply engine: no GPU, Tor, KVM, containers, root, or network
+          # is required, and no systemd/cgroup mutation ever occurs.
+          serein focus doctor
+          serein focus doctor --json | python -c "import json,sys; json.load(sys.stdin)"
