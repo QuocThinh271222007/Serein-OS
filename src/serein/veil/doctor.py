@@ -86,27 +86,49 @@ def _check_plan_generation(root: Path, runner: CommandRunner, home: Path | None)
 def _check_tor_service_consistency(runner: CommandRunner, root: Path) -> CheckResult:
     check_id, title = _TOR_SERVICE_CHECK
     tor = detect_tor_status(runner=runner, root=root)
-    if tor.package_installed and tor.service_present is False:
+    if tor.package_installed and tor.service.runtime_unit_present is False:
         return CheckResult(
             check_id, title, CheckStatus.WARN,
-            "The tor package is installed but no tor systemd service unit "
-            "was found - a partial or non-systemd install; Tor client "
-            "usability may be affected.",
+            "The tor package is installed but no tor@default.service "
+            "(the actual daemon runtime instance) was found - a partial "
+            "or non-systemd install; Tor client usability may be "
+            "affected. tor.service alone is never sufficient runtime "
+            "evidence.",
         )
-    detail = "No tor package/service mismatch detected."
+    if (
+        tor.service.master_unit_active is True
+        and tor.service.runtime_unit_present is not None
+        and tor.service.runtime_unit_active is not True
+    ):
+        return CheckResult(
+            check_id, title, CheckStatus.WARN,
+            "tor.service (the master/orchestration unit) is active, but "
+            "tor@default.service (the actual Tor daemon runtime instance) "
+            "is not - the master unit's own state is never runtime proof "
+            "by itself (S6R Corrective A).",
+        )
+    detail = "No tor master/runtime-service mismatch detected."
     return CheckResult(check_id, title, CheckStatus.PASS, detail)
 
 
 def _check_tor_socks_consistency(runner: CommandRunner, root: Path) -> CheckResult:
     check_id, title = _TOR_SOCKS_CHECK
     tor = detect_tor_status(runner=runner, root=root)
-    if tor.config.socks_port_configured is True and tor.service_active is False:
+    if tor.config.socks_port_configured is True and tor.service.runtime_unit_active is False:
         return CheckResult(
             check_id, title, CheckStatus.WARN,
-            "torrc explicitly configures a SocksPort, but the tor service "
-            "is not active - the configured SOCKS listener is not "
+            "torrc explicitly configures a SocksPort, but the Tor daemon "
+            "runtime is not active - the configured SOCKS listener is not "
             "actually running.",
         )
+    if tor.config.socks_port_configured is True and tor.service.runtime_unit_active is True:
+        detail = (
+            "torrc configures a SocksPort and the Tor daemon runtime is "
+            "active - configuration and runtime state agree, though this "
+            "still does not by itself confirm a real listener (see "
+            "tor.usable/docs/veil/tor-strategy.md)."
+        )
+        return CheckResult(check_id, title, CheckStatus.PASS, detail)
     return CheckResult(
         check_id, title, CheckStatus.PASS, "No SOCKS configuration/service mismatch detected."
     )
