@@ -80,12 +80,28 @@ now, entirely independent of whether it is the current target:
 - **cyber** (Section 79): `available` once the isolated toolbox is
   installed or VM isolation is usable (S5 evidence); `limited`
   otherwise - host-tier diagnostics remain usable without either.
-- **private** (Section 42/77): `available` only once the Tor client is
-  confirmed `usable` (S6 evidence); `limited` if some mechanism (Tor
-  binary, Tor Browser launcher, Whonix) is merely installed but not
-  proven usable; `blocked` if nothing usable exists at all - the one
-  domain that can be genuinely `blocked`, since a privacy focus that
-  cannot be realized must never be reported as available.
+- **private** (Section 42/77, corrected by S6.5R Corrective D): `available`
+  only once a *complete* private-browsing/isolation boundary is
+  confirmed usable - `private_workspace.usable`, `whonix_vm.usable`, or
+  `tor_browser.usable` is `True` (S6 evidence). **A usable Tor *client*
+  alone is deliberately insufficient** - S6 itself keeps "Tor client
+  usable" genuinely separate from "application routed via Tor"/
+  "private workspace usable"/"Whonix usable"
+  (`docs/veil/threat-model.md`), and an earlier S6.5 pass had
+  incorrectly re-collapsed that distinction by treating
+  `tor_client.usable=True` as sufficient for `"available"`. The
+  corrected chain:
+
+  ```
+  complete boundary usable (workspace/whonix/browser)  -> "available"
+  Tor client usable, no complete boundary usable          -> "limited"
+  some mechanism merely installed, nothing usable            -> "limited"
+  nothing present at all                                       -> "blocked"
+  ```
+
+  `serein focus doctor`'s `focus_private_readiness_not_tor_only` check
+  re-verifies live that Tor client usability alone never upgrades
+  readiness to `"available"`.
 
 ## Domain readiness vocabulary is mechanism-specific, never marketing (Section 77)
 

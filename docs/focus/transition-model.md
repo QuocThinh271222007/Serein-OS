@@ -59,23 +59,55 @@ FocusTransitionPlan(
 )
 ```
 
+## Lifecycle target semantics (S6.5R Corrective A/B) - which targets can even reach an instance action
+
+Only `ai_runtime` can ever reach an instance-level `target_intent`
+(`QUIESCE_CANDIDATE`/`PRIORITY_CANDIDATE`) - its binary presence *is*
+the recognized instance (Section 5/38 of the corrective). `cyber_toolbox`,
+`cyber_vm`, and `whonix` are mechanism-only targets: S6.5 has no
+instance-level detector for any of them (no `podman ps`, `virsh list`,
+or equivalent - Section 42), so `instance_present` stays `None` and
+`target_intent` stays `KEEP` regardless of mechanism readiness or focus
+role:
+
+```
+ai_runtime     - binary installed  -> instance_present=True  -> can reach
+                                        QUIESCE_CANDIDATE/PRIORITY_CANDIDATE
+cyber_toolbox  - engine+Distrobox present -> mechanism_available=True,
+                                               instance_present=None -> always KEEP
+cyber_vm       - KVM/QEMU/libvirt ready    -> mechanism_available=True,
+                                               instance_present=None -> always KEEP
+whonix         - VM privacy boundary ready  -> mechanism_available=True,
+                                                instance_present=None -> always KEEP
+                 (qcow2 artifacts present or not - never promoted to
+                 instance_present, Section 8)
+```
+
+See `docs/focus/resource-intent.md`'s "Lifecycle: mechanism readiness ≠
+instance existence" section for the full four-fact model
+(`recognized_by_serein`/`mechanism_available`/`instance_present`/
+`instance_running`/`managed_by_serein`).
+
 ## AI -> Cyber example
 
 ```
 cpu:    ai primary -> idle,  cyber idle -> primary
 memory: ai high -> low,      cyber low -> high
 gpu:    "preferred"/ai -> "shared" (if a GPU is present) or unchanged (none present)
-lifecycle: ai_runtime -> QUIESCE_CANDIDATE (if installed); cyber_toolbox/cyber_vm -> PRIORITY_CANDIDATE (if installed)
+lifecycle: ai_runtime -> QUIESCE_CANDIDATE (if the runtime binary is installed);
+           cyber_toolbox/cyber_vm stay KEEP even if their mechanism is ready
+           (Section 6-7/39-40 - mechanism readiness is never promoted to an
+           instance action)
 ```
 
 ## Cyber -> AI example
 
-Exact mirror: `cyber` role goes `primary -> idle`, `ai` goes
-`idle -> primary`; cyber toolbox/VM lifecycle intents (if installed)
-move toward `QUIESCE_CANDIDATE`, `ai_runtime` (if installed) moves
-toward `PRIORITY_CANDIDATE`. `dev` remains `secondary` in both
-directions - it is never involved in the ai/cyber IDLE-vs-PRIMARY
-swap.
+Exact mirror for CPU/memory: `cyber` role goes `primary -> idle`, `ai`
+goes `idle -> primary`; `ai_runtime` (if its binary is installed) moves
+toward `PRIORITY_CANDIDATE`. `cyber_toolbox`/`cyber_vm` stay `KEEP`
+regardless of mechanism readiness - there is no toolbox/VM instance
+evidence to quiesce. `dev` remains `secondary` in both directions - it
+is never involved in the ai/cyber IDLE-vs-PRIMARY swap.
 
 ## AI -> Private example (Section 55)
 
@@ -89,11 +121,15 @@ warnings regardless of readiness:
 > "Any other domain's GPU/resource preference must never interfere
 > with privacy isolation invariants."
 
-If `private`'s own readiness is `"blocked"` (no usable Tor/Whonix
-mechanism - the common case on a host with neither installed), the
-transition's `status` is `"BLOCKED"` and `blockers` names the exact
-readiness reason - Serein never pretends a privacy focus can be
-realized when the underlying S6 evidence says it cannot (Section 42).
+If `private`'s own readiness is `"blocked"` (nothing installed at all)
+the transition's `status` is `"BLOCKED"` and `blockers` names the exact
+readiness reason. If readiness is `"limited"` (e.g. a usable Tor
+*client* but no complete private-workspace/browser/Whonix boundary -
+S6.5R Corrective D, `docs/focus/domain-model.md`), the transition stays
+`"PLANNABLE"` with `prerequisites` naming the gap - Serein never
+pretends a privacy focus is fully realizable from Tor client usability
+alone, but a partial/limited state is still honestly reported as
+plannable, not silently upgraded or downgraded (Section 32).
 
 ## Private -> AI example (Section 56)
 

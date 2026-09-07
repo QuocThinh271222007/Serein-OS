@@ -104,17 +104,48 @@ def _cyber_readiness(evidence: FocusEvidence) -> tuple[str, str]:
 
 
 def _private_readiness(evidence: FocusEvidence) -> tuple[str, str]:
+    """S6.5R Corrective D (Section 25-31): Tor *client* usability alone
+    must never upgrade private readiness to ``"available"`` - S6 itself
+    keeps "Tor client usable" genuinely separate from "application
+    routed via Tor" / "private workspace usable" / "Whonix usable"
+    (`docs/veil/threat-model.md`), and Focus must not re-collapse that
+    distinction. ``"available"`` requires one of the mechanisms that
+    would actually constitute a *complete* private-browsing/isolation
+    boundary - ``private_workspace``, ``whonix_vm``, or ``tor_browser``
+    - to be confirmed ``usable`` (S6 evidence); a bare-usable Tor
+    client, or any mechanism merely *installed*, is ``"limited"``."""
     by_id = {c.id: c for c in evidence.veil_capabilities.capabilities}
     tor = by_id.get("tor_client")
     browser = by_id.get("tor_browser")
+    workspace = by_id.get("private_workspace")
     whonix = by_id.get("whonix_vm")
-    if tor is not None and tor.usable is True:
-        return "available", "Tor client is confirmed usable (S6 evidence)."
-    if (
-        (tor is not None and tor.installed)
-        or (browser is not None and browser.installed)
-        or (whonix is not None and whonix.usable is True)
-    ):
+
+    complete_boundary_usable = any(
+        capability is not None and capability.usable is True
+        for capability in (workspace, whonix, browser)
+    )
+    if complete_boundary_usable:
+        return (
+            "available",
+            "A complete private-workspace/Whonix/Tor-Browser boundary is "
+            "confirmed usable (S6 evidence).",
+        )
+
+    tor_usable = tor is not None and tor.usable is True
+    if tor_usable:
+        return (
+            "limited",
+            "Tor client is usable, but no complete private-workspace/"
+            "browser/Whonix boundary is confirmed usable (S6 evidence, "
+            "Section 42) - Tor client usability alone does not mean a "
+            "private focus is fully realizable (S6.5R Corrective D).",
+        )
+
+    something_present = any(
+        capability is not None and capability.installed
+        for capability in (tor, browser, workspace, whonix)
+    )
+    if something_present:
         return (
             "limited",
             "Some privacy mechanism is installed but not yet confirmed "
@@ -122,8 +153,9 @@ def _private_readiness(evidence: FocusEvidence) -> tuple[str, str]:
         )
     return (
         "blocked",
-        "No usable Tor client, Tor Browser, or Whonix readiness detected "
-        "(S6 evidence, Section 42) - a private focus cannot be realized yet.",
+        "No usable Tor client, Tor Browser, private workspace, or Whonix "
+        "readiness detected (S6 evidence, Section 42) - a private focus "
+        "cannot be realized yet.",
     )
 
 

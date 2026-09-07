@@ -44,6 +44,37 @@ A future phase adding a new understood service (e.g. a dev-tier
 container/build daemon) would extend this list explicitly, never infer
 one from a fuzzy process name.
 
+## Instance-level lifecycle evidence exists for exactly one target (S6.5R)
+
+Only `ai_runtime` can ever report `instance_present=True` - its
+recognized instance *is* the runtime binary. `cyber_toolbox`,
+`cyber_vm`, and `whonix` are permanently mechanism-only in this build:
+S6.5 has no instance-level detector for any of them (no `podman ps`,
+`virsh list`, or equivalent - deliberately out of scope, Section 42),
+so their `instance_present` stays `None` and their `target_intent`
+stays `KEEP` forever, regardless of mechanism readiness or focus role.
+A future phase that wants real toolbox-container/VM/Whonix-domain
+lifecycle candidates would need to add a genuinely new, carefully-
+reviewed instance-level detector to each subsystem (S5 for toolbox/VM,
+S6 for Whonix) - S6.5R deliberately did not do this itself, since
+adding detection scope was explicitly out of bounds for this
+corrective (`docs/focus/resource-intent.md`, `docs/focus/
+transition-model.md`).
+
+## Private readiness's "complete boundary" set is fixed at three capabilities
+
+S6.5R Corrective D gates private `"available"` readiness on
+`private_workspace.usable`, `whonix_vm.usable`, or `tor_browser.usable`
+being `True`. In the real S6 implementation shipped today, none of
+these three ever actually reach `True` from live detection (S6's own
+contract deliberately keeps them conservative - see
+`docs/veil/private-workspace.md`, `docs/veil/whonix.md`,
+`docs/veil/tor-browser.md`) - so `"available"` private readiness is
+currently unreachable from real host evidence, only from synthetic
+test fixtures. This is intentional, not a bug: the correct behavior
+today is that private focus stays `"limited"` at best until a future
+S6 phase actually proves one of these three usable end to end.
+
 ## `expected_ram_reclaim_bytes`/`expected_vram_reclaim_bytes` are always `None`
 
 By design (Section 84-85/105) - no workload-size measurement mechanism

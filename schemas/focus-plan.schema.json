@@ -104,20 +104,24 @@
     "lifecycleIntent": {
       "type": "object",
       "required": [
-        "kind", "target", "domain", "current_state", "target_intent",
-        "managed_by_serein", "reversible", "cost", "reason", "status"
+        "kind", "target", "domain", "recognized_by_serein", "mechanism_available",
+        "instance_present", "instance_running", "managed_by_serein", "target_intent",
+        "reversible", "cost", "reason", "status"
       ],
       "additionalProperties": false,
       "properties": {
         "kind": { "type": "string", "enum": ["service", "container", "vm"] },
         "target": { "type": "string", "minLength": 1 },
         "domain": { "type": "string", "enum": ["dev", "ai", "cyber", "private"] },
-        "current_state": { "type": "string", "minLength": 1 },
+        "recognized_by_serein": { "const": true },
+        "mechanism_available": { "type": ["boolean", "null"] },
+        "instance_present": { "type": ["boolean", "null"] },
+        "instance_running": { "type": ["boolean", "null"] },
+        "managed_by_serein": { "type": ["boolean", "null"] },
         "target_intent": {
           "type": "string",
           "enum": ["KEEP", "QUIESCE_CANDIDATE", "PRIORITY_CANDIDATE", "RESOURCE_INCREASE_CANDIDATE", "RESOURCE_REDUCE_CANDIDATE"]
         },
-        "managed_by_serein": { "type": "boolean" },
         "reversible": { "type": ["boolean", "null"] },
         "cost": { "type": "string", "enum": ["low", "medium", "high", "unknown"] },
         "reason": { "type": "string", "minLength": 1 },

@@ -98,7 +98,35 @@ a future lifecycle action, and it is never paired with a byte count.
 
 ## GPU lease intent (Section 29-35) - see `docs/focus/gpu-lease.md`
 
-## Service/container/VM lifecycle (Section 36-40) - see `docs/focus/transition-model.md`
+## Lifecycle: mechanism readiness ≠ instance existence (S6.5R Corrective A/B)
+
+An earlier S6.5 pass conflated four genuinely separate facts about a
+lifecycle target into one `installed` boolean. `LifecycleIntent` now
+keeps them apart explicitly:
+
+```
+recognized_by_serein   - Serein's model understands this target semantically
+mechanism_available    - S3-S6 evidence proves the underlying tool/engine/
+                          backend exists (a binary, an engine+Distrobox pair,
+                          a ready KVM/QEMU/libvirt stack)
+instance_present        - a CONCRETE resource instance actually exists
+                            (a running toolbox container, an imported VM, a
+                            launched runtime) - bool | None, None = unknown
+instance_running          - that instance is currently active - bool | None,
+                              never guessed True from presence alone
+managed_by_serein          - Serein itself created/owns that instance -
+                                False for every target today (no Apply
+                                engine has ever run)
+```
+
+S6.5 never adds a new instance-level detector (`podman ps`, `virsh
+list`, `systemctl status <service>`, `ps aux`, an `nvidia-smi` process
+listing) to manufacture `instance_present` evidence - it stays `None`
+for every target except `ai_runtime`, where the runtime binary itself
+*is* the recognized instance (a single global runtime, not a
+per-workload container). See `docs/focus/transition-model.md` for the
+full lifecycle-target-by-target breakdown and the instance-action
+invariant this distinction enforces.
 
 ## I/O weight (Section 28)
 

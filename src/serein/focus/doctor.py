@@ -18,8 +18,9 @@ from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.doctor.models import SCHEMA_VERSION, CheckResult, CheckStatus, DoctorReport
 from serein.focus.domains import CANONICAL_TRANSITIONS
 from serein.focus.evidence import FocusEvidence, gather_focus_evidence
-from serein.focus.models import FOCUS_TARGETS
-from serein.focus.policy import build_focus_policy
+from serein.focus.models import FOCUS_TARGETS, INSTANCE_LEVEL_INTENTS
+from serein.focus.policy import build_focus_policy, evaluate_domain_readiness
+from serein.focus.resources import usable_ai_gpu_backend
 from serein.focus.transition import build_focus_transition
 from serein.hardware._util import DEFAULT_ROOT
 
@@ -32,6 +33,18 @@ _PRIVATE_INVARIANT_CHECK = (
 )
 _NO_MUTATION_CHECK = ("focus_plan_no_mutation", "Focus plan does not mutate host")
 _TRANSITION_GRAPH_CHECK = ("focus_transition_graph_complete", "Transition graph complete")
+_LIFECYCLE_INSTANCE_EVIDENCE_CHECK = (
+    "focus_lifecycle_instance_evidence", "Lifecycle instance-level actions have instance evidence",
+)
+_LIFECYCLE_OWNERSHIP_CHECK = (
+    "focus_lifecycle_ownership_not_overclaimed", "Lifecycle ownership not overclaimed",
+)
+_AI_GPU_BACKEND_GATED_CHECK = (
+    "focus_ai_gpu_backend_gated", "AI GPU preference gated on usable backend",
+)
+_PRIVATE_TOR_ONLY_CHECK = (
+    "focus_private_readiness_not_tor_only", "Private readiness not upgraded by Tor client alone",
+)
 
 _FORBIDDEN_MUTATION_MARKERS: tuple[str, ...] = (
     "kill", "pkill", "killall",
@@ -179,6 +192,88 @@ def _check_transition_graph(evidence: FocusEvidence) -> CheckResult:
     return CheckResult(check_id, title, CheckStatus.PASS, detail)
 
 
+def _check_lifecycle_instance_evidence(evidence: FocusEvidence) -> CheckResult:
+    """S6.5R Corrective A, Section 4/36/60: an instance-level intent
+    (QUIESCE_CANDIDATE/PRIORITY_CANDIDATE/RESOURCE_INCREASE_CANDIDATE/
+    RESOURCE_REDUCE_CANDIDATE) is only ever valid when
+    ``instance_present is True``."""
+    check_id, title = _LIFECYCLE_INSTANCE_EVIDENCE_CHECK
+    for target in FOCUS_TARGETS:
+        policy = build_focus_policy(target, evidence)
+        for lc in policy.lifecycle_intents:
+            if lc.target_intent in INSTANCE_LEVEL_INTENTS and lc.instance_present is not True:
+                return CheckResult(
+                    check_id, title, CheckStatus.FAIL,
+                    f"target={target!r} lifecycle intent {lc.kind}.{lc.target} proposes "
+                    f"{lc.target_intent!r} with instance_present={lc.instance_present!r} "
+                    "(expected True).",
+                )
+    detail = "Every instance-level lifecycle intent has instance_present=True."
+    return CheckResult(check_id, title, CheckStatus.PASS, detail)
+
+
+def _check_lifecycle_ownership_not_overclaimed(evidence: FocusEvidence) -> CheckResult:
+    """S6.5R Corrective B, Section 12-16: Serein has never created any
+    lifecycle target (no Apply engine has ever run), so
+    ``managed_by_serein=True`` is never valid in this build."""
+    check_id, title = _LIFECYCLE_OWNERSHIP_CHECK
+    for target in FOCUS_TARGETS:
+        policy = build_focus_policy(target, evidence)
+        for lc in policy.lifecycle_intents:
+            if lc.managed_by_serein:
+                return CheckResult(
+                    check_id, title, CheckStatus.FAIL,
+                    f"target={target!r} lifecycle intent {lc.kind}.{lc.target} claims "
+                    "managed_by_serein=True without direct ownership evidence - no "
+                    "Apply engine has ever run.",
+                )
+    detail = "No lifecycle intent overclaims Serein ownership."
+    return CheckResult(check_id, title, CheckStatus.PASS, detail)
+
+
+def _check_ai_gpu_backend_gated(evidence: FocusEvidence) -> CheckResult:
+    """S6.5R Corrective C, Section 18-20/45: ``preferred_domain=="ai"``
+    is only valid alongside a confirmed-usable S4 GPU-backed PyTorch
+    build - never from generic GPU hardware/driver/runtime presence
+    alone."""
+    check_id, title = _AI_GPU_BACKEND_GATED_CHECK
+    policy = build_focus_policy("ai", evidence)
+    if policy.gpu_intent.preferred_domain == "ai" and not usable_ai_gpu_backend(evidence):
+        return CheckResult(
+            check_id, title, CheckStatus.FAIL,
+            "AI focus reports gpu_intent.preferred_domain='ai' without a confirmed-"
+            "usable S4 GPU-backed PyTorch build (pytorch_cuda/pytorch_rocm).",
+        )
+    detail = "AI GPU preference is never claimed without a confirmed-usable S4 GPU backend."
+    return CheckResult(check_id, title, CheckStatus.PASS, detail)
+
+
+def _check_private_readiness_not_tor_only(evidence: FocusEvidence) -> CheckResult:
+    """S6.5R Corrective D, Section 25-31: if the Tor client is the only
+    usable privacy mechanism, private readiness must never be
+    ``"available"``."""
+    check_id, title = _PRIVATE_TOR_ONLY_CHECK
+    by_id = {c.id: c for c in evidence.veil_capabilities.capabilities}
+    tor = by_id.get("tor_client")
+    tor_only_usable = (
+        tor is not None
+        and tor.usable is True
+        and not any(
+            by_id.get(capability_id) is not None and by_id[capability_id].usable is True
+            for capability_id in ("private_workspace", "whonix_vm", "tor_browser")
+        )
+    )
+    readiness, _reason = evaluate_domain_readiness(evidence)["private"]
+    if tor_only_usable and readiness == "available":
+        return CheckResult(
+            check_id, title, CheckStatus.FAIL,
+            "private readiness is 'available' from Tor client usability alone - "
+            "no complete private-workspace/browser/Whonix boundary is usable.",
+        )
+    detail = "Tor client usability alone never upgrades private readiness to 'available'."
+    return CheckResult(check_id, title, CheckStatus.PASS, detail)
+
+
 def run_focus_checks(
     root: Path = DEFAULT_ROOT, runner: CommandRunner = DEFAULT_RUNNER, home: Path | None = None
 ) -> DoctorReport:
@@ -191,5 +286,9 @@ def run_focus_checks(
         _check_private_preserves_veil_invariants(evidence),
         _check_no_mutation(evidence),
         _check_transition_graph(evidence),
+        _check_lifecycle_instance_evidence(evidence),
+        _check_lifecycle_ownership_not_overclaimed(evidence),
+        _check_ai_gpu_backend_gated(evidence),
+        _check_private_readiness_not_tor_only(evidence),
     ]
     return DoctorReport(schema_version=SCHEMA_VERSION, checks=checks)

@@ -24,16 +24,57 @@ backend enforcement, which does not exist. `resources.build_gpu_intent()`
 picks a mode from real evidence:
 
 ```
-No GPU device detected (S2 evidence)          -> "unavailable"
-AI is primary AND a GPU is present             -> "preferred", preferred_domain="ai"
-(everything else)                               -> "shared", preferred_domain=None
+No GPU device detected (S2 evidence)                              -> "unavailable"
+AI is primary + GPU present + usable_ai_gpu_backend(evidence)        -> "preferred", preferred_domain="ai"
+AI is primary + GPU present + NO usable S4 GPU-backed PyTorch build     -> "shared", preferred_domain=None
+(everything else)                                                        -> "shared", preferred_domain=None
 ```
+
+## AI GPU preference is gated on a usable S4 backend, not hardware presence (S6.5R Corrective C)
+
+An earlier pass moved to `"preferred"` from S2 GPU hardware presence
+alone. This was corrected: `resources.usable_ai_gpu_backend(evidence)`
+is now the sole gate for AI GPU preference -
+
+```python
+def usable_ai_gpu_backend(evidence: FocusEvidence) -> bool:
+    by_id = {c.id: c for c in evidence.ai_capabilities.capabilities}
+    return any(
+        by_id.get(cid) is not None and by_id[cid].usable is True
+        for cid in ("pytorch_cuda", "pytorch_rocm")
+    )
+```
+
+Deliberately **not** sufficient, on their own, to justify AI GPU
+preference: `nvidia_hardware`/`nvidia_driver`/`cuda_runtime`/
+`rocm_runtime` capability presence or usability - each of these can be
+`True` while the actual application-level backend Serein's own S4
+`select_pytorch_backend()` decision reflects remains unusable (a driver
+can be installed and a CUDA *driver-API* runtime confirmed, while the
+PyTorch CUDA *build itself* is absent or broken). `serein focus doctor`'s
+`focus_ai_gpu_backend_gated` check re-verifies this live: FAIL if
+`gpu_intent.preferred_domain == "ai"` without `usable_ai_gpu_backend()`
+returning `True` against the same evidence.
+
+```
+GPU present, no usable backend at all                 -> preferred_domain=None, mode="shared"
+GPU present, only nvidia_hardware confirmed            -> preferred_domain=None, mode="shared"
+GPU present, driver + CUDA runtime, PyTorch CUDA unusable -> preferred_domain=None, mode="shared"
+GPU present, pytorch_cuda.usable=True                    -> preferred_domain="ai", mode="preferred"
+GPU present, pytorch_rocm.usable=True                       -> preferred_domain="ai", mode="preferred"
+```
+
+CPU-only AI focus remains entirely valid (readiness is never gated on
+GPU presence - see `docs/focus/domain-model.md`) - it simply never
+implies a GPU preference exists.
 
 ## Per-domain policy (Section 31-34)
 
-- **AI** (Section 31): the only domain whose primary focus moves the
-  mode to `"preferred"` - and even then only when S2 evidence actually
-  shows a GPU device; `enforceable` stays `False` regardless.
+- **AI** (Section 31/S6.5R Corrective C): the only domain whose primary
+  focus can move the mode to `"preferred"` - and only when a confirmed-
+  usable S4 GPU-backed PyTorch build exists, never from generic
+  hardware/driver/runtime presence alone (see above); `enforceable`
+  stays `False` regardless.
 - **Cyber** (Section 32): never automatically claims the GPU merely
   because it became primary - most cyber workflows (host diagnostics,
   packet capture, VM/toolbox management) are not GPU-heavy, and S6.5

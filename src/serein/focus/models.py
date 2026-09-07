@@ -77,6 +77,16 @@ LIFECYCLE_INTENTS: tuple[str, ...] = (
     "RESOURCE_INCREASE_CANDIDATE", "RESOURCE_REDUCE_CANDIDATE",
 )
 
+#: S6.5R Section 36/60: intents that act on a *concrete instance* -
+#: valid only when ``instance_present is True``. ``KEEP`` is
+#: deliberately excluded - it never proposes any change, so it carries
+#: no instance-existence requirement (it is the correct intent for
+#: "mechanism available, instance unknown" states, Section 4).
+INSTANCE_LEVEL_INTENTS: tuple[str, ...] = (
+    "QUIESCE_CANDIDATE", "PRIORITY_CANDIDATE",
+    "RESOURCE_INCREASE_CANDIDATE", "RESOURCE_REDUCE_CANDIDATE",
+)
+
 #: Reuses the exact S3-S6 plan-action status vocabulary (Section 36).
 PLAN_STATUSES: tuple[str, ...] = ("APPLY", "NOOP", "SKIP", "BLOCKED")
 
@@ -169,19 +179,47 @@ class GPULeaseIntent:
 
 @dataclass(frozen=True)
 class LifecycleIntent:
-    """Section 36-40: service/container/VM lifecycle planning, all
-    sharing one shape (``kind`` distinguishes them) since their
-    semantics and status vocabulary are identical. Only ever created
-    for a target Serein *explicitly* understands via an existing
-    subsystem's own detection (Section 37) - never an arbitrary
-    process name."""
+    """Service/container/VM lifecycle planning, all sharing one shape
+    (``kind`` distinguishes them) since their semantics and status
+    vocabulary are identical. Only ever created for a target Serein
+    *explicitly* understands via an existing subsystem's own detection
+    (Section 37) - never an arbitrary process name.
+
+    S6.5R Corrective A/B (Section 2-16): a single ``installed``/
+    ``current_state`` proxy conflated four genuinely separate facts -
+    ``mechanism_available`` (S3-S6 evidence proves the underlying
+    tool/engine/backend exists), ``instance_present`` (a *concrete*
+    resource instance - a running toolbox container, an imported VM, a
+    launched runtime - actually exists), ``instance_running`` (that
+    instance is currently active), and ``managed_by_serein`` (Serein
+    itself created/owns that instance). None of S6.5's existing
+    evidence sources can currently prove ``instance_present`` for any
+    target except ``ai_runtime`` (where the runtime binary itself *is*
+    the recognized instance - Section 5/38); every other target keeps
+    ``instance_present=None`` (genuinely unknown - Section 42
+    forbids adding a new `podman ps`/`virsh list`/`systemctl status`
+    style detector to manufacture this evidence). ``managed_by_serein``
+    is ``False`` for every current target - Serein has never created
+    any of them (no Apply engine has ever existed), so claiming
+    ownership would be a fabrication (Section 13-14).
+
+    An intent in ``INSTANCE_LEVEL_INTENTS`` (QUIESCE_CANDIDATE,
+    PRIORITY_CANDIDATE, RESOURCE_INCREASE_CANDIDATE,
+    RESOURCE_REDUCE_CANDIDATE) is only ever proposed when
+    ``instance_present is True`` - enforced directly by
+    ``tests/test_focus.py::TestInstanceActionInvariant`` and
+    ``serein focus doctor``'s ``focus_lifecycle_instance_evidence``
+    check. Everywhere else the intent is ``KEEP`` (Section 4/36)."""
 
     kind: str  # "service" | "container" | "vm"
     target: str  # e.g. "ai_runtime", "cyber_toolbox", "cyber_vm", "whonix"
     domain: str  # one of FOCUS_DOMAINS
-    current_state: str  # descriptive, e.g. "available" | "not_detected"
+    recognized_by_serein: bool
+    mechanism_available: bool | None
+    instance_present: bool | None
+    instance_running: bool | None
+    managed_by_serein: bool | None
     target_intent: str  # one of LIFECYCLE_INTENTS
-    managed_by_serein: bool
     reversible: bool | None
     cost: str  # one of COST_LEVELS
     reason: str
