@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/distribution-payload-manifest.schema.json",
+  "title": "Serein Distribution Payload Manifest",
+  "description": "Enumerates exactly which repository-derived files are embedded onto Serein distribution media, with a per-file sha256 so the inspector can prove payload integrity without trusting the build host. Never a full worktree copy - see docs/distribution/payload.md for the allowlist this manifest is built from.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source_commit",
+    "generated_from",
+    "entry_count",
+    "total_bytes",
+    "entries"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full git commit sha the payload was assembled from."
+    },
+    "generated_from": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Top-level allowlisted source roots this payload was built from (e.g. 'src/serein', 'hardware/profiles')."
+    },
+    "entry_count": { "type": "integer", "minimum": 0 },
+    "total_bytes": { "type": "integer", "minimum": 0 },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256", "size_bytes"],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Payload-relative path (POSIX separators), never an absolute host path."
+          },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "size_bytes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}
