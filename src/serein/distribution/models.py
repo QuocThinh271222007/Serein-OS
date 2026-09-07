@@ -23,8 +23,12 @@ DISTRIBUTION_BUILD_SCHEMA = 1
 
 #: Serein's own build-tooling identity, independent of the Python package
 #: version (Section 14 of the S7.0 contract) - bump only when the build
-#: *pipeline itself* changes in a way that could affect output.
-BUILDER_VERSION = "serein-distribution-builder/0.1"
+#: *pipeline itself* changes in a way that could affect output. Bumped
+#: to 0.2 in S7.0R: the canonical pipeline now builds and embeds the
+#: Serein wheel, resets the extraction workspace before every build,
+#: and can produce a QA boot variant - all material changes to what a
+#: build actually produces.
+BUILDER_VERSION = "serein-distribution-builder/0.2"
 
 #: Overlay content version (Section 16) - bump only when files under
 #: distribution/overlay/ change in a way that affects media content.
@@ -192,6 +196,16 @@ class InspectionReport:
     @property
     def passed(self) -> bool:
         return all(f.status != "fail" for f in self.findings)
+
+    @property
+    def strict_passed(self) -> bool:
+        """S7.0R Corrective E: for Layer-B real-media evidence, a
+        ``skip`` (e.g. xorriso unavailable) must never be read as
+        equivalent to a real pass - every finding must be exactly
+        ``"pass"``. Lenient extracted-tree/fixture inspection should
+        keep using :attr:`passed`; real-ISO closure evidence must use
+        this instead."""
+        return bool(self.findings) and all(f.status == "pass" for f in self.findings)
 
     def to_dict(self) -> dict[str, Any]:
         return {
