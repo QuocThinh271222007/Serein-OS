@@ -10,9 +10,14 @@ developer runs on purpose - never invoked by ``pytest``/``ruff``/
 
 Subcommands:
 
-    verify-base   verify the cached base ISO's checksum (fail closed)
-    build         run the full ISO build pipeline
-    inspect PATH  structurally inspect a built ISO or extracted tree
+    verify-base    verify the cached base ISO's checksum (fail closed)
+    build          run the full ISO build pipeline
+    boot-smoke     bounded, marker-aware QEMU boot validation
+    inspect PATH   structurally inspect a built ISO or extracted tree
+    evidence       assemble the compact Layer-B evidence JSON (tolerant
+                   of partial/failed runs - S7.0RM Corrective B)
+    closure-gate   the one explicit, fail-closed Layer-B closure check
+                   (S7.0RM Corrective G)
 """
 
 from __future__ import annotations
@@ -47,7 +52,9 @@ def _cmd_build(args: argparse.Namespace) -> int:
     from serein.distribution.build import BuildError, run_build
 
     try:
-        result = run_build(source_commit=args.source_commit)
+        result = run_build(
+            source_commit=args.source_commit, ephemeral_storage=args.ephemeral_storage
+        )
     except BuildError as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
@@ -63,11 +70,24 @@ def _cmd_build(args: argparse.Namespace) -> int:
 
 
 def _cmd_boot_smoke(args: argparse.Namespace) -> int:
+    import json
+
     from serein.distribution.bootsmoke import DEFAULT_TIMEOUT_SECONDS, run_boot_smoke
 
     iso_path = Path(args.iso)
     work_dir = Path(args.work_dir) if args.work_dir else iso_path.parent / "boot-smoke"
     ovmf_code = Path(args.ovmf_code) if args.ovmf_code else None
+
+    if args.require_uefi and ovmf_code is None:
+        # Corrective F: S7.0 closure requires real UEFI evidence - never
+        # silently fall back to BIOS while a caller downstream might
+        # still label the result "uefi". Fail closed before even
+        # launching QEMU.
+        print(
+            "FAIL: --require-uefi set but no --ovmf-code given - REAL_UEFI_BOOT=BLOCKED",
+            file=sys.stderr,
+        )
+        return 1
 
     result = run_boot_smoke(
         iso_path=iso_path,
@@ -76,7 +96,16 @@ def _cmd_boot_smoke(args: argparse.Namespace) -> int:
         accel=args.accel,
         ovmf_code=ovmf_code,
     )
-    print(f"status={result.status} marker={result.matched_marker!r} reason={result.reason}")
+    print(
+        f"status={result.status} boot_mode={result.boot_mode} "
+        f"marker={result.matched_marker!r} reason={result.reason}"
+    )
+
+    if args.result_json:
+        result_path = Path(args.result_json)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(json.dumps(result.to_dict(), indent=2, sort_keys=True) + "\n")
+
     if result.status != "pass":
         print("--- log excerpt ---", file=sys.stderr)
         print(result.log_excerpt, file=sys.stderr)
@@ -117,28 +146,59 @@ def _cmd_evidence(args: argparse.Namespace) -> int:
 
     from serein.distribution.evidence import assemble_layer_b_evidence, write_layer_b_evidence
 
-    def _load_manifest_dict(path: str) -> dict:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+    def _load_json_optional(path: str | None) -> dict | None:
+        # Corrective B: never assume a stage's file exists - an earlier
+        # failure (e.g. the disk-space preflight, before any build)
+        # means the production/QA manifest legitimately never got
+        # written. Missing means "that stage did not happen", not a
+        # crash.
+        if not path:
+            return None
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
 
-    prod = _load_manifest_dict(args.production_manifest)
-    qa = _load_manifest_dict(args.qa_manifest) if args.qa_manifest else None
+    prod = _load_json_optional(args.production_manifest)
+    qa = _load_json_optional(args.qa_manifest)
+    boot_result = _load_json_optional(args.boot_smoke_result)
 
     evidence = assemble_layer_b_evidence(
-        source_commit=prod["source_commit"],
+        source_commit=args.source_commit,
+        failure_stage=args.failure_stage,
+        failure_reason=args.failure_reason,
         base_filename=args.base_filename,
-        base_sha256_expected=args.base_sha256_expected,
-        base_sha256_actual=args.base_sha256_actual,
-        production_iso_filename=prod["output"]["filename"],
-        production_iso_sha256=prod["output"]["sha256"],
-        production_inspection_status=args.production_inspection_status,
-        qa_boot_iso_filename=qa["output"]["filename"] if qa else None,
-        qa_boot_iso_sha256=qa["output"]["sha256"] if qa else None,
-        qemu_boot=args.qemu_boot_status,
-        qemu_boot_mode=args.qemu_boot_mode,
-        boot_marker=args.boot_marker,
+        base_sha256_expected=args.base_sha256_expected or None,
+        base_sha256_actual=args.base_sha256_actual or None,
+        production_iso_filename=prod["output"]["filename"] if prod else None,
+        production_iso_sha256=prod["output"]["sha256"] if prod else None,
+        production_build=args.production_build,
+        production_inspection=args.production_inspection,
+        qa_iso_filename=qa["output"]["filename"] if qa else None,
+        qa_iso_sha256=qa["output"]["sha256"] if qa else None,
+        qa_build=args.qa_build,
+        qa_inspection=args.qa_inspection,
+        qemu_boot=boot_result["status"] if boot_result else args.qemu_boot,
+        qemu_boot_mode=boot_result["boot_mode"] if boot_result else None,
+        ovmf_firmware=boot_result.get("firmware") if boot_result else None,
+        boot_marker=boot_result["matched_marker"] if boot_result else None,
     )
     out_path = write_layer_b_evidence(evidence, Path(args.out))
     print(f"PASS: wrote {out_path}")
+    return 0
+
+
+def _cmd_closure_gate(args: argparse.Namespace) -> int:
+    from serein.distribution.closure import ClosureError, enforce_layer_b_closure
+    from serein.distribution.evidence import load_layer_b_evidence
+
+    evidence = load_layer_b_evidence(Path(args.evidence))
+    try:
+        enforce_layer_b_closure(evidence, expected_source_commit=args.expected_source_commit)
+    except ClosureError as exc:
+        print(f"FAIL: {exc}", file=sys.stderr)
+        return 1
+    print("PASS: Layer-B closure gate satisfied")
     return 0
 
 
@@ -154,6 +214,11 @@ def main(argv: list[str] | None = None) -> int:
     build_parser.add_argument(
         "--source-commit", required=True, help="Full git commit sha to record in the build manifest"
     )
+    build_parser.add_argument(
+        "--ephemeral-storage", action="store_true",
+        help="Delete the cached base ISO once no longer needed - ephemeral CI runners only, "
+             "never a normal developer build",
+    )
     build_parser.set_defaults(func=_cmd_build)
 
     boot_smoke_parser = subparsers.add_parser(
@@ -165,6 +230,13 @@ def main(argv: list[str] | None = None) -> int:
     boot_smoke_parser.add_argument("--accel", default="tcg", choices=["tcg", "kvm"])
     boot_smoke_parser.add_argument(
         "--ovmf-code", default=None, help="Path to OVMF_CODE.fd for UEFI boot"
+    )
+    boot_smoke_parser.add_argument(
+        "--require-uefi", action="store_true",
+        help="Fail before launching QEMU if --ovmf-code was not given (never silently boot BIOS)",
+    )
+    boot_smoke_parser.add_argument(
+        "--result-json", default=None, help="Path to write a machine-readable boot-smoke result"
     )
     boot_smoke_parser.set_defaults(func=_cmd_boot_smoke)
 
@@ -185,24 +257,54 @@ def main(argv: list[str] | None = None) -> int:
     inspect_parser.set_defaults(func=_cmd_inspect)
 
     evidence_parser = subparsers.add_parser(
-        "evidence", help="Assemble the compact Layer-B evidence JSON"
+        "evidence", help="Assemble the compact Layer-B evidence JSON (tolerant of partial runs)"
     )
-    evidence_parser.add_argument("--production-manifest", required=True)
-    evidence_parser.add_argument("--qa-manifest", default=None)
-    evidence_parser.add_argument("--base-filename", required=True)
-    evidence_parser.add_argument("--base-sha256-expected", required=True)
-    evidence_parser.add_argument("--base-sha256-actual", required=True)
     evidence_parser.add_argument(
-        "--production-inspection-status", default="not_performed",
+        "--source-commit", required=True, help="Known from the exact-head checkout, always present"
+    )
+    evidence_parser.add_argument(
+        "--failure-stage", default=None,
+        help="Name of the stage that failed, if any (e.g. disk_preflight, base_verification)",
+    )
+    evidence_parser.add_argument("--failure-reason", default=None)
+    evidence_parser.add_argument("--base-filename", default=None)
+    evidence_parser.add_argument("--base-sha256-expected", default=None)
+    evidence_parser.add_argument("--base-sha256-actual", default=None)
+    evidence_parser.add_argument(
+        "--production-manifest", default=None,
+        help="Path to the production build manifest, if the build reached that stage",
+    )
+    evidence_parser.add_argument(
+        "--production-build", default="not_performed", choices=["pass", "fail", "not_performed"]
+    )
+    evidence_parser.add_argument(
+        "--production-inspection", default="not_performed",
         choices=["pass", "fail", "not_performed"],
     )
+    evidence_parser.add_argument("--qa-manifest", default=None)
     evidence_parser.add_argument(
-        "--qemu-boot-status", default="not_performed", choices=["pass", "fail", "not_performed"]
+        "--qa-build", default="not_performed", choices=["pass", "fail", "not_performed"]
     )
-    evidence_parser.add_argument("--qemu-boot-mode", default=None, choices=[None, "uefi", "bios"])
-    evidence_parser.add_argument("--boot-marker", default=None)
+    evidence_parser.add_argument(
+        "--qa-inspection", default="not_performed", choices=["pass", "fail", "not_performed"]
+    )
+    evidence_parser.add_argument(
+        "--boot-smoke-result", default=None,
+        help="Path to the JSON result written by `boot-smoke --result-json`",
+    )
+    evidence_parser.add_argument(
+        "--qemu-boot", default="not_performed", choices=["pass", "fail", "not_performed"],
+        help="Used only if --boot-smoke-result was not given",
+    )
     evidence_parser.add_argument("--out", required=True)
     evidence_parser.set_defaults(func=_cmd_evidence)
+
+    closure_gate_parser = subparsers.add_parser(
+        "closure-gate", help="Enforce the explicit fail-closed Layer-B closure gate"
+    )
+    closure_gate_parser.add_argument("--evidence", required=True, help="Path to the evidence JSON")
+    closure_gate_parser.add_argument("--expected-source-commit", required=True)
+    closure_gate_parser.set_defaults(func=_cmd_closure_gate)
 
     args = parser.parse_args(argv)
     result: int = args.func(args)
