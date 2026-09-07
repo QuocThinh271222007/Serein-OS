@@ -236,11 +236,35 @@ jobs:
           echo "ACTUAL_BASE_SHA256=${ACTUAL_SHA}"
           echo "actual=${ACTUAL_SHA}" >> "$GITHUB_OUTPUT"
 
+      # S7.0RM3: `dist/` was never guaranteed to exist on the normal
+      # success path before this step (every earlier step only ever
+      # created it inside its own failure branch) - the shell
+      # redirection into dist/el-torito-base-report.txt ran before
+      # xorriso itself, so a missing dist/ silently aborted the whole
+      # job before xorriso ever executed. Fixed: create the directory
+      # unconditionally first (Fix A), record precise failure evidence
+      # if xorriso itself fails (Fix B), and never report success on an
+      # empty report even if xorriso exited zero (Fix C - `test -s`).
       - name: Save real base el-torito report (evidence)
         run: |
+          mkdir -p dist
           BASE_FILENAME="${{ steps.pinned-base.outputs.filename }}"
-          xorriso -indev "cache/upstream/${BASE_FILENAME}" -report_el_torito as_mkisofs \
-            > dist/el-torito-base-report.txt
+          REPORT_PATH="dist/el-torito-base-report.txt"
+
+          if ! xorriso -indev "cache/upstream/${BASE_FILENAME}" -report_el_torito as_mkisofs \
+              > "${REPORT_PATH}"; then
+            echo "base_el_torito_report" > dist/.failure_stage
+            echo "xorriso failed to extract the base ISO El Torito report" > dist/.failure_reason
+            echo "::error::xorriso failed to extract the base ISO El Torito report"
+            exit 1
+          fi
+
+          if [ ! -s "${REPORT_PATH}" ]; then
+            echo "base_el_torito_report" > dist/.failure_stage
+            echo "base ISO El Torito report is empty" > dist/.failure_reason
+            echo "::error::base ISO El Torito report is empty"
+            exit 1
+          fi
 
       # S7.0RM2 Corrective B: `id: build` lets the evidence-assembly
       # step read this step's own real outcome

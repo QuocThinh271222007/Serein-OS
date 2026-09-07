@@ -1650,6 +1650,147 @@ class TestLayerBWorkflow:
 
 
 # ---------------------------------------------------------------------------
+# S7.0RM3: real base El Torito report step - directory + failure semantics
+# ---------------------------------------------------------------------------
+
+
+def _requires_bash():
+    if shutil.which("bash") is None:
+        pytest.skip("bash not available in this environment")
+
+
+def _make_fake_xorriso(
+    bin_dir: Path, *, exit_code: int = 0, stdout: str = "-c '/boot.catalog'\n"
+) -> None:
+    """A stub `xorriso` on PATH so the *real* committed workflow bash
+    can be executed end to end without the real tool or a real ISO -
+    this proves behavior, not merely that certain strings appear in
+    the YAML text."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "xorriso"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s' \"{stdout}\"\n"
+        f"exit {exit_code}\n"
+    )
+    script.chmod(0o755)
+
+
+class TestElToritoReportStep:
+    """Extracts the REAL `run:` script for the "Save real base
+    el-torito report (evidence)" step straight from the committed
+    workflow YAML (never a hand-copied re-implementation, which could
+    drift from what actually ships) and executes it for real via
+    `bash -c` in a sandboxed tmp_path, with a stub `xorriso` on PATH -
+    proving the real fix behaviorally (directory creation, failure
+    evidence, empty-report fail-closed), not merely that certain
+    strings happen to appear in the file.
+    """
+
+    @pytest.fixture()
+    def step_script(self):
+        import yaml
+
+        _requires_bash()
+        with (WORKFLOWS_DIR / "iso-smoke.yml").open(encoding="utf-8") as fh:
+            workflow = yaml.safe_load(fh)
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        step = next(
+            s for s in steps
+            if s.get("name", "").startswith("Save real base el-torito report")
+        )
+        script = step["run"]
+        # the only GH-Actions expression this step references - substitute
+        # with a literal so the extracted script runs standalone under bash.
+        return script.replace(
+            "${{ steps.pinned-base.outputs.filename }}", "fake-base.iso"
+        )
+
+    def _run(self, script: str, work_dir: Path, bin_dir: Path) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        return subprocess.run(
+            ["bash", "-c", script], cwd=work_dir, env=env,
+            capture_output=True, text=True,
+        )
+
+    def test_missing_dist_directory_is_created_and_xorriso_is_reached(self, step_script, tmp_path):
+        work_dir = tmp_path / "work"
+        (work_dir / "cache" / "upstream").mkdir(parents=True)
+        (work_dir / "cache" / "upstream" / "fake-base.iso").write_bytes(b"fake iso bytes")
+        assert not (work_dir / "dist").exists()
+
+        _make_fake_xorriso(tmp_path / "bin", exit_code=0, stdout="-c '/boot.catalog'\n")
+        result = self._run(step_script, work_dir, tmp_path / "bin")
+
+        assert result.returncode == 0, result.stderr
+        assert (work_dir / "dist").is_dir()
+        report = work_dir / "dist" / "el-torito-base-report.txt"
+        assert report.is_file()
+        assert report.read_text().strip() != ""
+        assert not (work_dir / "dist" / ".failure_stage").exists()
+
+    def test_xorriso_failure_records_evidence_and_fails(self, step_script, tmp_path):
+        work_dir = tmp_path / "work"
+        (work_dir / "cache" / "upstream").mkdir(parents=True)
+        (work_dir / "cache" / "upstream" / "fake-base.iso").write_bytes(b"fake iso bytes")
+
+        _make_fake_xorriso(tmp_path / "bin", exit_code=1, stdout="")
+        result = self._run(step_script, work_dir, tmp_path / "bin")
+
+        assert result.returncode != 0
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "base_el_torito_report"
+        reason = (work_dir / "dist" / ".failure_reason").read_text().strip()
+        assert reason != ""
+        assert "xorriso" in reason.lower()
+
+    def test_empty_report_fails_closed_even_on_exit_zero(self, step_script, tmp_path):
+        work_dir = tmp_path / "work"
+        (work_dir / "cache" / "upstream").mkdir(parents=True)
+        (work_dir / "cache" / "upstream" / "fake-base.iso").write_bytes(b"fake iso bytes")
+
+        _make_fake_xorriso(tmp_path / "bin", exit_code=0, stdout="")
+        result = self._run(step_script, work_dir, tmp_path / "bin")
+
+        assert result.returncode != 0
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "base_el_torito_report"
+        reason = (work_dir / "dist" / ".failure_reason").read_text().strip()
+        assert "empty" in reason.lower()
+
+    def test_valid_nonempty_report_succeeds(self, step_script, tmp_path):
+        work_dir = tmp_path / "work"
+        (work_dir / "cache" / "upstream").mkdir(parents=True)
+        (work_dir / "cache" / "upstream" / "fake-base.iso").write_bytes(b"fake iso bytes")
+
+        _make_fake_xorriso(
+            tmp_path / "bin", exit_code=0,
+            stdout="-c '/boot.catalog'\n-appended_part_as_gpt\n",
+        )
+        result = self._run(step_script, work_dir, tmp_path / "bin")
+
+        assert result.returncode == 0, result.stderr
+        report = work_dir / "dist" / "el-torito-base-report.txt"
+        assert report.is_file()
+        assert report.stat().st_size > 0
+        assert not (work_dir / "dist" / ".failure_stage").exists()
+
+    def test_script_creates_dist_before_any_redirection(self, step_script):
+        # Static ordering check: `mkdir -p dist` must appear before the
+        # xorriso redirection, never after.
+        mkdir_index = step_script.index("mkdir -p dist")
+        redirect_index = step_script.index("> \"${REPORT_PATH}\"")
+        assert mkdir_index < redirect_index
+
+    def test_script_uses_distinct_failure_reasons(self, step_script):
+        assert "xorriso failed to extract the base ISO El Torito report" in step_script
+        assert "base ISO El Torito report is empty" in step_script
+        assert step_script.count('echo "base_el_torito_report" > dist/.failure_stage') == 2
+
+    def test_script_checks_report_non_empty(self, step_script):
+        assert '[ ! -s "${REPORT_PATH}"' in step_script
+
+
+# ---------------------------------------------------------------------------
 # S7.0R: Layer-B evidence assembly
 # ---------------------------------------------------------------------------
 
