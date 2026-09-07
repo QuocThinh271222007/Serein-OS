@@ -17,30 +17,47 @@ own file listing): ``tor.service`` (a top-level/master unit),
 process is actually running, and must never be treated as sufficient
 runtime evidence by itself. See ``TorServiceStatus`` in ``models.py``.
 
-**Tor config semantics (S6R Corrective B).** ``torrc`` is parsed
-sequentially starting from ``/etc/tor/torrc`` only; ``/etc/tor/torrc.d``
-is **never** implicitly merged - it is only read if the main ``torrc``
-(or something it includes) contains an explicit ``%include`` directive
-referencing it, exactly mirroring real Tor's own config-loading
-behavior. ``SocksPort``/``ControlPort``/``TransPort``/``DNSPort`` are
-real Tor multi-valued/additive directives (each occurrence can open its
-own listener), so they are evaluated as "any enabled occurrence found",
-never "first occurrence wins" - an earlier ``SocksPort 0`` line must
-never suppress a later, genuinely-enabled ``SocksPort 9050`` line.
-``CookieAuthentication`` is a scalar on/off flag and is evaluated as
-"last occurrence wins", matching Tor's real override behavior for that
-kind of directive.
+**Tor config semantics (S6R/S6RM Correctives B).** ``torrc`` is an
+*ordered configuration command stream*, not an unordered bag of
+directives - it is parsed sequentially starting from ``/etc/tor/torrc``
+only; ``/etc/tor/torrc.d`` is **never** implicitly merged - it is only
+read if the main ``torrc`` (or something it includes) contains an
+explicit ``%include`` directive referencing it (wildcards supported,
+see below), exactly mirroring real Tor's own config-loading behavior
+(live-verified against the Debian ``torrc(5)`` manual). Each line is
+parsed into a ``(operation, name, value)`` command - ``"set"`` (plain
+``Option value``), ``"append"`` (``+Option value`` - Tor's own
+documented syntax for adding to a multi-valued option without
+discarding earlier values), or ``"clear"`` (``/Option`` - Tor's own
+documented syntax for removing every prior value of that option, with
+no replacement). ``SocksPort``/``ControlPort``/``TransPort``/``DNSPort``
+are real Tor multi-valued/additive directives - every ``set``/``append``
+occurrence contributes an entry (repeated plain ``Option`` lines are
+already additive in real Tor within one file - this is why "any enabled
+occurrence found" was already S6R's correct model for the plain case),
+a ``clear`` empties the accumulated set at that exact point in the
+sequence, and evaluation is fully ordered: a ``clear`` after an enabled
+entry produces ``False`` (explicitly disabled), while a later ``append``
+after a ``clear`` can re-enable it. ``CookieAuthentication`` is a scalar
+on/off flag - ``set``/``append`` both mean "last one wins" (Tor's real
+override behavior for a scalar), and ``clear`` conservatively resets to
+``None`` (unknown) rather than asserting Tor's compiled-in default,
+since Serein does not want to hardcode a specific reset value for a
+scalar security-relevant flag (Section 12).
 
-**Tor usability evidence (S6R Corrective C).** Configuration intent
-(an explicit ``SocksPort`` directive) is never, by itself, runtime
-proof - ``usable`` requires the Tor daemon *runtime* unit to be
-confirmed active *and* a real, local SOCKS listener to actually be
-detected. "SocksPort configured, no confirmed listener" is ``None``
-(unknown), never ``True``.
+**Tor usability evidence (S6R Corrective C, unchanged by S6RM).**
+Configuration intent (an explicit ``SocksPort`` directive) is never, by
+itself, runtime proof - ``usable`` requires the Tor daemon *runtime*
+unit to be confirmed active *and* a real, local SOCKS listener to
+actually be detected. "SocksPort configured, no confirmed listener" is
+``None`` (unknown), never ``True``; an explicitly *cleared*/disabled
+SocksPort takes precedence over any listener evidence, so a stale
+listener can never override an explicit ``/SocksPort`` (Section 26).
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 from pathlib import Path, PurePosixPath
 
@@ -61,20 +78,42 @@ _RUNTIME_UNIT_CANDIDATES: tuple[str, ...] = ("tor@default.service",)
 #: this module ever checks for a local listener (Section 45).
 _DEFAULT_SOCKS_PORT = 9050
 
-_DIRECTIVE_RE = re.compile(r"^([A-Za-z][A-Za-z0-9]*)\s+(.*)$")
+#: A directive line: an optional "+" (append) or "/" (clear) operator
+#: prefix, the option name, and an optional value (absent for "/Option",
+#: which takes no value - live-verified against the Debian torrc(5)
+#: manual's documented command-line/config-file override syntax).
+_DIRECTIVE_RE = re.compile(r"^([+/]?)([A-Za-z][A-Za-z0-9]*)(?:\s+(.*))?$")
 _INCLUDE_RE = re.compile(r"^%include\s+(\S+)\s*$", re.IGNORECASE)
 
-#: Real Tor multi-valued/additive directives - "any enabled occurrence
-#: found" semantics (Section 12-15), never first-occurrence-wins.
-_MULTI_VALUE_DIRECTIVES: tuple[str, ...] = ("SocksPort", "ControlPort", "TransPort", "DNSPort")
-
-#: Guards against a runaway/cyclic %include chain (Section 10).
+#: Guards against a runaway/cyclic %include chain (Section 18).
 _MAX_INCLUDE_DEPTH = 8
 
+#: Wildcard characters Tor's torrc(5) manual documents for %include:
+#: "*" (any number of characters, including none) and "?" (exactly one
+#: character) - live-verified; no other glob syntax is supported
+#: (Section 17 - bounded, safe, only what Tor itself documents).
+_WILDCARD_CHARS = ("*", "?")
+
 
 # ---------------------------------------------------------------------------
-# torrc parsing (%include-aware, never an implicit torrc.d merge)
+# torrc parsing (%include-aware, wildcard-aware, root-confined, never an
+# implicit torrc.d merge)
 # ---------------------------------------------------------------------------
+
+
+def _is_within_root(root: Path, candidate: Path) -> bool:
+    """True only if ``candidate`` resolves to a location inside
+    ``root`` - blocks ``%include ../../../etc/passwd``-style traversal,
+    absolute-path re-rooting included (Section 15-16). Never touches
+    the real filesystem beyond lexical path resolution (``resolve()``
+    with ``strict=False``, the default, does not require the path to
+    exist)."""
+    try:
+        root_resolved = root.resolve()
+        candidate_resolved = candidate.resolve()
+    except OSError:
+        return False
+    return candidate_resolved == root_resolved or root_resolved in candidate_resolved.parents
 
 
 def _include_target_path(root: Path, raw: str, current_dir: Path) -> Path:
@@ -88,14 +127,34 @@ def _include_target_path(root: Path, raw: str, current_dir: Path) -> Path:
     return current_dir / raw
 
 
+def _has_wildcard(segment: str) -> bool:
+    return any(char in segment for char in _WILDCARD_CHARS)
+
+
+def _split_wildcard_include(raw: str) -> tuple[str, str] | None:
+    """If the *final* path segment of a ``%include`` argument contains a
+    wildcard, returns ``(directory_part, pattern)``; else ``None``.
+    Only the final segment is treated as a glob (Section 17/19) - this
+    is the only shape Tor's own examples and this corrective's required
+    tests use (``%include /etc/tor/torrc.d/*.conf``); a wildcard earlier
+    in the path is treated literally (no match), a documented scope
+    limitation rather than a full recursive-glob implementation."""
+    directory_part, sep, last = raw.rpartition("/")
+    if not _has_wildcard(last):
+        return None
+    return (directory_part if sep else "."), last
+
+
 def _resolve_lines(root: Path, path: Path, seen: frozenset[Path], depth: int) -> list[str]:
-    if depth > _MAX_INCLUDE_DEPTH or path in seen:
+    if depth > _MAX_INCLUDE_DEPTH or path in seen or not _is_within_root(root, path):
         return []
     seen = seen | {path}
 
     if path.is_dir():
         try:
-            children = sorted(p for p in path.iterdir() if p.is_file())
+            children = sorted(
+                (p for p in path.iterdir() if p.is_file()), key=lambda p: p.name
+            )
         except OSError:
             return []
         lines: list[str] = []
@@ -113,10 +172,42 @@ def _resolve_lines(root: Path, path: Path, seen: frozenset[Path], depth: int) ->
             continue
         include_match = _INCLUDE_RE.match(stripped)
         if include_match:
-            target = _include_target_path(root, include_match.group(1), path.parent)
-            lines.extend(_resolve_lines(root, target, seen, depth + 1))
+            lines.extend(_resolve_include(root, include_match.group(1), path.parent, seen, depth))
             continue
         lines.append(stripped)
+    return lines
+
+
+def _resolve_include(
+    root: Path, raw_arg: str, current_dir: Path, seen: frozenset[Path], depth: int
+) -> list[str]:
+    """Resolves one ``%include`` argument - plain path or wildcard
+    (Section 13-14/17): wildcards are expanded first, matches sorted
+    lexically, then each matching file/directory is parsed in the
+    ``%include`` line's exact position, mirroring the documented Tor
+    behavior verbatim ("Wildcards are expanded first, then sorted using
+    lexical order... for each matching file or folder...")."""
+    wildcard = _split_wildcard_include(raw_arg)
+    if wildcard is None:
+        target = _include_target_path(root, raw_arg, current_dir)
+        return _resolve_lines(root, target, seen, depth + 1)
+
+    directory_arg, pattern = wildcard
+    directory = _include_target_path(root, directory_arg, current_dir)
+    if not _is_within_root(root, directory):
+        return []
+    try:
+        if not directory.is_dir():
+            return []
+        matches = sorted(
+            (p for p in directory.iterdir() if fnmatch.fnmatch(p.name, pattern)),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        return []
+    lines: list[str] = []
+    for match in matches:
+        lines.extend(_resolve_lines(root, match, seen, depth + 1))
     return lines
 
 
@@ -131,52 +222,97 @@ def _effective_torrc_lines(root: Path) -> list[str]:
     return _resolve_lines(root, main, frozenset(), 0)
 
 
-def _all_directive_values(lines: list[str], name: str) -> list[str]:
-    lowered = name.lower()
-    values = []
+def _parse_directive_line(line: str) -> tuple[str, str, str | None] | None:
+    """Parses one non-comment, non-``%include`` torrc line into
+    ``(operation, name, value)`` - ``"set"``, ``"append"`` (``+``), or
+    ``"clear"`` (``/``, which never takes a value)."""
+    match = _DIRECTIVE_RE.match(line)
+    if not match:
+        return None
+    prefix, name, value = match.groups()
+    operation = {"+": "append", "/": "clear"}.get(prefix, "set")
+    return operation, name, (value.strip() if value is not None else None)
+
+
+def _parsed_directives(lines: list[str]) -> list[tuple[str, str, str | None]]:
+    directives = []
     for line in lines:
-        match = _DIRECTIVE_RE.match(line)
-        if match and match.group(1).lower() == lowered:
-            values.append(match.group(2).strip())
-    return values
+        parsed = _parse_directive_line(line)
+        if parsed is not None:
+            directives.append(parsed)
+    return directives
 
 
-def _multi_value_tri_state(lines: list[str], name: str) -> bool | None:
-    """"Any enabled occurrence found" - real Tor semantics for an
-    additive/multi-valued directive (Section 13-15/18): multiple
-    occurrences each open their own listener, so an earlier ``0`` never
-    suppresses a later enabled value."""
-    values = _all_directive_values(lines, name)
-    if not values:
+def _evaluate_multi_value(
+    directives: list[tuple[str, str, str | None]], name: str
+) -> bool | None:
+    """Sequential ``set``/``append``/``clear`` evaluation for a real
+    Tor multi-valued/additive directive (Section 6/13-15/21):
+    ``set``/``append`` both contribute an entry (within one file,
+    repeated plain ``Option`` lines are already additive in real Tor -
+    Section 10), ``clear`` empties the accumulated set at that exact
+    point, so a later ``append`` after a ``clear`` can still re-enable
+    it (Section 8/27). ``None`` only when the option is never
+    mentioned at all; an explicit ``clear`` with nothing re-enabling it
+    afterward is a definite ``False`` (Section 22)."""
+    lowered = name.lower()
+    entries: list[str] = []
+    mentioned = False
+    for operation, directive_name, value in directives:
+        if directive_name.lower() != lowered:
+            continue
+        mentioned = True
+        if operation == "clear":
+            entries = []
+        else:
+            entries.append(value if value is not None else "")
+    if not mentioned:
         return None
-    return any(value not in ("0", "") for value in values)
+    return any(entry not in ("0", "") for entry in entries)
 
 
-def _single_value_tri_state(lines: list[str], name: str) -> bool | None:
-    """"Last occurrence wins" - Tor's real override behavior for a
-    scalar on/off directive like ``CookieAuthentication``."""
-    values = _all_directive_values(lines, name)
-    if not values:
+def _evaluate_scalar(directives: list[tuple[str, str, str | None]], name: str) -> bool | None:
+    """Sequential evaluation for a scalar on/off directive like
+    ``CookieAuthentication`` - ``set``/``append`` both mean "last one
+    wins" (Section 12: append has no distinct multi-value meaning for a
+    genuinely scalar option), and ``clear`` conservatively resets to
+    ``None`` rather than asserting a specific Tor-compiled-in default
+    value Serein does not want to hardcode."""
+    lowered = name.lower()
+    last_value: str | None = None
+    mentioned = False
+    for operation, directive_name, value in directives:
+        if directive_name.lower() != lowered:
+            continue
+        if operation == "clear":
+            last_value, mentioned = None, False
+            continue
+        mentioned = True
+        last_value = value
+    if not mentioned:
         return None
-    return values[-1] not in ("0", "")
+    return last_value not in ("0", "", None)
 
 
 def parse_tor_config(root: Path = DEFAULT_ROOT) -> TorConfigStatus:
-    """Read-only ``torrc`` (+ explicit ``%include`` targets) parsing -
-    never exposes a directive's raw value (only a booleans-derived
-    summary), and never reads bridge line text, cookie file contents,
-    or hashed passwords (Section 39-41/92)."""
+    """Read-only ``torrc`` (+ explicit, wildcard-aware ``%include``
+    targets) parsing - never exposes a directive's raw value (only a
+    booleans-derived summary), and never reads bridge line text, cookie
+    file contents, or hashed passwords (Section 23-24/39-41/92)."""
     main_present = (root / "etc" / "tor" / "torrc").is_file()
     lines = _effective_torrc_lines(root)
-    bridge_present = any(line.lower().startswith("bridge ") for line in lines)
+    directives = _parsed_directives(lines)
+    bridge_present = any(
+        line.lstrip("+/").lower().startswith("bridge ") for line in lines
+    )
     return TorConfigStatus(
         config_present=main_present or bool(lines),
-        socks_port_configured=_multi_value_tri_state(lines, "SocksPort"),
-        control_port_configured=_multi_value_tri_state(lines, "ControlPort"),
-        cookie_authentication_configured=_single_value_tri_state(lines, "CookieAuthentication"),
-        trans_port_configured=_multi_value_tri_state(lines, "TransPort"),
-        dns_port_configured=_multi_value_tri_state(lines, "DNSPort"),
-        data_directory_configured=bool(_all_directive_values(lines, "DataDirectory")),
+        socks_port_configured=_evaluate_multi_value(directives, "SocksPort"),
+        control_port_configured=_evaluate_multi_value(directives, "ControlPort"),
+        cookie_authentication_configured=_evaluate_scalar(directives, "CookieAuthentication"),
+        trans_port_configured=_evaluate_multi_value(directives, "TransPort"),
+        dns_port_configured=_evaluate_multi_value(directives, "DNSPort"),
+        data_directory_configured=bool(_evaluate_scalar(directives, "DataDirectory")),
         bridge_lines_present=bridge_present,
     )
 

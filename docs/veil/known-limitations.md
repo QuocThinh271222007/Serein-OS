@@ -33,13 +33,31 @@ detection-logic gap.
 
 ## `%include` support has real scope limits
 
-`_resolve_lines()` implements a depth-limited (8 levels), cycle-guarded
-recursive resolver for `%include <file>`/`%include <directory>` -
-directory includes are non-recursive (only direct child files, sorted),
-matching the "no recursion into subdirectories" conservative choice
-made for host-safety reasons. It does not implement Tor's full config
-grammar (e.g. `%include` with shell-style glob patterns, if Tor
-supports them) - only plain file and directory paths.
+`_resolve_lines()`/`_resolve_include()` implement a depth-limited (8
+levels), cycle-guarded, root-confined resolver for `%include <file>`,
+`%include <directory>`, and `%include <wildcard>` (S6RM added `*`/`?`
+wildcard support, live-verified against the Debian `torrc(5)` manual -
+see `docs/veil/tor-strategy.md`) - directory includes and wildcard
+matches are both non-recursive (only direct children, sorted
+lexically), matching the "no recursion into subdirectories" conservative
+choice made for host-safety reasons. Wildcards are only recognized in
+the *final* path segment of an include argument (`%include
+/etc/tor/torrc.d/*.conf`, the documented and tested shape) - a wildcard
+character earlier in the path is treated literally rather than
+triggering a recursive multi-segment glob walk, a deliberate scope
+limitation (Section 17/19), not a correctness gap for the shapes Tor's
+own examples and this corrective's tests use.
+
+## Tor config precedence beyond `set`/`append`/`clear` is not modeled
+
+`_evaluate_multi_value()`/`_evaluate_scalar()` (S6RM) correctly
+implement the three operators the Debian `torrc(5)` manual documents
+(`Option`/`+Option`/`/Option`) in file/include order. They do not model
+precedence between a *separate* Tor defaults-torrc file or real
+command-line arguments (`--SocksPort ...`) - S6 has no such input
+sources to begin with (Serein never invokes `tor` with CLI flags, and
+does not read a `torrc-defaults` file), so this is out of scope by
+construction rather than an unfinished feature.
 
 ## `obfs4proxy` detection is best-effort
 

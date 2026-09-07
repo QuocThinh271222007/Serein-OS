@@ -29,7 +29,7 @@ from serein.veil.models import (
 )
 from serein.veil.planner import VALID_COMPONENTS, build_veil_plan
 from serein.veil.status import build_veil_status
-from serein.veil.tor import detect_tor_status, parse_tor_config
+from serein.veil.tor import _parse_directive_line, detect_tor_status, parse_tor_config
 from serein.veil.whonix import detect_whonix_status
 from serein.veil.workspace import evaluate_kill_switch, evaluate_workspace_readiness
 
@@ -436,6 +436,234 @@ class TestTorConfig:
 
 
 # ---------------------------------------------------------------------------
+# Tor config mutation operators (+Option/append, /Option/clear) and
+# wildcard %include (S6RM, Section 2-40)
+# ---------------------------------------------------------------------------
+
+
+class TestTorConfigOperators:
+    def test_plain_option_parsed_as_set(self):
+        assert _parse_directive_line("SocksPort 9050") == ("set", "SocksPort", "9050")
+
+    def test_plus_option_parsed_as_append(self):
+        assert _parse_directive_line("+SocksPort 9150") == ("append", "SocksPort", "9150")
+
+    def test_slash_option_parsed_as_clear(self):
+        assert _parse_directive_line("/SocksPort") == ("clear", "SocksPort", None)
+
+    # --- SocksPort matrix (Section 32) ------------------------------------
+
+    def test_socksport_plain_set_is_true(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["SocksPort 9050"]))
+        assert config.socks_port_configured is True
+
+    def test_socksport_set_then_clear_is_false(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["SocksPort 9050", "/SocksPort"]))
+        assert config.socks_port_configured is False
+
+    def test_socksport_set_clear_append_is_true(self, tmp_path):
+        config = parse_tor_config(
+            _root_with_torrc(tmp_path, ["SocksPort 9050", "/SocksPort", "+SocksPort 9150"])
+        )
+        assert config.socks_port_configured is True
+
+    def test_socksport_zero_then_append_is_true(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["SocksPort 0", "+SocksPort 9050"]))
+        assert config.socks_port_configured is True
+
+    def test_socksport_clear_alone_is_false(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["/SocksPort"]))
+        assert config.socks_port_configured is False
+
+    def test_socksport_absent_is_none(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["ControlPort 9051"]))
+        assert config.socks_port_configured is None
+
+    def test_socksport_append_alone_is_true(self, tmp_path):
+        # Section 9: real Tor appends to the (non-empty) compiled-in
+        # default or to an empty set - either way the appended value
+        # itself makes the effective set non-empty, so this is a
+        # definite True, never a guessed/unsafe value.
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["+SocksPort 9050"]))
+        assert config.socks_port_configured is True
+
+    # --- ControlPort (Section 28/33) --------------------------------------
+
+    def test_controlport_set_then_clear_is_false(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["ControlPort 9051", "/ControlPort"]))
+        assert config.control_port_configured is False
+
+    def test_controlport_clear_then_append_is_true(self, tmp_path):
+        config = parse_tor_config(
+            _root_with_torrc(tmp_path, ["/ControlPort", "+ControlPort 9051"])
+        )
+        assert config.control_port_configured is True
+
+    # --- DNSPort / TransPort (Section 29/34/35) ---------------------------
+
+    def test_dnsport_set_then_clear_is_false(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["DNSPort 5353", "/DNSPort"]))
+        assert config.dns_port_configured is False
+
+    def test_transport_set_then_clear_is_false(self, tmp_path):
+        config = parse_tor_config(_root_with_torrc(tmp_path, ["TransPort 9040", "/TransPort"]))
+        assert config.trans_port_configured is False
+
+    # --- Scalar CookieAuthentication (Section 12) --------------------------
+
+    def test_cookie_authentication_clear_is_unknown_not_false(self, tmp_path):
+        # Section 12: a scalar's "clear" reverts to Tor's own compiled
+        # default, which Serein does not hardcode as a specific boolean.
+        config = parse_tor_config(
+            _root_with_torrc(tmp_path, ["CookieAuthentication 1", "/CookieAuthentication"])
+        )
+        assert config.cookie_authentication_configured is None
+
+    # --- %include wildcard support (Section 13-14/36) ----------------------
+
+    def test_include_wildcard_matches_files(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/*.conf"],
+            torrc_d={"10-socks.conf": "SocksPort 9050\n", "ignored.txt": "SocksPort 9999\n"},
+        )
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+
+    def test_include_wildcard_ignores_non_matching_files(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/*.conf"],
+            torrc_d={"10-notes.txt": "SocksPort 9999\n"},
+        )
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is None
+
+    def test_include_wildcard_question_mark(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/1?.conf"],
+            torrc_d={"10.conf": "SocksPort 9050\n", "100.conf": "SocksPort 9999\n"},
+        )
+        config = parse_tor_config(root)
+        # "1?.conf" matches "10.conf" (exactly one char after "1") but
+        # not "100.conf" (two chars) - only the matching file is read.
+        assert config.socks_port_configured is True
+
+    def test_include_wildcard_lexical_order_clear_wins(self, tmp_path):
+        # Section 37: 10-first.conf sets SocksPort, 20-clear.conf clears
+        # it - lexical order means the clear applies last -> False.
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/*.conf"],
+            torrc_d={"10-first.conf": "SocksPort 9050\n", "20-clear.conf": "/SocksPort\n"},
+        )
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is False
+
+    def test_include_wildcard_lexical_order_enable_wins(self, tmp_path):
+        # Reversed filenames so the clear applies first, then the
+        # append re-enables it -> True. Directly proves lexical, not
+        # arbitrary, ordering.
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/*.conf"],
+            torrc_d={"10-clear.conf": "/SocksPort\n", "20-enable.conf": "+SocksPort 9050\n"},
+        )
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+
+    def test_include_wildcard_position_preserved(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path,
+            ["SocksPort 9050", "%include /etc/tor/torrc.d/*.conf", "/SocksPort"],
+            torrc_d={"10-noop.conf": "ControlPort 9051\n"},
+        )
+        config = parse_tor_config(root)
+        # The post-include "/SocksPort" line must still apply after the
+        # included content, proving the include is spliced at its exact
+        # position, not appended at the end.
+        assert config.socks_port_configured is False
+        assert config.control_port_configured is True
+
+    def test_include_wildcard_stays_under_injected_root(self, tmp_path):
+        # Section 15/36: an absolute-looking wildcard path is re-rooted
+        # under the injected root, never the real host /etc/tor/torrc.d.
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/*.conf"],
+            torrc_d={"10-socks.conf": "SocksPort 9050\n"},
+        )
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+        # A sibling directory outside `root` with a matching filename
+        # must never be read even if it happens to exist.
+        outside = tmp_path / "etc" / "tor" / "torrc.d"
+        outside.mkdir(parents=True, exist_ok=True)
+        (outside / "10-socks.conf").write_text("SocksPort 7777\n", encoding="utf-8")
+        config_again = parse_tor_config(root)
+        assert config_again.socks_port_configured is True  # unaffected by the sibling
+
+    def test_root_escape_via_relative_traversal_is_blocked(self, tmp_path):
+        # Section 16/38: a sentinel secret placed OUTSIDE root must
+        # never be read via ../ traversal in a %include argument.
+        sentinel_dir = tmp_path / "outside-root-secret"
+        sentinel_dir.mkdir(parents=True, exist_ok=True)
+        (sentinel_dir / "passwd").write_text("root:SUPERSECRETVALUE:0:0\n", encoding="utf-8")
+        root = _root_with_torrc(
+            tmp_path, ["%include ../../../../../../outside-root-secret/passwd"]
+        )
+        config = parse_tor_config(root)
+        dumped = json.dumps(asdict(config))
+        assert "SUPERSECRETVALUE" not in dumped
+        assert "root:" not in dumped
+
+    def test_root_escape_via_absolute_traversal_is_blocked(self, tmp_path):
+        sentinel_dir = tmp_path / "outside-root-secret"
+        sentinel_dir.mkdir(parents=True, exist_ok=True)
+        (sentinel_dir / "passwd").write_text("root:SUPERSECRETVALUE2:0:0\n", encoding="utf-8")
+        root = _root_with_torrc(
+            tmp_path, ["%include /../../../../../../outside-root-secret/passwd"]
+        )
+        config = parse_tor_config(root)
+        dumped = json.dumps(asdict(config))
+        assert "SUPERSECRETVALUE2" not in dumped
+
+    def test_root_escape_via_wildcard_traversal_is_blocked(self, tmp_path):
+        sentinel_dir = tmp_path / "outside-root-secret"
+        sentinel_dir.mkdir(parents=True, exist_ok=True)
+        (sentinel_dir / "passwd.conf").write_text(
+            "SocksPort 9050\n# SUPERSECRETVALUE3\n", encoding="utf-8"
+        )
+        root = _root_with_torrc(
+            tmp_path, ["%include ../../../../../../outside-root-secret/*.conf"]
+        )
+        config = parse_tor_config(root)
+        dumped = json.dumps(asdict(config))
+        assert "SUPERSECRETVALUE3" not in dumped
+        # Since the traversal is blocked, the include contributes
+        # nothing - SocksPort must stay unmentioned, never guessed True.
+        assert config.socks_port_configured is None
+
+    def test_include_cycle_with_glob_does_not_recurse_forever(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/*.conf"],
+            torrc_d={"10-self.conf": "%include /etc/tor/torrc\nSocksPort 9050\n"},
+        )
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+
+    def test_wildcard_never_leaks_secrets(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d/*.conf"],
+            torrc_d={
+                "10-bridge.conf": "Bridge obfs4 198.51.100.7:443 CAFEBABE99887766\n",
+                "20-cookie.conf": "HashedControlPassword 16:FEEDFACE00112233\n",
+            },
+        )
+        config = parse_tor_config(root)
+        assert config.bridge_lines_present is True
+        dumped = json.dumps(asdict(config))
+        assert "198.51.100.7" not in dumped
+        assert "CAFEBABE99887766" not in dumped
+        assert "FEEDFACE00112233" not in dumped
+
+
+# ---------------------------------------------------------------------------
 # Tor usability evidence (S6R Corrective C, Section 19-27, 53)
 # ---------------------------------------------------------------------------
 
@@ -499,6 +727,31 @@ class TestTorUsability:
         runner = _runtime_active_runner()
         status = detect_tor_status(runner=runner, root=root)
         assert status.usable is None
+
+    def test_explicit_clear_overrides_stale_listener_evidence(self, tmp_path):
+        # S6RM Section 26/40 - the security-relevant regression: runtime
+        # active + a real listener on 9050 + torrc that explicitly
+        # clears SocksPort must NOT report usable=True. Explicit
+        # config disablement takes precedence over listener evidence.
+        root = _add_listener(
+            _root_with_torrc(tmp_path, ["SocksPort 9050", "/SocksPort"]), 9050
+        )
+        runner = _runtime_active_runner()
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.config.socks_port_configured is False
+        assert status.socks_listener_detected is True
+        assert status.usable is False
+
+    def test_clear_then_reenable_with_listener_is_usable(self, tmp_path):
+        # Section 27: a clear followed by a genuine re-enable, backed by
+        # real runtime+listener evidence, is legitimately usable=True.
+        root = _add_listener(
+            _root_with_torrc(tmp_path, ["SocksPort 9050", "/SocksPort", "+SocksPort 9050"]), 9050
+        )
+        runner = _runtime_active_runner()
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.config.socks_port_configured is True
+        assert status.usable is True
 
 
 # ---------------------------------------------------------------------------
