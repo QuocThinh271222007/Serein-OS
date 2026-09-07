@@ -29,3 +29,8 @@ Thumbs.db
 *.log
 /data/
 *.iso
+
+# Distribution (S7.0) build intermediates and downloaded base images -
+# never committed; see docs/distribution/architecture.md.
+/cache/
+/build/

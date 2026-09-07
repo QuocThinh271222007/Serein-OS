@@ -1,0 +1,63 @@
+name: ISO Smoke (real build + boot validation)
+
+# Layer B (Section 50-51 of the S7.0 distribution contract): the real,
+# multi-GB download / build / boot validation path. Deliberately NEVER
+# runs on every push/PR (that stays in ci.yml as Layer A, fixture-only)
+# - only on an explicit manual trigger, so no PR is ever forced to pay
+# for a ~6 GB Ubuntu download.
+#
+# Uploads the built ISO as a private, internal Actions artifact with
+# modest retention (Section 100) - never a GitHub Release, never a
+# public download link (Section 101).
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  iso-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (editable, with dev dependencies)
+        run: python -m pip install -e ".[dev]"
+
+      # Ephemeral GitHub-hosted-runner setup only - never target-host
+      # mutation (Section 21 distinguishes the two explicitly).
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso jq qemu-system-x86 ovmf
+
+      - name: Fetch pinned base image (explicit, this job only)
+        run: ./distribution/scripts/fetch-base-image.sh
+
+      - name: Verify base image (fail-closed)
+        run: ./distribution/scripts/verify-base-image.sh
+
+      - name: Build Serein Alpha ISO
+        run: ./distribution/scripts/build-iso.sh
+
+      - name: Inspect built ISO
+        run: |
+          ISO_PATH="$(ls dist/serein-*.iso | head -1)"
+          ./distribution/scripts/inspect-iso.sh "${ISO_PATH}"
+
+      - name: QEMU boot smoke (no target disk, bounded timeout)
+        run: |
+          ISO_PATH="$(ls dist/serein-*.iso | head -1)"
+          OVMF_CODE="$(find /usr/share/OVMF -iname 'OVMF_CODE*.fd' | head -1)"
+          ./distribution/scripts/boot-smoke.sh "${ISO_PATH}" --ovmf-code "${OVMF_CODE}"
+
+      - name: Upload build manifest + sha256 (never the multi-GB ISO itself)
+        uses: actions/upload-artifact@v4
+        with:
+          name: serein-alpha-build-evidence
+          path: |
+            dist/*.manifest.json
+            dist/*.sha256
+          retention-days: 14
