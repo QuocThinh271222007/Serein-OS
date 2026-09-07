@@ -70,9 +70,12 @@ def _empty_root(tmp_path: Path, name: str = "root") -> Path:
 
 
 def _root_with_torrc(
-    tmp_path: Path, lines: list[str], torrc_d: dict[str, str] | None = None
+    tmp_path: Path,
+    lines: list[str],
+    torrc_d: dict[str, str] | None = None,
+    root: Path | None = None,
 ) -> Path:
-    root = _empty_root(tmp_path, "root")
+    root = root if root is not None else _empty_root(tmp_path, "root")
     tor_dir = root / "etc" / "tor"
     tor_dir.mkdir(parents=True, exist_ok=True)
     (tor_dir / "torrc").write_text("\n".join(lines), encoding="utf-8")
@@ -84,8 +87,7 @@ def _root_with_torrc(
     return root
 
 
-def _root_with_listener(tmp_path: Path, port: int, state: str = "0A") -> Path:
-    root = _empty_root(tmp_path, "root")
+def _add_listener(root: Path, port: int, state: str = "0A") -> Path:
     net_dir = root / "proc" / "net"
     net_dir.mkdir(parents=True, exist_ok=True)
     header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
@@ -99,14 +101,34 @@ def _root_with_listener(tmp_path: Path, port: int, state: str = "0A") -> Path:
     return root
 
 
-def _root_with_empty_proc_net(tmp_path: Path) -> Path:
-    root = _empty_root(tmp_path, "root")
+def _root_with_listener(tmp_path: Path, port: int, state: str = "0A") -> Path:
+    return _add_listener(_empty_root(tmp_path, "root"), port, state)
+
+
+def _add_empty_proc_net(root: Path) -> Path:
     net_dir = root / "proc" / "net"
     net_dir.mkdir(parents=True, exist_ok=True)
     header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
     (net_dir / "tcp").write_text(header + "\n", encoding="utf-8")
     (net_dir / "tcp6").write_text(header + "\n", encoding="utf-8")
     return root
+
+
+def _root_with_empty_proc_net(tmp_path: Path) -> Path:
+    return _add_empty_proc_net(_empty_root(tmp_path, "root"))
+
+
+#: Standard FakeCommandRunner responses for "tor@default.service active"
+#: - the real Tor daemon runtime evidence (S6R Corrective A).
+def _runtime_active_runner(extra: dict | None = None) -> FakeCommandRunner:
+    responses = {
+        "tor": _ok("Tor version 0.4.9.11."),
+        ("systemctl", "is-enabled", "tor@default.service"): _ok("enabled"),
+        ("systemctl", "is-active", "tor@default.service"): _ok("active"),
+    }
+    if extra:
+        responses.update(extra)
+    return FakeCommandRunner(responses)
 
 
 def _kvm_ready_root(tmp_path: Path, module_loaded: bool = True) -> Path:
@@ -156,77 +178,83 @@ class TestTor:
         assert status.usable is False
         assert status.confidence == "high"
 
-    def test_tor_binary_present_service_unknown(self, tmp_path):
-        # systemctl entirely unavailable (e.g. some WSL configurations)
-        # - service state must be None, never guessed False.
+    def test_master_active_alone_is_not_runtime_active(self, tmp_path):
+        # S6R Corrective A: tor.service active, tor@default.service
+        # absent - must never satisfy runtime-active evidence.
         root = _empty_root(tmp_path)
-        runner = FakeCommandRunner({"tor": _ok("Tor version 0.4.9.11.")})
+        runner = FakeCommandRunner({
+            "tor": _ok("Tor version 0.4.9.11."),
+            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor.service"): _ok("active"),
+            ("systemctl", "is-enabled", "tor@default.service"): _fail(
+                4, "Unit tor@default.service not-found."
+            ),
+        })
         status = detect_tor_status(runner=runner, root=root)
-        assert status.package_installed is True
-        assert status.service_present is None
-        assert status.usable is None
-        assert status.confidence == "low"
+        assert status.service.master_unit_active is True
+        assert status.service.runtime_unit_active is not True
+        assert status.service.service_active is not True
+        assert status.usable is False
 
-    def test_service_inactive(self, tmp_path):
+    def test_master_active_runtime_inactive(self, tmp_path):
+        root = _empty_root(tmp_path)
+        runner = FakeCommandRunner({
+            "tor": _ok("Tor version 0.4.9.11."),
+            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor.service"): _ok("active"),
+            ("systemctl", "is-enabled", "tor@default.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor@default.service"): CommandResult(3, "inactive", ""),
+        })
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.service.master_unit_active is True
+        assert status.service.runtime_unit_active is False
+        assert status.usable is False
+
+    def test_master_inactive_runtime_active(self, tmp_path):
         root = _empty_root(tmp_path)
         runner = FakeCommandRunner({
             "tor": _ok("Tor version 0.4.9.11."),
             ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
             ("systemctl", "is-active", "tor.service"): CommandResult(3, "inactive", ""),
+            ("systemctl", "is-enabled", "tor@default.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor@default.service"): _ok("active"),
         })
         status = detect_tor_status(runner=runner, root=root)
-        assert status.service_present is True
-        assert status.service_active is False
-        assert status.usable is False
-        assert status.confidence == "high"
+        assert status.service.master_unit_active is False
+        assert status.service.runtime_unit_active is True
+        assert status.service.service_active is True
 
-    def test_service_active_without_socks_evidence_is_unknown(self, tmp_path):
+    def test_runtime_active_implies_service_active_true(self, tmp_path):
         root = _root_with_empty_proc_net(tmp_path)
-        runner = FakeCommandRunner({
-            "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
-            ("systemctl", "is-active", "tor.service"): _ok("active"),
-        })
+        runner = _runtime_active_runner()
         status = detect_tor_status(runner=runner, root=root)
-        assert status.service_active is True
-        assert status.config.socks_port_configured is None
-        assert status.socks_listener_detected is False
+        assert status.service.service_active is True
+
+    def test_systemctl_unavailable_is_unknown_not_false(self, tmp_path):
+        # No systemd at all (e.g. some WSL configurations) - runtime
+        # state must be None, never guessed False.
+        root = _empty_root(tmp_path)
+        runner = FakeCommandRunner({"tor": _ok("Tor version 0.4.9.11.")})
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.package_installed is True
+        assert status.service.master_unit_present is None
+        assert status.service.runtime_unit_present is None
+        assert status.service.runtime_unit_active is None
         assert status.usable is None
         assert status.confidence == "low"
 
-    def test_socks_explicitly_configured_is_usable(self, tmp_path):
-        root = _root_with_torrc(tmp_path, ["SocksPort 9050"])
+    def test_runtime_unit_absent_confirmed_is_false_not_none(self, tmp_path):
+        root = _empty_root(tmp_path)
         runner = FakeCommandRunner({
             "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
-            ("systemctl", "is-active", "tor.service"): _ok("active"),
+            ("systemctl", "is-enabled", "tor.service"): _fail(4, "Unit tor.service not-found."),
+            ("systemctl", "is-enabled", "tor@default.service"): _fail(
+                4, "Unit tor@default.service not-found."
+            ),
         })
         status = detect_tor_status(runner=runner, root=root)
-        assert status.config.socks_port_configured is True
-        assert status.usable is True
-        assert status.confidence == "medium"
-
-    def test_socks_explicitly_disabled_is_not_usable(self, tmp_path):
-        root = _root_with_torrc(tmp_path, ["SocksPort 0"])
-        runner = FakeCommandRunner({
-            "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
-            ("systemctl", "is-active", "tor.service"): _ok("active"),
-        })
-        status = detect_tor_status(runner=runner, root=root)
-        assert status.config.socks_port_configured is False
+        assert status.service.runtime_unit_present is False
         assert status.usable is False
-
-    def test_local_socks_listener_is_positive_evidence(self, tmp_path):
-        root = _root_with_listener(tmp_path, 9050)
-        runner = FakeCommandRunner({
-            "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
-            ("systemctl", "is-active", "tor.service"): _ok("active"),
-        })
-        status = detect_tor_status(runner=runner, root=root)
-        assert status.socks_listener_detected is True
-        assert status.usable is True
 
     def test_control_port_absent_is_unknown(self, tmp_path):
         root = _root_with_torrc(tmp_path, ["SocksPort 9050"])
@@ -243,48 +271,22 @@ class TestTor:
         config = parse_tor_config(root)
         assert config.control_port_configured is False
 
-    def test_tor_alternate_unit_name_is_found(self, tmp_path):
-        root = _empty_root(tmp_path)
-        runner = FakeCommandRunner({
-            "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _fail(4, "Unit tor.service not-found."),
-            ("systemctl", "is-enabled", "tor@default.service"): _ok("enabled"),
-            ("systemctl", "is-active", "tor@default.service"): _ok("active"),
-        })
-        status = detect_tor_status(runner=runner, root=root)
-        assert status.service_present is True
-        assert status.service_unit == "tor@default.service"
-
-    def test_systemctl_available_but_no_unit_found_is_definite_absent(self, tmp_path):
-        root = _empty_root(tmp_path)
-        runner = FakeCommandRunner({
-            "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _fail(4, "Unit tor.service not-found."),
-            ("systemctl", "is-enabled", "tor@default.service"): _fail(
-                4, "Unit tor@default.service not-found."
-            ),
-        })
-        status = detect_tor_status(runner=runner, root=root)
-        assert status.service_present is False
-        assert status.usable is False
-
     def test_never_performs_a_real_socks_handshake_or_external_connection(self, tmp_path):
-        root = _root_with_listener(tmp_path, 9050)
-        runner = FakeCommandRunner({
-            "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
-            ("systemctl", "is-active", "tor.service"): _ok("active"),
-        })
+        root = _add_listener(_root_with_torrc(tmp_path, ["SocksPort 9050"]), 9050)
+        runner = _runtime_active_runner()
         detect_tor_status(runner=runner, root=root)
         for call in runner.calls:
             joined = " ".join(call).lower()
             assert "check.torproject.org" not in joined
             assert "curl" not in joined
             assert ".onion" not in joined
+            assert "systemctl start" not in joined
+            assert "systemctl enable" not in joined
+            assert "systemctl restart" not in joined
 
 
 # ---------------------------------------------------------------------------
-# Tor config parsing / secret safety (Section 39-41, 92, 95)
+# Tor config parsing / secret safety (Section 8-18, 39-41, 92, 95)
 # ---------------------------------------------------------------------------
 
 
@@ -295,24 +297,106 @@ class TestTorConfig:
         assert config.config_present is False
         assert config.socks_port_configured is None
 
-    def test_torrc_d_directory_is_parsed(self, tmp_path):
+    def test_torrc_d_not_included_by_default(self, tmp_path):
+        # S6R Corrective B, Section 9/18: torrc.d files exist but the
+        # main torrc has no %include - must NOT affect effective config.
         root = _root_with_torrc(
-            tmp_path, [], torrc_d={"50-socks.conf": "SocksPort 9050\n"}
+            tmp_path, ["SocksPort 9050"], torrc_d={"50-extra.conf": "ControlPort 9051\n"}
+        )
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+        assert config.control_port_configured is None
+
+    def test_include_directive_pulls_in_torrc_d_at_position(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path,
+            ["ControlPort 9051", "%include /etc/tor/torrc.d", "DataDirectory /var/lib/tor"],
+            torrc_d={"50-socks.conf": "SocksPort 9050\n"},
         )
         config = parse_tor_config(root)
         assert config.config_present is True
         assert config.socks_port_configured is True
+        assert config.control_port_configured is True
+        assert config.data_directory_configured is True
 
-    def test_trans_port_and_dns_port_presence_only(self, tmp_path):
-        root = _root_with_torrc(tmp_path, ["TransPort 9040", "DNSPort 5353"])
+    def test_include_single_file(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["%include /etc/tor/torrc.d/50-socks.conf"])
+        d = root / "etc" / "tor" / "torrc.d"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "50-socks.conf").write_text("SocksPort 9050\n", encoding="utf-8")
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+
+    def test_include_cycle_is_guarded(self, tmp_path):
+        # A torrc that (directly or indirectly) includes itself must
+        # never infinite-loop - the cycle guard breaks it silently.
+        root = _root_with_torrc(tmp_path, ["%include /etc/tor/torrc", "SocksPort 9050"])
+        config = parse_tor_config(root)
+        assert config.config_present is True
+
+    def test_multiple_socksport_any_enabled_wins(self, tmp_path):
+        # Section 13/18: an earlier disabled entry must never suppress
+        # a later, genuinely-enabled entry.
+        root = _root_with_torrc(tmp_path, ["SocksPort 0", "SocksPort 9050"])
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+
+    def test_socksport_all_disabled_is_false(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["SocksPort 0"])
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is False
+
+    def test_socksport_absent_is_none(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["ControlPort 9051"])
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is None
+
+    def test_multiple_enabled_socksport_is_true(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["SocksPort 9050", "SocksPort 9150"])
+        config = parse_tor_config(root)
+        assert config.socks_port_configured is True
+
+    def test_control_port_zero_is_false(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["ControlPort 0"])
+        config = parse_tor_config(root)
+        assert config.control_port_configured is False
+
+    def test_dns_port_zero_is_false(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["DNSPort 0"])
+        config = parse_tor_config(root)
+        assert config.dns_port_configured is False
+
+    def test_dns_port_enabled_is_true(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["DNSPort 5353"])
+        config = parse_tor_config(root)
+        assert config.dns_port_configured is True
+
+    def test_trans_port_zero_is_false(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["TransPort 0"])
+        config = parse_tor_config(root)
+        assert config.trans_port_configured is False
+
+    def test_trans_port_enabled_is_true(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["TransPort 9040"])
         config = parse_tor_config(root)
         assert config.trans_port_configured is True
-        assert config.dns_port_configured is True
+
+    def test_trans_port_and_dns_port_absent_is_none(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["SocksPort 9050"])
+        config = parse_tor_config(root)
+        assert config.trans_port_configured is None
+        assert config.dns_port_configured is None
 
     def test_data_directory_presence_only(self, tmp_path):
         root = _root_with_torrc(tmp_path, ["DataDirectory /var/lib/tor"])
         config = parse_tor_config(root)
         assert config.data_directory_configured is True
+
+    def test_cookie_authentication_last_occurrence_wins(self, tmp_path):
+        # Scalar/override directive - last occurrence wins (Section 15).
+        root = _root_with_torrc(tmp_path, ["CookieAuthentication 1", "CookieAuthentication 0"])
+        config = parse_tor_config(root)
+        assert config.cookie_authentication_configured is False
 
     def test_cookie_authentication_tri_state(self, tmp_path):
         enabled = parse_tor_config(_root_with_torrc(tmp_path / "a", ["CookieAuthentication 1"]))
@@ -334,10 +418,87 @@ class TestTorConfig:
         assert "AAAABBBBCCCCDDDDEEEEFFFF0011223344" not in dumped
         assert "SUPERSECRET" not in dumped
 
+    def test_include_never_leaks_secrets_either(self, tmp_path):
+        root = _root_with_torrc(
+            tmp_path, ["%include /etc/tor/torrc.d"],
+            torrc_d={"50-bridge.conf": "Bridge obfs4 198.51.100.9:443 DEADBEEF1234\n"},
+        )
+        config = parse_tor_config(root)
+        assert config.bridge_lines_present is True
+        dumped = json.dumps(asdict(config))
+        assert "198.51.100.9" not in dumped
+        assert "DEADBEEF1234" not in dumped
+
     def test_comments_are_ignored(self, tmp_path):
         root = _root_with_torrc(tmp_path, ["# SocksPort 9050", "  # a comment", ""])
         config = parse_tor_config(root)
         assert config.socks_port_configured is None
+
+
+# ---------------------------------------------------------------------------
+# Tor usability evidence (S6R Corrective C, Section 19-27, 53)
+# ---------------------------------------------------------------------------
+
+
+class TestTorUsability:
+    def test_configured_endpoint_alone_without_listener_is_unknown(self, tmp_path):
+        root = _add_empty_proc_net(_root_with_torrc(tmp_path, ["SocksPort 9050"]))
+        runner = _runtime_active_runner()
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.config.socks_port_configured is True
+        assert status.socks_listener_detected is False
+        assert status.usable is None
+
+    def test_matching_listener_is_usable_true(self, tmp_path):
+        root = _add_listener(_root_with_torrc(tmp_path, ["SocksPort 9050"]), 9050)
+        runner = _runtime_active_runner()
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.socks_listener_detected is True
+        assert status.usable is True
+        assert status.confidence == "medium"
+
+    def test_runtime_active_no_directive_listener_present_is_usable(self, tmp_path):
+        root = _add_listener(_empty_root(tmp_path), 9050)
+        runner = _runtime_active_runner()
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.config.socks_port_configured is None
+        assert status.socks_listener_detected is True
+        assert status.usable is True
+
+    def test_explicit_socks_disablement_is_false_even_with_runtime_active(self, tmp_path):
+        root = _root_with_torrc(tmp_path, ["SocksPort 0"])
+        runner = _runtime_active_runner()
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.usable is False
+        assert status.confidence == "high"
+
+    def test_runtime_inactive_with_listener_marker_is_false(self, tmp_path):
+        root = _add_listener(_empty_root(tmp_path), 9050)
+        runner = FakeCommandRunner({
+            "tor": _ok("Tor version 0.4.9.11."),
+            ("systemctl", "is-enabled", "tor@default.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor@default.service"): CommandResult(3, "inactive", ""),
+        })
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.socks_listener_detected is True
+        assert status.service.runtime_unit_active is False
+        assert status.usable is False
+
+    def test_runtime_unknown_is_unknown(self, tmp_path):
+        root = _add_listener(_empty_root(tmp_path), 9050)
+        runner = FakeCommandRunner({"tor": _ok("Tor version 0.4.9.11.")})
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.service.runtime_unit_present is None
+        assert status.usable is None
+
+    def test_custom_socks_port_without_listener_match_stays_unknown(self, tmp_path):
+        # Section 22-23: a non-default SocksPort (e.g. 9150) is not
+        # detected by the fixed-port-9050 listener check - must never
+        # be promoted to usable=True from configuration alone.
+        root = _add_empty_proc_net(_root_with_torrc(tmp_path, ["SocksPort 9150"]))
+        runner = _runtime_active_runner()
+        status = detect_tor_status(runner=runner, root=root)
+        assert status.usable is None
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +701,44 @@ class TestWhonix:
         assert whonix.usable is not True
         assert whonix.network_topology_configured is False
 
+    def test_filename_presence_is_never_trusted_as_verified(self, tmp_path, monkeypatch):
+        # S6R Corrective D, Section 37: a matching filename must never
+        # be treated as a verified artifact.
+        root = _kvm_ready_root(tmp_path)
+        home = _home_with_images(tmp_path, gateway=True, workstation=True)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        whonix = detect_whonix_status(runner=_ready_vm_runner(), root=root, home=home)
+        assert whonix.gateway_image_present is True
+        assert whonix.gateway_image_verified is None
+        assert whonix.workstation_image_present is True
+        assert whonix.workstation_image_verified is None
+        assert whonix.lifecycle_stage == "present_unverified"
+
+    def test_domain_definition_state_stays_unknown(self, tmp_path, monkeypatch):
+        # Section 33: Serein never maps a libvirt domain name to a
+        # specific verified artifact - always None, conservative.
+        root = _kvm_ready_root(tmp_path)
+        home = _home_with_images(tmp_path, gateway=True, workstation=True)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        whonix = detect_whonix_status(runner=_ready_vm_runner(), root=root, home=home)
+        assert whonix.gateway_domain_defined is None
+        assert whonix.workstation_domain_defined is None
+
+    def test_lifecycle_stage_absent_when_no_images(self, tmp_path):
+        root = _empty_root(tmp_path)
+        home = _empty_home(tmp_path)
+        whonix = detect_whonix_status(runner=FakeCommandRunner({}), root=root, home=home)
+        assert whonix.lifecycle_stage == "absent"
+
+    def test_lifecycle_stage_is_weaker_of_the_two_artifacts(self, tmp_path, monkeypatch):
+        root = _kvm_ready_root(tmp_path)
+        home = _home_with_images(tmp_path, gateway=True, workstation=False)
+        monkeypatch.setattr("os.access", lambda *a, **kw: True)
+        whonix = detect_whonix_status(runner=_ready_vm_runner(), root=root, home=home)
+        # Gateway is present_unverified, Workstation is absent - the
+        # joint stage must be the weaker ("absent"), not the stronger.
+        assert whonix.lifecycle_stage == "absent"
+
     def test_never_scans_home_directory_wide(self, tmp_path, monkeypatch):
         # Section 29: only the two exact expected filenames are ever
         # checked - a differently-named file must never be detected.
@@ -684,8 +883,10 @@ class TestPlanner:
         )
         actions = self._actions_by_id(plan)
         assert actions["whonix.vm_prerequisites"].status == "BLOCKED"
-        assert actions["whonix.gateway"].status == "BLOCKED"
-        assert actions["whonix.workstation"].status == "BLOCKED"
+        assert actions["whonix.gateway_artifact"].status == "BLOCKED"
+        assert actions["whonix.gateway_verification"].status == "BLOCKED"
+        assert actions["whonix.workstation_artifact"].status == "BLOCKED"
+        assert actions["whonix.workstation_verification"].status == "BLOCKED"
         assert actions["whonix.network_topology"].status == "BLOCKED"
 
     def test_whonix_vm_ready_images_absent_is_apply(self, tmp_path, monkeypatch):
@@ -697,19 +898,29 @@ class TestPlanner:
         )
         actions = self._actions_by_id(plan)
         assert actions["whonix.vm_prerequisites"].status == "NOOP"
-        assert actions["whonix.gateway"].status == "APPLY"
-        assert actions["whonix.workstation"].status == "APPLY"
+        assert actions["whonix.gateway_artifact"].status == "APPLY"
+        assert actions["whonix.workstation_artifact"].status == "APPLY"
+        # Nothing is present yet, so verification has nothing to do -
+        # BLOCKED, never APPLY/NOOP (S6R Corrective D, Section 35-36).
+        assert actions["whonix.gateway_verification"].status == "BLOCKED"
+        assert actions["whonix.workstation_verification"].status == "BLOCKED"
         assert actions["whonix.network_topology"].status == "BLOCKED"
 
-    def test_whonix_images_present_topology_unmanaged_is_apply(self, tmp_path, monkeypatch):
+    def test_whonix_images_present_topology_stays_blocked_unverified(self, tmp_path, monkeypatch):
+        # S6R Corrective D (defect #4): images present alone must NOT
+        # advance the artifact actions to NOOP-then-topology-APPLY -
+        # verification/import are never performed, so topology stays
+        # BLOCKED even with both images present.
         root = _kvm_ready_root(tmp_path)
         home = _home_with_images(tmp_path, gateway=True, workstation=True)
         monkeypatch.setattr("os.access", lambda *a, **kw: True)
         plan = build_veil_plan("whonix", root=root, runner=_ready_vm_runner(), home=home)
         actions = self._actions_by_id(plan)
-        assert actions["whonix.gateway"].status == "NOOP"
-        assert actions["whonix.workstation"].status == "NOOP"
-        assert actions["whonix.network_topology"].status == "APPLY"
+        assert actions["whonix.gateway_artifact"].status == "NOOP"
+        assert actions["whonix.workstation_artifact"].status == "NOOP"
+        assert actions["whonix.gateway_verification"].status == "BLOCKED"
+        assert actions["whonix.workstation_verification"].status == "BLOCKED"
+        assert actions["whonix.network_topology"].status == "BLOCKED"
 
     def test_workspace_component_filter(self, tmp_path):
         plan = build_veil_plan(
@@ -791,12 +1002,26 @@ class TestDoctor:
         root = _root_with_torrc(tmp_path, ["SocksPort 9050"])
         runner = FakeCommandRunner({
             "tor": _ok("Tor version 0.4.9.11."),
-            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
-            ("systemctl", "is-active", "tor.service"): CommandResult(3, "inactive", ""),
+            ("systemctl", "is-enabled", "tor@default.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor@default.service"): CommandResult(3, "inactive", ""),
         })
         report = run_veil_checks(root=root, runner=runner, home=_empty_home(tmp_path))
         by_id = self._by_id(report)
         assert by_id["veil_tor_socks_configured_service_inactive"].status == CheckStatus.WARN
+
+    def test_master_active_runtime_inactive_warns(self, tmp_path):
+        runner = FakeCommandRunner({
+            "tor": _ok("Tor version 0.4.9.11."),
+            ("systemctl", "is-enabled", "tor.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor.service"): _ok("active"),
+            ("systemctl", "is-enabled", "tor@default.service"): _ok("enabled"),
+            ("systemctl", "is-active", "tor@default.service"): CommandResult(3, "inactive", ""),
+        })
+        report = run_veil_checks(
+            root=_empty_root(tmp_path), runner=runner, home=_empty_home(tmp_path)
+        )
+        by_id = self._by_id(report)
+        assert by_id["veil_tor_package_service_mismatch"].status == CheckStatus.WARN
 
     def test_tor_only_claim_check_currently_always_passes(self, tmp_path):
         report = run_veil_checks(
@@ -907,6 +1132,14 @@ class TestInvariants:
         assert by_id["tor_browser"].mechanism is not None
         assert "firefox" not in by_id["tor_browser"].mechanism.lower()
 
+    def test_tor_browser_launcher_never_claims_to_be_official_release(self, tmp_path):
+        # S6R Corrective E, Section 42: the launcher package itself must
+        # never be described as *being* an official Tor Project release.
+        report = build_veil_capabilities(root=_empty_root(tmp_path), home=_empty_home(tmp_path))
+        by_id = {c.id: c for c in report.capabilities}
+        mechanism = by_id["tor_browser"].mechanism.lower()
+        assert "official tor project release" not in mechanism
+
     def test_privacy_levels_are_mechanism_names_not_marketing_confidence(self):
         for level in PRIVACY_LEVELS:
             assert "anonymity" not in level
@@ -981,7 +1214,8 @@ class TestNoExternalNetworkOrLeaks:
 
         forbidden_argv_markers = (
             "apt-get install", "apt install", "apt-get remove", "apt-get purge",
-            "systemctl start", "systemctl enable", "virsh define", "virsh create",
+            "systemctl start", "systemctl enable", "systemctl restart",
+            "virsh define", "virsh create",
             "wget", "curl", "iptables", "nft ", "ufw ", "netns add", "podman run",
             "docker run", "distrobox create",
         )

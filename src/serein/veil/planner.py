@@ -180,10 +180,13 @@ def _whonix_vm_prerequisites_action(readiness: VMReadiness) -> VeilPlanAction:
     )
 
 
-def _whonix_image_action(
+def _whonix_artifact_action(
     image_id: str, present: bool, readiness_status: str, readiness_reason: str
 ) -> VeilPlanAction:
-    action_id, component, action = f"whonix.{image_id}", "whonix", "import_vm_image"
+    """Artifact *presence* only (S6R Corrective D, Section 35) - a
+    separate, distinctly-named action from verification below, so an
+    ``APPLY``/``NOOP`` here never reads as "Whonix is ready"."""
+    action_id, component, action = f"whonix.{image_id}_artifact", "whonix", "detect_vm_image"
     tool = f"Whonix-{image_id.capitalize()}.qcow2"
     if readiness_status in _VM_BLOCKED_STATUSES or readiness_status != "ready":
         return VeilPlanAction(
@@ -196,9 +199,8 @@ def _whonix_image_action(
         return VeilPlanAction(
             action_id, component, action, tool, "user-managed",
             "present", "present",
-            f"{tool} is present at the expected location. Serein has not "
-            "verified its signature/hash and never imports it "
-            "automatically (Section 30-31).",
+            f"{tool} is present at the expected location. Presence alone "
+            f"is never verification - see whonix.{image_id}_verification.",
             False, True, "none", "n/a", "NOOP",
         )
     return VeilPlanAction(
@@ -206,33 +208,105 @@ def _whonix_image_action(
         "not present", tool,
         f"{tool} is not present. Serein never downloads a Whonix image "
         "(Section 30) - future provisioning would require the official "
-        "source and signature/hash verification documented in "
-        "docs/veil/whonix.md.",
+        "source documented in docs/veil/whonix.md.",
         True, True, "medium", "n/a", "APPLY",
     )
 
 
-def _whonix_network_topology_action(
-    gateway_present: bool, workstation_present: bool, readiness_status: str, readiness_reason: str
+def _whonix_verification_action(
+    image_id: str, present: bool, verified: bool | None
 ) -> VeilPlanAction:
-    action_id, component, action = "whonix.network_topology", "whonix", "configure_vm_network"
-    tool = "internal-only Whonix-Workstation adapter (never direct clearnet egress)"
-    if readiness_status != "ready" or not (gateway_present and workstation_present):
+    """Signature/hash verification is a distinct, later step Serein
+    never performs itself (S6R Corrective D, Section 32/36) - this
+    action is BLOCKED, not APPLY/NOOP, whenever the artifact is absent
+    or unverified, so a plan reader is never told verification is
+    "done" or "actionable by Serein" when it is neither."""
+    action_id, component, action = f"whonix.{image_id}_verification", "whonix", "verify_vm_image"
+    tool = f"Whonix-{image_id.capitalize()}.qcow2 signature/hash verification"
+    if not present:
         return VeilPlanAction(
             action_id, component, action, tool, "user-managed",
             "blocked", None,
-            "VM backend/images are not fully ready yet: " + readiness_reason,
+            f"{image_id.capitalize()} image is not present yet - nothing "
+            "to verify.",
+            False, True, "none", "n/a", "BLOCKED",
+        )
+    if verified:
+        return VeilPlanAction(
+            action_id, component, action, tool, "user-managed",
+            "verified", "verified", "Verification already confirmed.",
+            False, True, "none", "n/a", "NOOP",
+        )
+    return VeilPlanAction(
+        action_id, component, action, tool, "user-managed",
+        "unverified", None,
+        "Serein never performs OpenPGP/signify/hash verification "
+        "automatically (Section 31-32) - this requires explicit user-"
+        "managed verification against official Whonix signature/hash "
+        "metadata (docs/veil/whonix.md) before the image can be trusted. "
+        "A matching filename is never treated as verified (Section 37).",
+        False, True, "none", "n/a", "BLOCKED",
+    )
+
+
+def _whonix_network_topology_action(
+    gateway_present: bool, workstation_present: bool,
+    gateway_verified: bool | None, workstation_verified: bool | None,
+    gateway_defined: bool | None, workstation_defined: bool | None,
+    readiness_status: str, readiness_reason: str,
+) -> VeilPlanAction:
+    """Topology may only ever reach ``APPLY`` once both artifacts are
+    present, verified, AND imported/defined (S6R Corrective D, Section
+    34) - never merely "present". Since Serein performs no verification
+    or import itself, this remains ``BLOCKED`` in every real build
+    today - an explicitly accepted, documented outcome (Section 34:
+    "In S6's current no-Apply phase, likely topology remains BLOCKED in
+    all real cases. That is acceptable.")."""
+    action_id, component, action = "whonix.network_topology", "whonix", "configure_vm_network"
+    tool = "internal-only Whonix-Workstation adapter (never direct clearnet egress)"
+    if readiness_status != "ready":
+        return VeilPlanAction(
+            action_id, component, action, tool, "user-managed",
+            "blocked", None,
+            "VM backend is not ready yet: " + readiness_reason,
+            False, True, "none", "n/a", "BLOCKED",
+        )
+    if not (gateway_present and workstation_present):
+        return VeilPlanAction(
+            action_id, component, action, tool, "user-managed",
+            "blocked", None,
+            "Both Whonix images must be present before topology can be "
+            "considered.",
+            False, True, "none", "n/a", "BLOCKED",
+        )
+    if not (gateway_verified and workstation_verified):
+        return VeilPlanAction(
+            action_id, component, action, tool, "user-managed",
+            "blocked", None,
+            "Both Whonix images are present but not verified - Serein "
+            "never trusts a matching filename alone (Section 31/37); "
+            "topology configuration cannot proceed on an unverified "
+            "artifact.",
+            False, True, "none", "n/a", "BLOCKED",
+        )
+    if not (gateway_defined and workstation_defined):
+        return VeilPlanAction(
+            action_id, component, action, tool, "user-managed",
+            "blocked", None,
+            "Both Whonix images are verified but not yet imported as "
+            "libvirt domains ('virsh define') - topology configuration "
+            "requires both domains to exist first.",
             False, True, "none", "n/a", "BLOCKED",
         )
     return VeilPlanAction(
         action_id, component, action, tool, "user-managed",
         "not configured", tool,
-        "Both Whonix images are present. Future topology configuration "
-        "MUST route Whonix-Workstation exclusively through Whonix-Gateway "
-        "-> NAT/host uplink: Whonix-Workstation must never be planned with "
-        "a direct clearnet-facing network adapter (Section 32-33/100) - "
-        "this invariant is enforced regardless of any future Apply engine "
-        "implementation.",
+        "Both Whonix domains are verified and imported. Future topology "
+        "configuration MUST route Whonix-Workstation exclusively through "
+        "Whonix-Gateway -> NAT/host uplink: Whonix-Workstation must never "
+        "be planned with a direct clearnet-facing network adapter "
+        "(Section 32-33/100) - this invariant is enforced regardless of "
+        "any future Apply engine implementation.",
         True, True, "medium", "n/a", "APPLY",
     )
 
@@ -258,14 +332,22 @@ def build_veil_plan(
         _workspace_routing_action(),
         _workspace_kill_switch_action(),
         _whonix_vm_prerequisites_action(readiness),
-        _whonix_image_action(
+        _whonix_artifact_action(
             "gateway", whonix.gateway_image_present, readiness.status, readiness.reason
         ),
-        _whonix_image_action(
+        _whonix_verification_action(
+            "gateway", whonix.gateway_image_present, whonix.gateway_image_verified
+        ),
+        _whonix_artifact_action(
             "workstation", whonix.workstation_image_present, readiness.status, readiness.reason
+        ),
+        _whonix_verification_action(
+            "workstation", whonix.workstation_image_present, whonix.workstation_image_verified
         ),
         _whonix_network_topology_action(
             whonix.gateway_image_present, whonix.workstation_image_present,
+            whonix.gateway_image_verified, whonix.workstation_image_verified,
+            whonix.gateway_domain_defined, whonix.workstation_domain_defined,
             readiness.status, readiness.reason,
         ),
     ]

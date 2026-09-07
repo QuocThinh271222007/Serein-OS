@@ -63,7 +63,8 @@ def build_veil_capabilities(
     capabilities.append(
         Capability(
             "tor_browser", True, tor_browser.launcher_installed, tor_browser.usable,
-            "torbrowser-launcher (official Tor Project release)",
+            "Ubuntu-packaged torbrowser-launcher for downloading/verifying "
+            "official Tor Browser releases",
             "ubuntu-repository", "medium" if tor_browser.launcher_installed else "low",
             tor_browser.reason,
         )
@@ -117,7 +118,12 @@ def build_veil_capabilities(
         Capability(
             "whonix_vm", True, whonix.gateway_image_present and whonix.workstation_image_present,
             whonix.usable, "Whonix-Gateway + Whonix-Workstation qcow2 images",
-            "user-managed", whonix.confidence, whonix.reason,
+            "user-managed", whonix.confidence,
+            "installed means both artifact files are present at the "
+            "expected location only, never verified/imported/usable "
+            f"(lifecycle stage: {whonix.lifecycle_stage}) - usable stays "
+            "None/False until real verification and topology exist. "
+            + whonix.reason,
         )
     )
 
