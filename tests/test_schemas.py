@@ -70,6 +70,9 @@ def _load_schema(name: str) -> dict:
         "focus-plan.schema.json",
         "focus-capabilities.schema.json",
         "focus-transition.schema.json",
+        "distribution-base-image.schema.json",
+        "distribution-payload-manifest.schema.json",
+        "distribution-build-manifest.schema.json",
     ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:

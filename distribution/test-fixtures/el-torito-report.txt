@@ -1,0 +1,13 @@
+# Representative shape of `xorriso -indev <iso> -report_el_torito
+# as_mkisofs` output - used only to test that
+# serein.distribution.iso.parse_el_torito_report tokenizes report lines
+# in order. This is NOT asserted anywhere to be the literal output for
+# any specific Ubuntu 26.04 image (that has not been run against a real
+# ISO in this environment - see docs/distribution/known-limitations.md);
+# it is a structurally realistic fixture for testing the parser itself.
+-c '/boot.catalog'
+-b '/boot/grub/i386-pc/eltorito.img' -no-emul-boot -boot-load-size 4 -boot-info-table
+-eltorito-alt-boot
+-e '--interval:appended_partition_2:all::' -no-emul-boot
+-appended_part_as_gpt
+-partition_cyl_align all
