@@ -181,10 +181,44 @@ storage-efficient:
 - **Diagnostics, not estimates, drive the preflight.** `df`/`du`
   output is logged at each transition point in the workflow
   (`serein.distribution.storage.measure_disk_usage` is the equivalent
-  Python-side helper, used by tests). The preflight's 12 GiB threshold
-  is a documented, conservative estimate (base ISO until released + one
-  extraction tree + up to two rebuilt ISOs existing briefly together +
-  a 2 GiB margin) - explicitly not claimed to be byte-exact.
+  Python-side helper, used by tests).
+
+### Disk-preflight requirement derivation (S7.0RM2 Corrective D)
+
+An earlier version of this threshold (12 GiB) was not actually derived
+from its own documented components - they summed to significantly
+more than the number enforced. The current requirement is computed in
+the workflow from named, internally-consistent components reflecting
+the *real* simultaneously-live large-object peak in the pipeline order
+above:
+
+```
+EXTRACTED_TREE_GIB (6)     xorriso -osirrox extracts the ISO9660 tree's
+                            files exactly as stored - the live SquashFS
+                            payload is copied out as one still-
+                            compressed blob, never re-expanded, so the
+                            extracted tree's apparent size stays close
+                            to the base ISO's own size
++ PRODUCTION_ISO_GIB (6)    deliberately RETAINED on disk while the QA
+                            ISO is rebuilt (the production ISO must
+                            already be finalized and unaffected before
+                            the QA transition begins)
++ QA_ISO_GIB (6)            being written by the second xorriso rebuild
+= PEAK_GIB (18)              all three exist simultaneously during the
+                              QA rebuild step - the true peak, since
+                              ephemeral_storage already released the
+                              base ISO before the two rebuilds began
++ SAFETY_MARGIN_GIB (4)      rough size estimates, not measured
+= REQUIRED_GIB (22)
+```
+
+A second, lower candidate peak - base ISO (6 GiB) + extracted tree
+growing to 6 GiB during extraction, before `ephemeral_storage` releases
+the base ISO - is ~12 GiB, below the QA-rebuild peak above, so it does
+not drive the requirement. `tests/test_distribution.py::TestLayerBWorkflow`'s
+Corrective D tests regress that these components' own literal values
+actually sum to the enforced requirement, not merely document an
+unrelated number.
 
 ## Why extraction/rebuild instead of SquashFS/EFI-partition surgery (Sections 34-36)
 

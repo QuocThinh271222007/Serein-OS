@@ -1,4 +1,21 @@
-# Boot Validation (S7.0 Sections 30-31, 44-49, 92-97; S7.0R Correctives A/B/E)
+# Boot Validation (S7.0 Sections 30-31, 44-49, 92-97; S7.0R Correctives A/B/E; S7.0RM2 execution fixes)
+
+## Scripts must be Git-executable, not just runnable locally (S7.0RM2 Corrective A)
+
+A real Layer-B run passed the (now-fixed) disk preflight and then
+failed immediately at
+`./distribution/scripts/fetch-base-image.sh: Permission denied` -
+every direct shell entrypoint under `distribution/scripts/` (including
+`boot-smoke.sh`, which this document covers) was tracked in the Git
+tree as `100644`. A local `chmod +x` on a developer's own checkout
+never fixes this, since GitHub Actions materializes whatever mode the
+Git *tree itself* records on a fresh checkout, not whatever a prior
+local working copy happened to carry. All six scripts are now tracked
+as `100755` (`git ls-files -s distribution/scripts/` - regression-tested
+by `tests/test_distribution.py::TestGitExecutableModes`, which reads
+the Git index directly rather than local filesystem permissions, since
+this suite also runs on Windows where POSIX x-bit semantics do not
+apply to the working copy at all).
 
 ## Layer-B trigger model (Corrective A)
 
