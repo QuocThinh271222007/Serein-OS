@@ -24,7 +24,7 @@ path that would actually apply a profile) is not implemented. Reporting an
 inactive profile as active would violate the "no fake PASS output" rule
 that also governs `doctor`.
 
-## Current scope (as of S5)
+## Current scope (as of S6)
 
 - `core` (S0): `profiles/core/core.profile.json`. Describes the
   unmodified host — empty `packages`/`services`/etc. — and exists to
@@ -85,21 +85,26 @@ that also governs `doctor`.
   (including the hardware-present-vs-runtime-usable distinction), and
   `serein ai plan` all work end to end, but there is still no Apply
   mechanism.
-- `cyber` (S5): `profiles/cyber/cyber.profile.json` (version `0.2.0`).
-  **Important distinction, called out explicitly per the S5 brief:**
-  this is the same `cyber` profile identity S2 already gave a hardware
-  resource-policy manifest to (CPU/memory/storage policy biased for
-  stable virtualization behavior, e.g. for running a VM-isolated
-  workload) — S5 does not create a second "cyber" profile, it extends
-  this one, exactly the pattern `dev` (S3) and `ai` (S4) already
-  established. Its `packages` field is the union of S2's 2 hardware
-  packages and S5's 14-package Host Cyber Light default apt manifest
-  (`serein.cyber.tools.default_apt_packages()` —
-  `bind9-dnsutils`/`binutils`/`ethtool`/`file`/
+- `cyber` (S5): `profiles/cyber/cyber.profile.json` (version `0.2.1`
+  after the S5R micro corrective). **Important distinction, called out
+  explicitly per the S5 brief:** this is the same `cyber` profile
+  identity S2 already gave a hardware resource-policy manifest to
+  (CPU/memory/storage policy biased for stable virtualization behavior,
+  e.g. for running a VM-isolated workload) — S5 does not create a
+  second "cyber" profile, it extends this one, exactly the pattern
+  `dev` (S3) and `ai` (S4) already established. Its `packages` field is
+  the union of S2's 2 hardware packages and S5R's 13-package Host Cyber
+  Light default apt manifest (`serein.cyber.tools.default_apt_packages()`
+  — `bind9-dnsutils`/`binutils`/`ethtool`/`file`/
   `libimage-exiftool-perl`/`mtr-tiny`/`netcat-openbsd`/`nmap`/
-  `openssl`/`socat`/`tcpdump`/`tshark`/`whois`/`wireshark`, live-
-  validated on Ubuntu 26.04 — see `docs/validation/s5/`); its
-  `verification_checks` field adds S5's six `cyber_*` doctor check ids
+  `openssl`/`socat`/`tcpdump`/`tshark`/`whois`, live-validated on Ubuntu
+  26.04 — see `docs/validation/s5/`). `wireshark` (the GUI package) is
+  deliberately **not** part of this default set as of the S5R micro
+  corrective: it is `recommended_tier="host"` (appropriate to have) but
+  `default_install=False` (not forced onto every host) — see
+  `docs/cyber/toolbox-strategy.md` and `docs/cyber/host-tooling.md`.
+  Its `verification_checks` field adds S5's seven `cyber_*` doctor
+  check ids (including the S5R-added `cyber_vm_readiness` check)
   alongside S2's ten hardware checks. See `docs/cyber/architecture.md`
   for what "implemented" means here — detection, capability modeling
   (host/toolbox/VM tiering, packet-capture privilege modeling), and
@@ -107,10 +112,17 @@ that also governs `doctor`.
   mechanism: no package is installed, no container or VM is created, no
   packet is captured, no network is scanned.
 - `DECLARED_ONLY_PROFILES` (`src/serein/profiles/registry.py`) is empty
-  as of S2 — every roadmap profile now has a manifest. It remains the
-  mechanism a future phase (e.g. S6's veil/privacy profile) will use
-  before it has a manifest of its own; the veil/privacy profile is
-  **not** declared yet and should be added when S6 starts, not before.
+  as of S2 — every roadmap profile now has a manifest, and it remains
+  empty through S6: **no `veil` profile manifest was added in S6**,
+  deliberately (Section 90 of the S6 brief: "Do not automatically make
+  Veil a global boot/network profile" — a registered profile Serein's
+  own hardware-policy layer could apply implicitly would cut directly
+  against S6's governing "privacy is opt-in, never an invisible global
+  side effect" principle). `serein veil status`/`capabilities`/`plan`/
+  `doctor` work without any profile registration, mirroring how S5's
+  cyber *tooling* worked before S2 ever gave `cyber` a manifest.
+  `DECLARED_ONLY_PROFILES` remains available for a future phase that
+  does want profile-gated behavior.
 
 ## Manifest fields
 
