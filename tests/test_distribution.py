@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -30,10 +31,12 @@ from serein.distribution.base import (
 from serein.distribution.bootsmoke import (
     DEFAULT_SUCCESS_MARKERS,
     build_qemu_boot_command,
+    derive_boot_mode,
     evaluate_boot_log,
     run_boot_smoke,
 )
 from serein.distribution.build import BuildError, BuildResult, run_build
+from serein.distribution.closure import ClosureError, enforce_layer_b_closure
 from serein.distribution.evidence import assemble_layer_b_evidence, write_layer_b_evidence
 from serein.distribution.inspect import (
     inspect_extracted_tree,
@@ -71,10 +74,12 @@ from serein.distribution.payload import (
 from serein.distribution.qa_boot import (
     QA_ENTRY_TITLE,
     QaBootError,
+    QaProtectedFileMutationError,
     derive_qa_menuentry,
     discover_grub_config,
     install_qa_entry_as_default,
     prepare_qa_variant,
+    transition_to_qa_in_place,
     update_checksum_catalog_if_present,
 )
 from serein.distribution.safety import (
@@ -83,6 +88,12 @@ from serein.distribution.safety import (
     scan_tree_for_credentials,
 )
 from serein.distribution.status import build_distribution_status
+from serein.distribution.storage import (
+    StorageError,
+    directory_size_bytes,
+    measure_disk_usage,
+    release_base_iso,
+)
 from serein.distribution.workspace import WorkspaceError, reset_extracted_workspace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -577,6 +588,32 @@ class TestInspector:
         assert _shutil  # keep import referenced for clarity
 
 
+class _FakeQemuProcess:
+    """A minimal subprocess.Popen-shaped fake for the boot-smoke
+    monitor (S7.0RM Corrective D): .poll()/.terminate()/.kill()/.wait()
+    without ever spawning a real process."""
+
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.terminate_called = False
+        self.kill_called = False
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.terminate_called = True
+        if self.returncode is None:
+            self.returncode = -15
+
+    def kill(self):
+        self.kill_called = True
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
 class TestBootSmoke:
     def test_command_never_attaches_a_target_disk(self, tmp_path):
         command = build_qemu_boot_command(tmp_path / "iso.iso", tmp_path / "serial.log")
@@ -613,41 +650,113 @@ class TestBootSmoke:
         success, _ = evaluate_boot_log("qemu started\n" * 50)
         assert success is False
 
-    def test_run_boot_smoke_reports_pass_when_marker_written(self, tmp_path):
-        def fake_runner(command, **kwargs):
-            serial_index = command.index("-serial") + 1
-            log_path = Path(command[serial_index].removeprefix("file:"))
-            log_path.write_text("... Reached target Basic System ...")
-            return subprocess.CompletedProcess(command, 0)
+    def test_run_boot_smoke_reports_pass_when_marker_appears_while_running(self, tmp_path):
+        # S7.0RM Corrective D: a live boot is expected to keep running,
+        # not exit - the marker must be detected while poll() still
+        # returns None.
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
+
+        def fake_sleep(_seconds):
+            fake_time["t"] += _seconds
+            if fake_time["t"] >= 2.0:
+                (tmp_path / "work" / "boot-smoke-serial.log").write_text(
+                    "booting...\nReached target Basic System\nmore\n"
+                )
 
         result = run_boot_smoke(
             iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
-            subprocess_runner=fake_runner,
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"], sleep_fn=fake_sleep,
         )
         assert result.status == "pass"
         assert result.matched_marker is not None
+        assert process.terminate_called is True  # deliberately stopped, never leaked
 
     def test_run_boot_smoke_reports_fail_on_timeout(self, tmp_path):
-        def timeout_runner(command, **kwargs):
-            raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout", 1))
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
 
         result = run_boot_smoke(
             iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
-            timeout_seconds=1, subprocess_runner=timeout_runner,
+            timeout_seconds=3, poll_interval_seconds=1.0,
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"],
+            sleep_fn=lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
         )
         assert result.status == "fail"
         assert "timed out" in result.reason
+        assert process.terminate_called is True
 
-    def test_run_boot_smoke_reports_fail_when_no_marker(self, tmp_path):
-        def silent_runner(command, **kwargs):
-            return subprocess.CompletedProcess(command, 0)
+    def test_run_boot_smoke_reports_fail_when_process_exits_before_marker(self, tmp_path):
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
+
+        def fake_sleep(_seconds):
+            fake_time["t"] += _seconds
+            process.returncode = 1  # exits on the very first poll, no marker ever written
 
         result = run_boot_smoke(
             iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
-            subprocess_runner=silent_runner,
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"], sleep_fn=fake_sleep,
         )
         assert result.status == "fail"
         assert result.matched_marker is None
+
+    def test_run_boot_smoke_process_never_leaked_on_exception(self, tmp_path):
+        process = _FakeQemuProcess()
+
+        def raising_sleep(_seconds):
+            raise RuntimeError("simulated harness crash")
+
+        with pytest.raises(RuntimeError):
+            run_boot_smoke(
+                iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
+                popen_factory=lambda *a, **k: process,
+                time_source=lambda: 0.0, sleep_fn=raising_sleep,
+            )
+        assert process.terminate_called is True
+
+    def test_boot_mode_derived_from_ovmf_presence(self, tmp_path):
+        process = _FakeQemuProcess()
+        fake_time = {"t": 0.0}
+
+        def fake_sleep(_seconds):
+            fake_time["t"] += _seconds
+            (tmp_path / "work" / "boot-smoke-serial.log").write_text(
+                "Reached target Basic System\n"
+            )
+
+        result_bios = run_boot_smoke(
+            iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"], sleep_fn=fake_sleep,
+        )
+        assert result_bios.boot_mode == "bios"
+
+        fake_time["t"] = 0.0
+        process2 = _FakeQemuProcess()
+        result_uefi = run_boot_smoke(
+            iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work2",
+            ovmf_code=tmp_path / "OVMF_CODE.fd",
+            popen_factory=lambda *a, **k: process2,
+            time_source=lambda: fake_time["t"],
+            sleep_fn=lambda s: (
+                fake_time.__setitem__("t", fake_time["t"] + s),
+                (tmp_path / "work2" / "boot-smoke-serial.log").write_text(
+                    "Reached target Basic System\n"
+                ),
+            ),
+        )
+        assert result_uefi.boot_mode == "uefi"
+        assert result_uefi.firmware == str(tmp_path / "OVMF_CODE.fd")
+
+    def test_boot_smoke_result_pass_requires_matched_marker(self):
+        from serein.distribution.bootsmoke import BootSmokeError, BootSmokeResult
+
+        with pytest.raises(BootSmokeError):
+            BootSmokeResult(status="pass", matched_marker=None, reason="", log_excerpt="")
 
 
 class TestBuildPipeline:
@@ -1327,6 +1436,91 @@ class TestLayerBWorkflow:
         assert "*.iso" not in paths
         assert "manifest.json" in paths
 
+    def test_evidence_upload_runs_even_on_earlier_failure(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        assert upload.get("if") == "always()"
+        assemble = next(s for s in steps if s.get("name") == "Assemble Layer-B evidence")
+        assert assemble.get("if") == "always()"
+
+    def test_evidence_assembly_never_requires_manifest_files_unconditionally(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        assemble = next(s for s in steps if s.get("name") == "Assemble Layer-B evidence")
+        # the fix for the real observed defect: manifest paths must
+        # only be passed when the file actually exists, never assumed
+        assert "if [ -f dist/serein-alpha-26.04-amd64.iso.manifest.json ]" in assemble["run"]
+        assert "--source-commit" in assemble["run"]
+
+    def test_qemu_boot_step_fails_job_on_failure(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        boot = next(s for s in steps if s.get("name", "").startswith("QEMU boot smoke"))
+        assert boot.get("if") == "always()"
+        assert "exit 1" in boot["run"]
+
+    def test_qemu_boot_requires_uefi(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        boot = next(s for s in steps if s.get("name", "").startswith("QEMU boot smoke"))
+        assert "--require-uefi" in boot["run"]
+
+    def test_strict_inspection_steps_fail_job_on_failure(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        for name in ("Strict-inspect production ISO", "Strict-inspect QA ISO"):
+            step = next(s for s in steps if s.get("name") == name)
+            assert step.get("if") == "always()"
+            assert "exit 1" in step["run"]
+
+    def test_closure_gate_step_present_and_always_runs(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        gate = next(s for s in steps if s.get("name") == "Enforce Layer-B closure")
+        assert gate.get("if") == "always()"
+        assert "closure-gate" in gate["run"]
+        assert "--expected-source-commit" in gate["run"]
+
+    def test_ephemeral_cleanup_scoped_to_github_hosted(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        cleanup = next(s for s in steps if s.get("name") == "Reclaim ephemeral runner SDK space")
+        assert cleanup.get("if") == "runner.environment == 'github-hosted'"
+
+    def test_ephemeral_cleanup_never_uses_dangerous_glob_deletion(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        cleanup = next(s for s in steps if s.get("name") == "Reclaim ephemeral runner SDK space")
+        script = cleanup["run"]
+        assert "rm -rf /opt/*" not in script
+        assert "rm -rf /usr/local/*" not in script
+        assert "rm -rf \"$" not in script.replace("${resolved}", "")  # no untrusted-var-only rm -rf
+
+    def test_ephemeral_cleanup_logs_before_and_after_free_space(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        cleanup = next(s for s in steps if s.get("name") == "Reclaim ephemeral runner SDK space")
+        assert "FREE_SPACE_BEFORE_CLEANUP_KB" in cleanup["run"]
+        assert "FREE_SPACE_AFTER_CLEANUP_KB" in cleanup["run"]
+        assert "SPACE_RECLAIMED_KB" in cleanup["run"]
+
+    def test_preflight_threshold_is_justified_not_arbitrary(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        # the comment above the step documents the estimate; the check
+        # itself must not silently drop below a sane floor
+        assert "REQUIRED_KB=$((12 * 1024 * 1024))" in preflight["run"]
+
+    def test_build_step_uses_ephemeral_storage(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        build = next(
+            s for s in steps
+            if s.get("name") == "Build Serein Alpha ISO (production + QA variant)"
+        )
+        assert "EPHEMERAL_STORAGE=1" in build["run"]
+
+    def test_single_canonical_builder_no_competing_script(self):
+        # Section 9: no "ci-special-build.sh" or equivalent - only the
+        # scripts already covered by docs/distribution/.
+        scripts_dir = REPO_ROOT / "distribution" / "scripts"
+        names = {p.name for p in scripts_dir.glob("*.sh")}
+        assert names == {
+            "fetch-base-image.sh", "verify-base-image.sh", "build-iso.sh",
+            "inspect-iso.sh", "boot-smoke.sh", "clean.sh",
+        }
+
 
 # ---------------------------------------------------------------------------
 # S7.0R: Layer-B evidence assembly
@@ -1342,15 +1536,36 @@ class TestLayerBEvidence:
             base_sha256_actual="b" * 64,
             production_iso_filename="serein-alpha-26.04-amd64.iso",
             production_iso_sha256="c" * 64,
-            production_inspection_status="pass",
-            qa_boot_iso_filename="serein-alpha-26.04-amd64-qa.iso",
-            qa_boot_iso_sha256="d" * 64,
+            production_build="pass",
+            production_inspection="pass",
+            qa_iso_filename="serein-alpha-26.04-amd64-qa.iso",
+            qa_iso_sha256="d" * 64,
+            qa_build="pass",
+            qa_inspection="pass",
             qemu_boot="pass",
             qemu_boot_mode="uefi",
+            ovmf_firmware="/usr/share/OVMF/OVMF_CODE_4M.fd",
             boot_marker="Reached target Basic System",
         )
         schema = _load_schema("distribution-layer-b-evidence.schema.json")
         jsonschema.validate(evidence.to_dict(), schema)
+
+    def test_minimal_evidence_before_any_stage_ran_matches_schema(self):
+        # Corrective B: constructible from just source_commit, with
+        # every stage genuinely "not_performed" - e.g. the disk-space
+        # preflight failed before the base image was ever downloaded.
+        evidence = assemble_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="disk_preflight",
+            failure_reason="insufficient free space: 13599352 KiB available",
+        )
+        schema = _load_schema("distribution-layer-b-evidence.schema.json")
+        jsonschema.validate(evidence.to_dict(), schema)
+        assert evidence.production_build == "not_performed"
+        assert evidence.qa_build == "not_performed"
+        assert evidence.qemu_boot == "not_performed"
+        assert evidence.base_verified is False
+        assert evidence.boot_marker is None
 
     def test_base_verified_derived_from_hash_equality(self):
         matching = assemble_layer_b_evidence(
@@ -1365,6 +1580,24 @@ class TestLayerBEvidence:
         )
         assert matching.base_verified is True
         assert mismatched.base_verified is False
+
+    def test_invalid_stage_status_rejected(self):
+        with pytest.raises(ValueError, match="production_build"):
+            assemble_layer_b_evidence(source_commit="a" * 40, production_build="maybe")  # type: ignore[arg-type]
+
+    def test_round_trip_through_load(self, tmp_path):
+        from serein.distribution.evidence import load_layer_b_evidence
+
+        original = assemble_layer_b_evidence(
+            source_commit="a" * 40, production_build="pass", qa_build="fail",
+            failure_stage="qa_build", failure_reason="QA_BUILD=BLOCKED",
+        )
+        path = write_layer_b_evidence(original, tmp_path / "evidence.json")
+        reloaded = load_layer_b_evidence(path)
+        assert reloaded.source_commit == original.source_commit
+        assert reloaded.production_build == "pass"
+        assert reloaded.qa_build == "fail"
+        assert reloaded.failure_stage == "qa_build"
 
     def test_no_host_identifying_fields(self, tmp_path):
         evidence = assemble_layer_b_evidence(
@@ -1598,3 +1831,294 @@ def _fake_build_runner_without_grub():
         raise AssertionError(f"unexpected argv: {argv}")
 
     return runner
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM Corrective A: storage
+# ---------------------------------------------------------------------------
+
+
+class TestStorage:
+    def test_directory_size_bytes_missing_dir_is_zero(self, tmp_path):
+        assert directory_size_bytes(tmp_path / "does-not-exist") == 0
+
+    def test_directory_size_bytes_sums_files(self, tmp_path):
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "a.txt").write_bytes(b"12345")
+        (d / "sub").mkdir()
+        (d / "sub" / "b.txt").write_bytes(b"1234567890")
+        assert directory_size_bytes(d) == 15
+
+    def test_measure_disk_usage_reports_all_fields(self, tmp_path):
+        (tmp_path / "cache" / "upstream").mkdir(parents=True)
+        (tmp_path / "cache" / "upstream" / "base.iso").write_bytes(b"x" * 100)
+        report = measure_disk_usage(tmp_path)
+        assert report.cache_upstream_bytes == 100
+        assert report.build_work_bytes == 0
+        assert report.dist_bytes == 0
+        assert report.free_bytes > 0
+        assert "cache_upstream_bytes" in report.to_dict()
+
+    def test_release_base_iso_deletes_file_inside_cache_dir(self, tmp_path):
+        cache_dir = tmp_path / "cache" / "upstream"
+        cache_dir.mkdir(parents=True)
+        base_iso = cache_dir / "base.iso"
+        base_iso.write_bytes(b"verified base bytes")
+
+        deleted = release_base_iso(base_iso, cache_dir)
+        assert deleted is True
+        assert not base_iso.exists()
+
+    def test_release_base_iso_idempotent_when_already_absent(self, tmp_path):
+        cache_dir = tmp_path / "cache" / "upstream"
+        cache_dir.mkdir(parents=True)
+        deleted = release_base_iso(cache_dir / "missing.iso", cache_dir)
+        assert deleted is False
+
+    def test_release_base_iso_rejects_path_outside_cache_dir(self, tmp_path):
+        cache_dir = tmp_path / "cache" / "upstream"
+        cache_dir.mkdir(parents=True)
+        outside = tmp_path / "dist" / "important.iso"
+        outside.parent.mkdir(parents=True)
+        outside.write_bytes(b"do not delete me")
+
+        with pytest.raises(StorageError):
+            release_base_iso(outside, cache_dir)
+        assert outside.exists()  # never touched
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM Corrective A: storage-efficient in-place QA transition
+# ---------------------------------------------------------------------------
+
+
+class TestQaInPlaceTransition:
+    def test_transition_in_place_patches_the_same_directory(self, tmp_path):
+        dest = tmp_path / "extracted"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", dest)
+
+        result = transition_to_qa_in_place(dest)
+
+        patched = (dest / result.grub_config_relative_path).read_text()
+        assert QA_ENTRY_TITLE in patched
+        assert 'set default="0"' in patched
+        # no second tree was ever created
+        assert not (tmp_path / "extracted-qa").exists()
+
+    def test_transition_in_place_preserves_payload_and_marker(self, tmp_path):
+        dest = tmp_path / "extracted"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", dest)
+        marker_before = (dest / "serein" / "manifest.json").read_bytes()
+        payload_before = (dest / "serein" / "payload" / "hello.txt").read_bytes()
+
+        transition_to_qa_in_place(dest)
+
+        assert (dest / "serein" / "manifest.json").read_bytes() == marker_before
+        assert (dest / "serein" / "payload" / "hello.txt").read_bytes() == payload_before
+
+    def test_transition_in_place_blocked_without_grub_candidate(self, tmp_path):
+        dest = tmp_path / "extracted"
+        dest.mkdir()
+        (dest / "serein").mkdir()
+        with pytest.raises(QaBootError):
+            transition_to_qa_in_place(dest)
+
+    def test_transition_in_place_detects_unexpected_protected_mutation(self, tmp_path, monkeypatch):
+        dest = tmp_path / "extracted"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", dest)
+
+        real_install = install_qa_entry_as_default
+
+        def corrupting_install(grub_text, qa_entry_text):
+            # Simulate a hypothetical future bug that touches a file it
+            # has no business touching, alongside the real GRUB patch.
+            (dest / "EFI" / "boot" / "bootx64.efi").write_bytes(b"corrupted!")
+            return real_install(grub_text, qa_entry_text)
+
+        monkeypatch.setattr(
+            "serein.distribution.qa_boot.install_qa_entry_as_default", corrupting_install
+        )
+
+        with pytest.raises(QaProtectedFileMutationError):
+            transition_to_qa_in_place(dest)
+
+    def test_transition_in_place_updates_checksum_catalog(self, tmp_path):
+        dest = tmp_path / "extracted"
+        (dest / "boot" / "grub").mkdir(parents=True)
+        grub_path = dest / "boot" / "grub" / "grub.cfg"
+        grub_path.write_text(
+            'menuentry "Try or Install Serein OS Alpha" {\n'
+            "    linux   /casper/vmlinuz boot=casper splash ---\n"
+            "    initrd  /casper/initrd\n"
+            "}\n"
+        )
+        import hashlib
+
+        stale_hash = hashlib.md5(b"stale").hexdigest()  # noqa: S324
+        (dest / "md5sum.txt").write_text(f"{stale_hash}  ./boot/grub/grub.cfg\n")
+
+        result = transition_to_qa_in_place(dest)
+        assert result.checksum_catalog_updated is True
+        catalog_text = (dest / "md5sum.txt").read_text()
+        assert stale_hash not in catalog_text
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM Corrective D/F: boot-mode derivation
+# ---------------------------------------------------------------------------
+
+
+class TestBootModeDerivation:
+    def test_no_ovmf_is_bios(self):
+        assert derive_boot_mode(None) == "bios"
+
+    def test_ovmf_present_is_uefi(self, tmp_path):
+        assert derive_boot_mode(tmp_path / "OVMF_CODE.fd") == "uefi"
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM Corrective G: explicit fail-closed Layer-B closure gate
+# ---------------------------------------------------------------------------
+
+
+def _passing_evidence(**overrides):
+    base = dict(
+        source_commit="a" * 40,
+        base_sha256_expected="b" * 64, base_sha256_actual="b" * 64,
+        production_build="pass", production_inspection="pass",
+        qa_build="pass", qa_inspection="pass",
+        qemu_boot="pass", qemu_boot_mode="uefi",
+        boot_marker="Reached target Basic System",
+    )
+    base.update(overrides)
+    return assemble_layer_b_evidence(**base)
+
+
+class TestClosureGate:
+    def test_all_required_fields_pass_closure_passes(self):
+        evidence = _passing_evidence()
+        enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)  # must not raise
+
+    def test_base_not_verified_fails(self):
+        evidence = _passing_evidence(base_sha256_actual="c" * 64)
+        with pytest.raises(ClosureError, match="base_verified"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_production_inspection_fail_fails(self):
+        evidence = _passing_evidence(production_inspection="fail")
+        with pytest.raises(ClosureError, match="production_inspection"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_qa_build_fail_fails(self):
+        evidence = _passing_evidence(qa_build="fail")
+        with pytest.raises(ClosureError, match="qa_build"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_qemu_boot_fail_fails(self):
+        evidence = _passing_evidence(qemu_boot="fail")
+        with pytest.raises(ClosureError, match="qemu_boot"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_boot_marker_null_fails(self):
+        evidence = _passing_evidence(boot_marker=None)
+        with pytest.raises(ClosureError, match="boot_marker"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_bios_only_boot_fails(self):
+        evidence = _passing_evidence(qemu_boot_mode="bios")
+        with pytest.raises(ClosureError, match="qemu_boot_mode"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_wrong_source_commit_fails(self):
+        evidence = _passing_evidence()
+        with pytest.raises(ClosureError, match="source_commit"):
+            enforce_layer_b_closure(evidence, expected_source_commit="f" * 40)
+
+    def test_target_disk_attached_fails(self):
+        from dataclasses import replace as dc_replace
+
+        evidence = dc_replace(_passing_evidence(), target_disk_attached=True)
+        with pytest.raises(ClosureError, match="target_disk_attached"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_autoinstall_enabled_fails(self):
+        from dataclasses import replace as dc_replace
+
+        evidence = dc_replace(_passing_evidence(), autoinstall_enabled=True)
+        with pytest.raises(ClosureError, match="autoinstall_enabled"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_multiple_failures_all_listed(self):
+        evidence = _passing_evidence(qemu_boot="fail", qa_build="fail")
+        with pytest.raises(ClosureError) as exc_info:
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+        message = str(exc_info.value)
+        assert "qemu_boot" in message
+        assert "qa_build" in message
+
+    def test_early_preflight_failure_evidence_fails_closure(self):
+        # The real defect this corrective fixes: a preflight failure
+        # before any base download must still produce evidence, and
+        # that evidence must fail the closure gate, never pass it.
+        evidence = assemble_layer_b_evidence(
+            source_commit="a" * 40, failure_stage="disk_preflight",
+            failure_reason="insufficient free space",
+        )
+        with pytest.raises(ClosureError):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM: ephemeral-storage build integration
+# ---------------------------------------------------------------------------
+
+
+class TestEphemeralStorageBuild:
+    def test_ephemeral_storage_deletes_cached_base_after_use(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+        assert base_iso.is_file()
+
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+
+        run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=runner,
+            ephemeral_storage=True,
+        )
+
+        assert not base_iso.exists()
+
+    def test_normal_build_preserves_cached_base(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+
+        run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=runner,
+            ephemeral_storage=False,
+        )
+
+        assert base_iso.is_file()  # untouched by default
+
+    def test_qa_build_never_creates_a_second_extracted_tree(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+        work_dir = tmp_path / "work"
+
+        result = run_build(
+            repo_root=repo_root, work_dir=work_dir,
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=runner,
+        )
+
+        assert result.qa is not None
+        assert not (work_dir / "extracted-qa").exists()
