@@ -193,10 +193,16 @@ def _check_transition_graph(evidence: FocusEvidence) -> CheckResult:
 
 
 def _check_lifecycle_instance_evidence(evidence: FocusEvidence) -> CheckResult:
-    """S6.5R Corrective A, Section 4/36/60: an instance-level intent
-    (QUIESCE_CANDIDATE/PRIORITY_CANDIDATE/RESOURCE_INCREASE_CANDIDATE/
-    RESOURCE_REDUCE_CANDIDATE) is only ever valid when
-    ``instance_present is True``."""
+    """S6.5R/S6.5RM Corrective A, Section 4/13/30/36/60: an instance-
+    level intent (QUIESCE_CANDIDATE/PRIORITY_CANDIDATE/
+    RESOURCE_INCREASE_CANDIDATE/RESOURCE_REDUCE_CANDIDATE) is only ever
+    valid when ``instance_present is True`` - a future-compatible
+    invariant, not a hardcoded "always None" rule: no current builder
+    ever sets ``instance_present=True`` for any target (S6.5RM Section
+    11/27), so this check currently always PASSes by construction, but
+    it stays generic so a future, separately-reviewed instance detector
+    can produce a real instance-level action without this check
+    needing to change."""
     check_id, title = _LIFECYCLE_INSTANCE_EVIDENCE_CHECK
     for target in FOCUS_TARGETS:
         policy = build_focus_policy(target, evidence)

@@ -185,23 +185,27 @@ class LifecycleIntent:
     *explicitly* understands via an existing subsystem's own detection
     (Section 37) - never an arbitrary process name.
 
-    S6.5R Corrective A/B (Section 2-16): a single ``installed``/
-    ``current_state`` proxy conflated four genuinely separate facts -
-    ``mechanism_available`` (S3-S6 evidence proves the underlying
-    tool/engine/backend exists), ``instance_present`` (a *concrete*
-    resource instance - a running toolbox container, an imported VM, a
-    launched runtime - actually exists), ``instance_running`` (that
-    instance is currently active), and ``managed_by_serein`` (Serein
-    itself created/owns that instance). None of S6.5's existing
-    evidence sources can currently prove ``instance_present`` for any
-    target except ``ai_runtime`` (where the runtime binary itself *is*
-    the recognized instance - Section 5/38); every other target keeps
-    ``instance_present=None`` (genuinely unknown - Section 42
-    forbids adding a new `podman ps`/`virsh list`/`systemctl status`
-    style detector to manufacture this evidence). ``managed_by_serein``
-    is ``False`` for every current target - Serein has never created
-    any of them (no Apply engine has ever existed), so claiming
-    ownership would be a fabrication (Section 13-14).
+    S6.5R/S6.5RM (Corrective A/B, Section 1-16 of S6.5RM): a single
+    ``installed``/``current_state`` proxy conflated four genuinely
+    separate facts - ``mechanism_available`` (S3-S6 evidence proves the
+    underlying tool/engine/backend exists), ``instance_present`` (a
+    *concrete* resource instance - a running toolbox container, an
+    imported VM, a launched runtime daemon/server process - actually
+    exists), ``instance_running`` (that instance is currently active),
+    and ``managed_by_serein`` (Serein itself created/owns that
+    instance). S6.5 currently has **no concrete instance-presence
+    detector for any lifecycle target** - not even ``ai_runtime``: an
+    earlier pass treated the AI runtime binary itself as the recognized
+    instance, but tool/binary presence only ever proves a *mechanism*
+    exists, never that a daemon is running, a server process is up, a
+    model is loaded, or any concrete runtime instance exists (S6.5RM
+    Section 1/3). Every ``instance_present``/``instance_running`` stays
+    ``None`` (genuinely unknown) for every current target - Section 4/43
+    forbids adding a new `podman ps`/`virsh list`/`systemctl status`/
+    `pgrep`/`ollama ps` style detector to manufacture this evidence.
+    ``managed_by_serein`` is ``False`` for every current target - Serein
+    has never created any of them (no Apply engine has ever existed),
+    so claiming ownership would be a fabrication (Section 13-14/17).
 
     An intent in ``INSTANCE_LEVEL_INTENTS`` (QUIESCE_CANDIDATE,
     PRIORITY_CANDIDATE, RESOURCE_INCREASE_CANDIDATE,

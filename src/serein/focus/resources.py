@@ -183,91 +183,48 @@ def build_gpu_intent(domain_roles: list[DomainRole], evidence: FocusEvidence) ->
 
 
 # ---------------------------------------------------------------------------
-# Service / container / VM lifecycle (S6.5R Corrective A/B, Section 2-16/
-# 36-42/58-60)
+# Service / container / VM lifecycle (S6.5R/S6.5RM, Section 2-16/27/36-42/
+# 58-60)
 #
 # Mechanism availability, instance existence, instance running state, and
 # Serein ownership are four genuinely separate facts, never collapsed into
-# one boolean (Section 3). S6.5 never adds a new instance-level detector
-# (Section 42) - `podman ps`/`virsh list`/`systemctl status <service>` and
-# equivalents are all out of scope - so `instance_present` stays `None`
-# (genuinely unknown) for every target except `ai_runtime`, where the
-# runtime *binary itself* is the recognized instance (Section 5/38): a
-# single global runtime, not a per-workload container/VM S6.5 would need a
-# dedicated detector to observe. `managed_by_serein` is `False` everywhere
-# - no Apply engine has ever run, so Serein has created/owns nothing yet
-# (Section 13-14).
+# one boolean (Section 3). S6.5 currently has NO concrete instance-presence
+# detector for ANY lifecycle target (Section 11/27 of the S6.5RM
+# corrective) - not even ai_runtime: an earlier pass treated the AI runtime
+# *binary* itself as the recognized instance, but binary/tool presence
+# only ever proves a mechanism exists, never that a daemon is running, a
+# server process is up, a model is loaded, or any concrete runtime
+# instance exists (Section 1/3). `instance_present` therefore stays `None`
+# (genuinely unknown) for every one of the four targets, and no builder
+# here ever produces `instance_present=True` - S6.5 never adds a new
+# instance-level detector (`podman ps`/`virsh list`/`systemctl status
+# <service>`/`pgrep`/`ollama ps` and equivalents are all out of scope,
+# Section 4/43). `managed_by_serein` is `False` everywhere - no Apply
+# engine has ever run, so Serein has created/owns nothing yet (Section
+# 13-14/17).
+#
+# A future, separately-reviewed Focus runtime may add explicit adapters
+# that can actually prove instance_present/instance_running/
+# managed_by_serein for a specific target (a Serein-owned systemd unit, a
+# Serein-created container/VM) - only then would an instance-level intent
+# (QUIESCE_CANDIDATE/PRIORITY_CANDIDATE/RESOURCE_INCREASE_CANDIDATE/
+# RESOURCE_REDUCE_CANDIDATE) ever be valid; the vocabulary stays in
+# INSTANCE_LEVEL_INTENTS as future-compatible contract, unused today.
 # ---------------------------------------------------------------------------
-
-
-def _ai_runtime_lifecycle(role: DomainRole, evidence: FocusEvidence) -> LifecycleIntent:
-    """AI runtime binary presence (S4 `ollama`/`llama_cpp` capability
-    `installed`) proves a tool exists - never that a daemon is running
-    or a model is loaded (Section 5/37-38): `instance_running` stays
-    `None` regardless of `instance_present`."""
-    ollama = _capability_by_id(evidence.ai_capabilities.capabilities, "ollama")
-    llama_cpp = _capability_by_id(evidence.ai_capabilities.capabilities, "llama_cpp")
-    binary_present = bool((ollama and ollama.installed) or (llama_cpp and llama_cpp.installed))
-    reason_prefix = "Local AI runtime (Ollama/llama.cpp, S4 evidence)"
-
-    if not binary_present:
-        return LifecycleIntent(
-            kind="service", target="ai_runtime", domain=role.domain,
-            recognized_by_serein=True, mechanism_available=False,
-            instance_present=False, instance_running=None, managed_by_serein=False,
-            target_intent="KEEP", reversible=True, cost="low",
-            reason=f"{reason_prefix} is not detected - nothing to plan.",
-            status="SKIP",
-        )
-
-    if role.state == "primary":
-        return LifecycleIntent(
-            kind="service", target="ai_runtime", domain=role.domain,
-            recognized_by_serein=True, mechanism_available=True,
-            instance_present=True, instance_running=None, managed_by_serein=False,
-            target_intent="PRIORITY_CANDIDATE", reversible=True, cost="low",
-            reason=f"{reason_prefix} is installed and {role.domain} is the "
-            "primary focus - a priority candidate for a future runtime; "
-            "S6.5 never starts, stops, or reconfigures it. Whether a daemon "
-            "is actually running or a model is loaded remains unknown - "
-            "binary presence is never read as running state (Section 37).",
-            status="APPLY",
-        )
-    if role.state == "secondary":
-        return LifecycleIntent(
-            kind="service", target="ai_runtime", domain=role.domain,
-            recognized_by_serein=True, mechanism_available=True,
-            instance_present=True, instance_running=None, managed_by_serein=False,
-            target_intent="KEEP", reversible=True, cost="low",
-            reason=f"{reason_prefix} is installed and {role.domain} is "
-            "secondary - kept as-is, no change candidate.",
-            status="NOOP",
-        )
-    # idle or off - a future runtime could reduce/quiesce it, never
-    # destructively (Section 117: quiesce/unload, never delete). Valid
-    # here because instance_present=True (Section 36 invariant).
-    return LifecycleIntent(
-        kind="service", target="ai_runtime", domain=role.domain,
-        recognized_by_serein=True, mechanism_available=True,
-        instance_present=True, instance_running=None, managed_by_serein=False,
-        target_intent="QUIESCE_CANDIDATE", reversible=True, cost="medium",
-        reason=f"{reason_prefix} is installed but {role.domain} is "
-        f"{role.state} for this focus - a future runtime could quiesce it "
-        "to free resources for the primary focus; S6.5 never executes "
-        "this, and never proposes deleting any state.",
-        status="APPLY",
-    )
 
 
 def _mechanism_only_lifecycle(
     kind: str, target_name: str, role: DomainRole, mechanism_available: bool, reason_prefix: str
 ) -> LifecycleIntent:
-    """For targets where S6.5 has mechanism-readiness evidence but no
-    instance-level detector (cyber toolbox, cyber VM, Whonix - Section
-    6-9/39-41): `instance_present` stays `None` regardless of mechanism
-    state, and `target_intent` stays `KEEP` in every case - an instance-
-    level intent (QUIESCE_CANDIDATE/PRIORITY_CANDIDATE/etc.) is never
-    proposed without `instance_present is True` (Section 4/36/60)."""
+    """Every current lifecycle target (ai_runtime, cyber_toolbox,
+    cyber_vm, whonix) uses this one shape: S6.5 has mechanism-readiness
+    evidence but no instance-level detector for any of them (Section
+    4/6-9/11/39-41 of the S6.5RM corrective) - `instance_present` stays
+    `None` regardless of mechanism state, and `target_intent` stays
+    `KEEP` in every case - an instance-level intent (QUIESCE_CANDIDATE/
+    PRIORITY_CANDIDATE/etc.) is never proposed without
+    `instance_present is True` (Section 4/36/60), which no current
+    builder ever sets."""
     if not mechanism_available:
         return LifecycleIntent(
             kind=kind, target=target_name, domain=role.domain,
@@ -298,7 +255,20 @@ def build_lifecycle_intents(
     roles_by_domain = {role.domain: role for role in domain_roles}
     intents: list[LifecycleIntent] = []
 
-    intents.append(_ai_runtime_lifecycle(roles_by_domain["ai"], evidence))
+    ollama = _capability_by_id(evidence.ai_capabilities.capabilities, "ollama")
+    llama_cpp = _capability_by_id(evidence.ai_capabilities.capabilities, "llama_cpp")
+    ai_runtime_binary_present = bool(
+        (ollama and ollama.installed) or (llama_cpp and llama_cpp.installed)
+    )
+    intents.append(
+        _mechanism_only_lifecycle(
+            "service", "ai_runtime", roles_by_domain["ai"], ai_runtime_binary_present,
+            "Local AI runtime mechanism (S4 evidence: Ollama/llama.cpp "
+            "binary present) - this is tool presence, never proof a "
+            "runtime daemon, server process, or model-serving instance "
+            "was ever launched (S6.5RM Section 1/3)",
+        )
+    )
 
     cyber_toolbox = _capability_by_id(evidence.cyber_capabilities.capabilities, "container_toolbox")
     intents.append(

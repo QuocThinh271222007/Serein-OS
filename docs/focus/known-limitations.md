@@ -44,21 +44,27 @@ A future phase adding a new understood service (e.g. a dev-tier
 container/build daemon) would extend this list explicitly, never infer
 one from a fuzzy process name.
 
-## Instance-level lifecycle evidence exists for exactly one target (S6.5R)
+## Instance-level lifecycle evidence exists for no target (S6.5R/S6.5RM)
 
-Only `ai_runtime` can ever report `instance_present=True` - its
-recognized instance *is* the runtime binary. `cyber_toolbox`,
-`cyber_vm`, and `whonix` are permanently mechanism-only in this build:
-S6.5 has no instance-level detector for any of them (no `podman ps`,
-`virsh list`, or equivalent - deliberately out of scope, Section 42),
-so their `instance_present` stays `None` and their `target_intent`
-stays `KEEP` forever, regardless of mechanism readiness or focus role.
-A future phase that wants real toolbox-container/VM/Whonix-domain
-lifecycle candidates would need to add a genuinely new, carefully-
-reviewed instance-level detector to each subsystem (S5 for toolbox/VM,
-S6 for Whonix) - S6.5R deliberately did not do this itself, since
-adding detection scope was explicitly out of bounds for this
-corrective (`docs/focus/resource-intent.md`, `docs/focus/
+No current lifecycle target can ever report `instance_present=True`.
+`ai_runtime`, `cyber_toolbox`, `cyber_vm`, and `whonix` are all
+permanently mechanism-only in this build: S6.5 has no instance-level
+detector for any of them (no `podman ps`, `virsh list`, `ollama ps`,
+`pgrep`, `systemctl is-active`, or equivalent - deliberately out of
+scope, Section 42), so their `instance_present`/`instance_running`
+stay `None` and their `target_intent` stays `KEEP` forever, regardless
+of mechanism readiness or focus role. An earlier S6.5 pass treated the
+AI runtime binary's own presence as sufficient evidence that a
+recognized instance existed for `ai_runtime`; this was corrected
+(S6.5RM) - binary/tool presence only ever proves a mechanism exists,
+never that a daemon is running, a server process is up, a model is
+loaded, or any concrete runtime instance exists. A future phase that
+wants real ai_runtime/toolbox-container/VM/Whonix-domain lifecycle
+candidates would need to add a genuinely new, carefully-reviewed
+instance-level detector to each subsystem (S4 for ai_runtime, S5 for
+toolbox/VM, S6 for Whonix) - neither S6.5R nor S6.5RM did this, since
+adding detection scope was explicitly out of bounds for both
+correctives (`docs/focus/resource-intent.md`, `docs/focus/
 transition-model.md`).
 
 ## Private readiness's "complete boundary" set is fixed at three capabilities

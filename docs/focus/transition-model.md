@@ -59,20 +59,25 @@ FocusTransitionPlan(
 )
 ```
 
-## Lifecycle target semantics (S6.5R Corrective A/B) - which targets can even reach an instance action
+## Lifecycle target semantics (S6.5R/S6.5RM) - which targets can even reach an instance action
 
-Only `ai_runtime` can ever reach an instance-level `target_intent`
-(`QUIESCE_CANDIDATE`/`PRIORITY_CANDIDATE`) - its binary presence *is*
-the recognized instance (Section 5/38 of the corrective). `cyber_toolbox`,
-`cyber_vm`, and `whonix` are mechanism-only targets: S6.5 has no
+No current lifecycle target can reach an instance-level `target_intent`
+(`QUIESCE_CANDIDATE`/`PRIORITY_CANDIDATE`/`RESOURCE_INCREASE_CANDIDATE`/
+`RESOURCE_REDUCE_CANDIDATE`). `ai_runtime`, `cyber_toolbox`, `cyber_vm`,
+and `whonix` are all mechanism-only targets today: S6.5 has no
 instance-level detector for any of them (no `podman ps`, `virsh list`,
-or equivalent - Section 42), so `instance_present` stays `None` and
-`target_intent` stays `KEEP` regardless of mechanism readiness or focus
-role:
+`ollama ps`, `pgrep`, `systemctl is-active`, or equivalent - Section 42),
+so `instance_present`/`instance_running` stay `None` and `target_intent`
+stays `KEEP` regardless of mechanism readiness or focus role. An earlier
+S6.5 pass treated the AI runtime binary's own presence as the recognized
+instance for `ai_runtime`; this was corrected (S6.5RM) - binary/tool
+presence only ever proves a mechanism exists, never that a daemon is
+running, a server process is up, a model is loaded, or any concrete
+runtime instance exists:
 
 ```
-ai_runtime     - binary installed  -> instance_present=True  -> can reach
-                                        QUIESCE_CANDIDATE/PRIORITY_CANDIDATE
+ai_runtime     - binary installed        -> mechanism_available=True,
+                                              instance_present=None -> always KEEP
 cyber_toolbox  - engine+Distrobox present -> mechanism_available=True,
                                                instance_present=None -> always KEEP
 cyber_vm       - KVM/QEMU/libvirt ready    -> mechanism_available=True,
@@ -94,17 +99,19 @@ instance existence" section for the full four-fact model
 cpu:    ai primary -> idle,  cyber idle -> primary
 memory: ai high -> low,      cyber low -> high
 gpu:    "preferred"/ai -> "shared" (if a GPU is present) or unchanged (none present)
-lifecycle: ai_runtime -> QUIESCE_CANDIDATE (if the runtime binary is installed);
-           cyber_toolbox/cyber_vm stay KEEP even if their mechanism is ready
-           (Section 6-7/39-40 - mechanism readiness is never promoted to an
-           instance action)
+lifecycle: ai_runtime stays KEEP even if its runtime binary is installed;
+           cyber_toolbox/cyber_vm also stay KEEP even if their mechanism
+           is ready (Section 6-7/39-40 - mechanism readiness is never
+           promoted to an instance action, ai_runtime included since
+           S6.5RM)
 ```
 
 ## Cyber -> AI example
 
 Exact mirror for CPU/memory: `cyber` role goes `primary -> idle`, `ai`
-goes `idle -> primary`; `ai_runtime` (if its binary is installed) moves
-toward `PRIORITY_CANDIDATE`. `cyber_toolbox`/`cyber_vm` stay `KEEP`
+goes `idle -> primary`; `ai_runtime` stays `KEEP` even if its binary is
+installed (S6.5RM - no instance evidence exists to promote it toward
+`PRIORITY_CANDIDATE`). `cyber_toolbox`/`cyber_vm` also stay `KEEP`
 regardless of mechanism readiness - there is no toolbox/VM instance
 evidence to quiesce. `dev` remains `secondary` in both directions - it
 is never involved in the ai/cyber IDLE-vs-PRIMARY swap.

@@ -613,18 +613,87 @@ class TestLifecycleIntents:
         assert ai_runtime.status == "SKIP"
         assert ai_runtime.target_intent == "KEEP"
 
-    def test_ai_runtime_binary_installed_instance_present_running_unknown(self, tmp_path):
-        # S6.5R Corrective A, Section 5/38/58: binary presence is
-        # acceptable evidence of instance_present for ai_runtime
-        # specifically - it is the recognized instance itself; running
-        # state stays unknown regardless (Section 37).
+    def test_ai_runtime_binary_installed_is_mechanism_only(self, tmp_path):
+        # S6.5RM Section 1/3/32: binary/tool presence proves a
+        # mechanism exists only - never that a daemon/server process is
+        # running or a model is loaded. instance_present/
+        # instance_running both stay unknown, managed_by_serein stays
+        # False, and no instance-level action is ever proposed.
         runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
         evidence = _evidence(tmp_path, runner)
         policy = build_focus_policy("ai", evidence)
         ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
         assert ai_runtime.mechanism_available is True
-        assert ai_runtime.instance_present is True
+        assert ai_runtime.instance_present is None
         assert ai_runtime.instance_running is None
+        assert ai_runtime.managed_by_serein is False
+        assert ai_runtime.target_intent == "KEEP"
+        assert ai_runtime.status == "NOOP"
+
+    def test_ai_runtime_binary_absent_is_mechanism_unavailable(self, tmp_path):
+        # S6.5RM Section 5: binary absence still leaves instance_present
+        # unknown, not a definite False - S6.5 has no way to prove no
+        # externally-running instance exists either.
+        evidence = _evidence(tmp_path)  # nothing installed
+        policy = build_focus_policy("ai", evidence)
+        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
+        assert ai_runtime.mechanism_available is False
+        assert ai_runtime.instance_present is None
+        assert ai_runtime.instance_running is None
+        assert ai_runtime.target_intent == "KEEP"
+        assert ai_runtime.status == "SKIP"
+
+    def test_ai_primary_binary_installed_no_instance_action(self, tmp_path):
+        # S6.5RM Section 8/33: FOCUS=AI + Ollama installed must never
+        # produce PRIORITY_CANDIDATE from binary presence alone.
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("ai", evidence)
+        role = next(r for r in policy.domain_roles if r.domain == "ai")
+        assert role.state == "primary"
+        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
+        assert ai_runtime.target_intent == "KEEP"
+        assert ai_runtime.status == "NOOP"
+        assert ai_runtime.instance_present is None
+
+    def test_ai_idle_binary_installed_no_quiesce_action(self, tmp_path):
+        # S6.5RM Section 9/34: AI idle under a different primary focus +
+        # Ollama installed must never produce QUIESCE_CANDIDATE.
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("cyber", evidence)  # ai is idle here
+        role = next(r for r in policy.domain_roles if r.domain == "ai")
+        assert role.state == "idle"
+        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
+        assert ai_runtime.target_intent == "KEEP"
+        assert ai_runtime.target_intent != "QUIESCE_CANDIDATE"
+        assert ai_runtime.status == "NOOP"
+
+    def test_ai_never_reaches_off_state_under_current_readiness_rules(self, tmp_path):
+        # S6.5RM Section 35: no canonical target's role table ever
+        # assigns AI "off" (dev/ai/cyber/private all keep AI as
+        # primary/secondary/idle; balanced only assigns "off" when a
+        # domain's own readiness is "blocked", and AI readiness is
+        # never "blocked" per Section 78/S6.5R). There is therefore no
+        # reachable "AI off + binary installed" scenario to test against
+        # real policy construction - documented rather than fabricated.
+        evidence = _evidence(tmp_path)
+        for target in FOCUS_TARGETS:
+            policy = build_focus_policy(target, evidence)
+            role = next(r for r in policy.domain_roles if r.domain == "ai")
+            assert role.state != "off"
+
+    def test_ai_secondary_binary_installed_keep_only(self, tmp_path):
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        policy = build_focus_policy("dev", evidence)  # ai is secondary under dev
+        role = next(r for r in policy.domain_roles if r.domain == "ai")
+        assert role.state == "secondary"
+        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
+        assert ai_runtime.target_intent == "KEEP"
+        assert ai_runtime.instance_present is None
+        assert ai_runtime.instance_running is None
+        assert ai_runtime.managed_by_serein is False
 
     def test_cyber_toolbox_mechanism_available_but_no_instance_action(self, tmp_path):
         # S6.5R Corrective A, Section 6/39/58: Podman+Distrobox present
@@ -765,15 +834,43 @@ class TestInstanceActionInvariant:
                         f"with instance_present={lc.instance_present!r}"
                     )
 
-    def test_ai_runtime_idle_with_instance_present_is_a_valid_quiesce_candidate(self, tmp_path):
-        # Confirms the invariant is not simply "never propose instance
-        # actions" - it is "only propose them with real evidence."
-        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+    def test_current_lifecycle_instance_action_count_is_zero(self, tmp_path):
+        # S6.5RM Section 12/38: given current real evidence (no
+        # instance-level detector exists for any target), zero lifecycle
+        # intents anywhere may use an INSTANCE_LEVEL_INTENTS value -
+        # even with every mechanism binary/tool actually installed.
+        runner = FakeCommandRunner({
+            "ollama": _ok("ollama version 0.4.0"),
+            "podman": _ok("podman version 5.7.0"),
+            "distrobox": _ok("distrobox: 1.8.2.4"),
+        })
         evidence = _evidence(tmp_path, runner)
-        policy = build_focus_policy("cyber", evidence)  # ai is idle under cyber focus
-        ai_runtime = next(lc for lc in policy.lifecycle_intents if lc.target == "ai_runtime")
-        assert ai_runtime.target_intent == "QUIESCE_CANDIDATE"
-        assert ai_runtime.instance_present is True
+        instance_level_count = 0
+        for target in FOCUS_TARGETS:
+            policy = build_focus_policy(target, evidence)
+            for lc in policy.lifecycle_intents:
+                if lc.target_intent in INSTANCE_LEVEL_INTENTS:
+                    instance_level_count += 1
+        assert instance_level_count == 0
+
+    def test_instance_level_vocabulary_remains_structurally_valid(self):
+        # S6.5RM Section 14/39: INSTANCE_LEVEL_INTENTS must not be
+        # accidentally disabled forever - a synthetic LifecycleIntent
+        # using it is still a structurally valid object (this is a
+        # future-compatibility check only; it exercises no production
+        # code path that could ever construct one from real evidence).
+        from serein.focus.models import LifecycleIntent
+
+        synthetic = LifecycleIntent(
+            kind="service", target="ai_runtime", domain="ai",
+            recognized_by_serein=True, mechanism_available=True,
+            instance_present=True, instance_running=True, managed_by_serein=True,
+            target_intent="QUIESCE_CANDIDATE", reversible=True, cost="medium",
+            reason="synthetic future-runtime scenario, not real evidence",
+            status="APPLY",
+        )
+        assert synthetic.target_intent in INSTANCE_LEVEL_INTENTS
+        assert synthetic.instance_present is True
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +912,52 @@ class TestTransitionPlanner:
         }
         assert cpu_changes["cyber"] == ("primary", "idle")
         assert cpu_changes["ai"] == ("idle", "primary")
+
+    def test_ai_to_cyber_transition_never_quiesces_ai_runtime(self, tmp_path):
+        # S6.5RM Section 24/36: even with Ollama installed, AI -> Cyber
+        # must never contribute a QUIESCE_CANDIDATE lifecycle change for
+        # ai_runtime - resource intent still changes, lifecycle does not.
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        plan = build_focus_transition("ai", "cyber", evidence)
+        assert not any(
+            lc.target == "ai_runtime" and lc.target_intent == "QUIESCE_CANDIDATE"
+            for lc in plan.lifecycle_changes
+        )
+        cpu_changes = {
+            c.domain: (c.before, c.after) for c in plan.resource_changes if c.resource == "cpu"
+        }
+        assert cpu_changes["ai"] == ("primary", "idle")
+
+    def test_cyber_to_ai_transition_never_prioritizes_ai_runtime(self, tmp_path):
+        # S6.5RM Section 25/37: even with Ollama installed, Cyber -> AI
+        # must never contribute a PRIORITY_CANDIDATE lifecycle change
+        # for ai_runtime.
+        runner = FakeCommandRunner({"ollama": _ok("ollama version 0.4.0")})
+        evidence = _evidence(tmp_path, runner)
+        plan = build_focus_transition("cyber", "ai", evidence)
+        assert not any(
+            lc.target == "ai_runtime" and lc.target_intent == "PRIORITY_CANDIDATE"
+            for lc in plan.lifecycle_changes
+        )
+        cpu_changes = {
+            c.domain: (c.before, c.after) for c in plan.resource_changes if c.resource == "cpu"
+        }
+        assert cpu_changes["ai"] == ("idle", "primary")
+
+    def test_transitions_never_contribute_any_lifecycle_change_today(self, tmp_path):
+        # S6.5RM Section 23: empty lifecycle_changes is a valid,
+        # expected outcome given current evidence - no replacement
+        # action is ever invented to "keep output busy".
+        runner = FakeCommandRunner({
+            "ollama": _ok("ollama version 0.4.0"),
+            "podman": _ok("podman version 5.7.0"),
+            "distrobox": _ok("distrobox: 1.8.2.4"),
+        })
+        evidence = _evidence(tmp_path, runner)
+        for from_focus, to_focus in CANONICAL_TRANSITIONS:
+            plan = build_focus_transition(from_focus, to_focus, evidence)
+            assert plan.lifecycle_changes == []
 
     def test_ai_to_private_is_blocked_when_private_unavailable(self, tmp_path):
         evidence = _evidence(tmp_path)
@@ -1173,3 +1316,30 @@ class TestNoMutationRegressions:
         for from_focus, to_focus in CANONICAL_TRANSITIONS:
             transition = build_focus_transition(from_focus, to_focus, evidence)
             assert transition.runtime_enforcement is False
+
+    def test_no_new_instance_level_detector_in_focus_source(self):
+        # S6.5RM Section 4/43: this corrective narrows claims to
+        # existing evidence - it must not add a new AI-runtime (or any
+        # other) instance-level detector to reach that goal. Scoped to
+        # actual command-invocation shapes (runner.run([...]) argv
+        # literals), not bare substrings - doctor.py's own
+        # _FORBIDDEN_MUTATION_MARKERS legitimately contains the word
+        # "systemctl" as text to search *for*, which is not itself an
+        # invocation.
+        import pathlib
+
+        focus_src = pathlib.Path(__file__).resolve().parents[1] / "src" / "serein" / "focus"
+        forbidden_invocations = (
+            '"pgrep"', "'pgrep'", '"pidof"', "'pidof'",
+            '"ps",', "'ps',", '"lsof"', "'lsof'",
+            '"virsh", "list"', "'virsh', 'list'",
+            '"podman", "ps"', "'podman', 'ps'",
+            '"docker", "ps"', "'docker', 'ps'",
+            '"ollama", "ps"', "'ollama', 'ps'",
+            '"systemctl", "is-active", "ollama"', "'systemctl', 'is-active', 'ollama'",
+            '"ss",', "'ss',", '"curl"', "'curl'",
+        )
+        for py_file in focus_src.glob("*.py"):
+            text = py_file.read_text(encoding="utf-8")
+            for marker in forbidden_invocations:
+                assert marker not in text, f"{py_file.name}: found {marker!r}"
