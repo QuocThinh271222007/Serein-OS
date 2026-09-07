@@ -1496,12 +1496,15 @@ class TestLayerBWorkflow:
         assert "FREE_SPACE_AFTER_CLEANUP_KB" in cleanup["run"]
         assert "SPACE_RECLAIMED_KB" in cleanup["run"]
 
-    def test_preflight_threshold_is_justified_not_arbitrary(self, workflow):
+    def test_preflight_threshold_is_derived_not_arbitrary(self, workflow):
         steps = workflow["jobs"]["iso-smoke"]["steps"]
         preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
-        # the comment above the step documents the estimate; the check
-        # itself must not silently drop below a sane floor
-        assert "REQUIRED_KB=$((12 * 1024 * 1024))" in preflight["run"]
+        # the requirement must be computed from named components, never
+        # a bare literal like `REQUIRED_KB=$((12 * 1024 * 1024))` with
+        # no arithmetic connection to a documented peak - see
+        # TestLayerBWorkflow's Corrective D tests for the full
+        # coherence check.
+        assert "REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))" in preflight["run"]
 
     def test_build_step_uses_ephemeral_storage(self, workflow):
         steps = workflow["jobs"]["iso-smoke"]["steps"]
@@ -1520,6 +1523,130 @@ class TestLayerBWorkflow:
             "fetch-base-image.sh", "verify-base-image.sh", "build-iso.sh",
             "inspect-iso.sh", "boot-smoke.sh", "clean.sh",
         }
+
+    # -- S7.0RM2 Corrective B: stage-state fidelity, not artifact inference --
+
+    def test_build_step_has_an_id_for_outcome_tracking(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        build = next(
+            s for s in steps
+            if s.get("name") == "Build Serein Alpha ISO (production + QA variant)"
+        )
+        assert build.get("id") == "build"
+
+    def test_evidence_step_derives_stage_state_from_build_outcome_not_manifest_presence(
+        self, workflow
+    ):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        assemble = next(s for s in steps if s.get("name") == "Assemble Layer-B evidence")
+        script = assemble["run"]
+        assert "steps.build.outcome" in script
+        # the three real outcomes must each be handled explicitly
+        assert "success)" in script
+        assert "failure)" in script
+        # a skipped/cancelled build step must produce not_performed for
+        # BOTH stages, never "fail" - this is the exact real defect
+        assert "--production-build not_performed" in script
+        assert "--qa-build not_performed" in script
+        # a production failure must never claim QA was attempted
+        assert re.search(r"failure\)[\s\S]*?--qa-build not_performed", script)
+
+    def test_evidence_step_no_longer_infers_production_build_from_manifest_alone(
+        self, workflow
+    ):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        assemble = next(s for s in steps if s.get("name") == "Assemble Layer-B evidence")
+        script = assemble["run"]
+        # the old (buggy) pattern must be gone: production-build must
+        # never be decided by a bare `if [ -f manifest ]; then pass;
+        # else fail; fi` with no reference to the real step outcome
+        old_buggy_pattern = (
+            "ARGS+=(--production-build pass)\n"
+            "          else\n"
+            "            ARGS+=(--production-build fail)"
+        )
+        assert old_buggy_pattern not in script
+
+    # -- S7.0RM2 Corrective C: pinned vs. actual base metadata fidelity --
+
+    def test_pinned_base_metadata_step_present_and_early(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        names = [s.get("name") for s in steps]
+        pinned_index = names.index("Record pinned base metadata")
+        fetch_index = names.index("Fetch pinned base image (explicit, this job only)")
+        preflight_index = names.index("Disk space preflight")
+        # pinned metadata must be recorded before the earliest failure
+        # points (preflight, fetch) so it survives an early failure
+        assert pinned_index < preflight_index
+        assert pinned_index < fetch_index
+
+    def test_pinned_base_metadata_reads_committed_contract_file(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        pinned = next(s for s in steps if s.get("name") == "Record pinned base metadata")
+        assert "distribution/base-image.json" in pinned["run"]
+        assert "filename" in pinned["run"]
+        assert "expected_sha256" in pinned["run"]
+
+    def test_evidence_step_uses_pinned_metadata_not_conditional_fetch_output(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        assemble = next(s for s in steps if s.get("name") == "Assemble Layer-B evidence")
+        script = assemble["run"]
+        assert "steps.pinned-base.outputs.filename" in script
+        assert "steps.pinned-base.outputs.expected_sha256" in script
+
+    def test_actual_base_sha256_only_from_real_hash_step(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        base_sha = next(s for s in steps if s.get("name") == "Record actual base ISO sha256")
+        assert "sha256sum" in base_sha["run"]
+        assert base_sha.get("id") == "base-sha"
+
+    # -- S7.0RM2 Corrective D: coherent disk-preflight arithmetic --
+
+    def test_disk_preflight_arithmetic_is_internally_coherent(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        script = preflight["run"]
+
+        def _extract(varname):
+            match = re.search(rf"{varname}=(\d+)\b", script)
+            assert match, f"{varname} not found as a literal integer assignment"
+            return int(match.group(1))
+
+        extracted_tree = _extract("EXTRACTED_TREE_GIB")
+        production_iso = _extract("PRODUCTION_ISO_GIB")
+        qa_iso = _extract("QA_ISO_GIB")
+        margin = _extract("SAFETY_MARGIN_GIB")
+
+        # the derivation must be expressed in terms of the named
+        # components, never a disconnected magic number
+        assert "PEAK_GIB=$((EXTRACTED_TREE_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB))" in script
+        assert "REQUIRED_GIB=$((PEAK_GIB + SAFETY_MARGIN_GIB))" in script
+        assert "REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))" in script
+
+        computed_peak = extracted_tree + production_iso + qa_iso
+        computed_required = computed_peak + margin
+        assert computed_peak > 0
+        assert computed_required > computed_peak
+        # the previous S7.0RM defect: components summed to far more
+        # than the enforced requirement (e.g. 6+10+6+6+2=30 documented
+        # vs. 12 enforced) - guard against that class of mismatch by
+        # requiring the *enforced* requirement to be the documented
+        # components' own sum, not merely "at least" it.
+        required_kb_literal_present = "REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))" in script
+        assert required_kb_literal_present
+
+    def test_disk_preflight_no_longer_uses_old_disconnected_constant(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        # the old S7.0RM literal (12 GiB, unrelated to its own stated
+        # 6+8..10+6+6+2 components) must be gone
+        assert "REQUIRED_KB=$((12 * 1024 * 1024))" not in preflight["run"]
+
+    def test_disk_preflight_reports_available_and_required(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        assert "AVAILABLE_KB" in preflight["run"]
+        assert "REQUIRED_KB" in preflight["run"]
 
 
 # ---------------------------------------------------------------------------
@@ -1610,6 +1737,109 @@ class TestLayerBEvidence:
         for forbidden in (os.environ.get("USERNAME", "\0unset"), str(tmp_path)):
             if forbidden and forbidden != "\0unset":
                 assert forbidden not in serialized
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM2: end-to-end CLI reproduction of the real observed defects
+# ---------------------------------------------------------------------------
+
+
+class TestEvidenceCliEndToEnd:
+    """Exercises `python -m serein.distribution evidence` (and
+    `closure-gate`) exactly the way iso-smoke.yml now calls them, to
+    prove the real CLI wiring - not just the pure
+    ``assemble_layer_b_evidence`` function - handles the exact real
+    scenario a Layer-B run hit: an early ``base_fetch`` failure, with
+    the workflow passing ``--production-build not_performed
+    --qa-build not_performed`` (Corrective B) and real pinned metadata
+    from ``distribution/base-image.json`` even though nothing was ever
+    downloaded (Corrective C)."""
+
+    def test_early_base_fetch_failure_produces_not_performed_not_fail(self, tmp_path, capsys):
+        from serein.distribution.__main__ import main
+
+        out_path = tmp_path / "evidence.json"
+        argv = [
+            "evidence",
+            "--source-commit", "a" * 40,
+            "--failure-stage", "base_fetch",
+            "--failure-reason", "fetch-base-image.sh failed",
+            "--base-filename", "ubuntu-26.04.1-desktop-amd64.iso",
+            "--base-sha256-expected", "b" * 64,
+            "--base-sha256-actual", "",
+            "--production-build", "not_performed",
+            "--qa-build", "not_performed",
+            "--out", str(out_path),
+        ]
+        exit_code = main(argv)
+        assert exit_code == 0
+
+        data = json.loads(out_path.read_text())
+        # Corrective B: never "fail" for a stage that never began
+        assert data["production_build"] == "not_performed"
+        assert data["qa_build"] == "not_performed"
+        assert data["production_inspection"] == "not_performed"
+        assert data["qa_inspection"] == "not_performed"
+        assert data["qemu_boot"] == "not_performed"
+        # Corrective C: pinned metadata present even without a download
+        assert data["base_filename"] == "ubuntu-26.04.1-desktop-amd64.iso"
+        assert data["base_sha256_expected"] == "b" * 64
+        # actual/verified remain honestly absent/false - never fabricated
+        assert data["base_sha256_actual"] is None
+        assert data["base_verified"] is False
+
+    def test_production_failure_qa_never_attempted(self, tmp_path):
+        from serein.distribution.__main__ import main
+
+        out_path = tmp_path / "evidence.json"
+        argv = [
+            "evidence",
+            "--source-commit", "a" * 40,
+            "--failure-stage", "production_or_qa_build",
+            "--failure-reason", "build-iso.sh failed",
+            "--base-filename", "ubuntu-26.04.1-desktop-amd64.iso",
+            "--base-sha256-expected", "b" * 64,
+            "--base-sha256-actual", "b" * 64,
+            "--production-build", "fail",
+            "--qa-build", "not_performed",
+            "--out", str(out_path),
+        ]
+        assert main(argv) == 0
+        data = json.loads(out_path.read_text())
+        assert data["production_build"] == "fail"
+        assert data["qa_build"] == "not_performed"
+        assert data["base_verified"] is True  # real hashes matched
+
+    def test_closure_gate_cli_fails_closed_on_early_failure_evidence(self, tmp_path):
+        from serein.distribution.__main__ import main
+
+        evidence_path = tmp_path / "evidence.json"
+        main([
+            "evidence", "--source-commit", "a" * 40,
+            "--failure-stage", "base_fetch", "--failure-reason", "fetch failed",
+            "--base-filename", "ubuntu-26.04.1-desktop-amd64.iso",
+            "--base-sha256-expected", "b" * 64, "--base-sha256-actual", "",
+            "--production-build", "not_performed", "--qa-build", "not_performed",
+            "--out", str(evidence_path),
+        ])
+
+        exit_code = main([
+            "closure-gate", "--evidence", str(evidence_path),
+            "--expected-source-commit", "a" * 40,
+        ])
+        assert exit_code == 1
+
+    def test_inspect_and_boot_smoke_subcommands_are_registered(self):
+        from serein.distribution.__main__ import main
+
+        # argparse itself proves these subcommands exist and parse -
+        # both fail fast (missing required file/iso) without needing
+        # xorriso/qemu, which is exactly the point: CLI wiring is
+        # checked here, real tool execution is Layer B's job.
+        assert main(["inspect", "does-not-exist.iso"]) == 1
+        assert main([
+            "boot-smoke", "--iso", "does-not-exist.iso", "--require-uefi",
+        ]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1831,6 +2061,73 @@ def _fake_build_runner_without_grub():
         raise AssertionError(f"unexpected argv: {argv}")
 
     return runner
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM2 Corrective A: git executable-bit correctness
+# ---------------------------------------------------------------------------
+
+
+class TestGitExecutableModes:
+    """A real Layer-B run failed with `Permission denied` invoking
+    ``./distribution/scripts/fetch-base-image.sh`` because every direct
+    shell entrypoint under ``distribution/scripts/`` was tracked as
+    ``100644`` in the Git tree - a filesystem `chmod` alone cannot fix
+    this, since GitHub Actions materializes whatever mode the *Git
+    tree* records, not whatever a previous local checkout happened to
+    carry. This inspects the Git index directly (``git ls-files -s``),
+    never local filesystem permissions, which are not portable (this
+    suite also runs on Windows, where POSIX x-bit semantics do not
+    apply to the working copy at all) and would not have caught the
+    real defect."""
+
+    def _tracked_modes(self) -> dict[str, str]:
+        result = subprocess.run(
+            ["git", "ls-files", "-s", "distribution/scripts/"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        )
+        modes: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            match = re.match(r"^(\d{6})\s+\S+\s+\d+\t(.+)$", line)
+            if match:
+                modes[match.group(2)] = match.group(1)
+        return modes
+
+    def test_all_shell_entrypoints_are_git_executable(self):
+        # Dynamic, not a fixed literal list - any *.sh future addition
+        # under distribution/scripts/ must also carry 100755, so this
+        # regresses "loses its executable bit in the future" for
+        # scripts that do not exist yet, not only the six known today.
+        scripts_dir = REPO_ROOT / "distribution" / "scripts"
+        required = {
+            f"distribution/scripts/{p.name}" for p in scripts_dir.glob("*.sh")
+        }
+        assert required, "expected at least one *.sh entrypoint to check"
+
+        modes = self._tracked_modes()
+        for path in sorted(required):
+            assert path in modes, f"{path} is not tracked by git at all"
+            assert modes[path] == "100755", (
+                f"{path} has git tree mode {modes[path]!r}, expected '100755' - "
+                "a filesystem chmod alone does not fix this, the Git index entry "
+                "itself must carry the executable bit"
+            )
+
+    def test_known_six_entrypoints_explicitly(self):
+        # Belt-and-suspenders: the exact six scripts named in the
+        # corrective, checked by name so a rename/deletion is caught
+        # even if the dynamic glob above were ever satisfied trivially.
+        expected = {
+            "distribution/scripts/boot-smoke.sh": "100755",
+            "distribution/scripts/build-iso.sh": "100755",
+            "distribution/scripts/clean.sh": "100755",
+            "distribution/scripts/fetch-base-image.sh": "100755",
+            "distribution/scripts/inspect-iso.sh": "100755",
+            "distribution/scripts/verify-base-image.sh": "100755",
+        }
+        modes = self._tracked_modes()
+        for path, expected_mode in expected.items():
+            assert modes.get(path) == expected_mode
 
 
 # ---------------------------------------------------------------------------

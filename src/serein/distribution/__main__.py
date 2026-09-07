@@ -167,7 +167,7 @@ def _cmd_evidence(args: argparse.Namespace) -> int:
         source_commit=args.source_commit,
         failure_stage=args.failure_stage,
         failure_reason=args.failure_reason,
-        base_filename=args.base_filename,
+        base_filename=args.base_filename or None,
         base_sha256_expected=args.base_sha256_expected or None,
         base_sha256_actual=args.base_sha256_actual or None,
         production_iso_filename=prod["output"]["filename"] if prod else None,

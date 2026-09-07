@@ -78,6 +78,25 @@ jobs:
           fi
           echo "SOURCE_COMMIT=${ACTUAL_CHECKED_OUT_SHA}" >> "$GITHUB_ENV"
 
+      # S7.0RM2 Corrective C: distribution/base-image.json is committed
+      # and always present right after checkout - the pinned filename
+      # and expected sha256 are known EXPECTED/PINNED metadata
+      # regardless of whether the download ever happens or succeeds.
+      # Recorded this early (no `if:` needed - nothing before this can
+      # fail) so evidence assembled after ANY later failure still
+      # carries real, non-fabricated pinned values instead of empty
+      # strings. The ACTUAL downloaded file's hash is a completely
+      # separate, runtime-only fact - see "Record actual base ISO
+      # sha256" below, which only ever runs (and only ever can produce
+      # a real value) after a real download+verify succeeded.
+      - name: Record pinned base metadata
+        id: pinned-base
+        run: |
+          FILENAME="$(jq -r '.filename' distribution/base-image.json)"
+          EXPECTED_SHA="$(jq -r '.sha256' distribution/base-image.json)"
+          echo "filename=${FILENAME}" >> "$GITHUB_OUTPUT"
+          echo "expected_sha256=${EXPECTED_SHA}" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -132,27 +151,49 @@ jobs:
           echo "FREE_SPACE_AFTER_CLEANUP_KB=${FREE_AFTER_KB}"
           echo "SPACE_RECLAIMED_KB=$((FREE_AFTER_KB - FREE_BEFORE_KB))"
 
-      # S7.0RM Corrective A: the storage-efficient pipeline (single
-      # extraction tree, in-place QA transition, ephemeral base-ISO
-      # release right after extraction) has a documented, justified
-      # peak: base ISO (until released) + one extracted tree + up to
-      # two rebuilt ISOs existing briefly together, plus inspection
-      # scratch. This is NOT byte-exact - it is a conservative estimate
-      # with a safety margin, stated as such.
+      # S7.0RM2 Corrective D: the preflight requirement is derived from
+      # the ACTUAL maximum simultaneously-live large-object set in the
+      # real S7.0RM pipeline order, not an arbitrary rounded number.
       #
-      #   base ISO (~6 GiB, released after extraction+report capture)
-      #   + one extracted tree (~8-10 GiB uncompressed apparent size)
-      #   + production ISO (~6 GiB) + QA ISO (~6 GiB, both exist briefly
-      #     together at most once, since QA reuses the same extraction)
-      #   + ~2 GiB safety margin
-      #   ~= 12 GiB minimum, deliberately rounded up to 12 GiB required
+      # `xorriso -osirrox` extracts the ISO9660 tree's files exactly as
+      # stored - the live SquashFS payload inside is copied out as one
+      # still-compressed blob, never re-expanded - so the extracted
+      # tree's apparent size is close to the base ISO's own size, not
+      # several times larger.
       #
-      # (Down from an unjustified fixed 20 GiB in the S7.0R workflow.)
+      # With EPHEMERAL_STORAGE=1 (used below), the base ISO is released
+      # immediately after extraction + the El Torito report are
+      # captured - so it never coexists with either rebuilt ISO. But
+      # the production ISO is deliberately RETAINED on disk while the
+      # QA ISO is rebuilt (production must already be finalized and
+      # unaffected before the QA transition begins - see
+      # docs/distribution/iso-build.md) - so the true peak is the QA
+      # rebuild step, where the extracted tree, the finished production
+      # ISO, and the QA ISO being written all exist at once:
+      #
+      #   EXTRACTED_TREE_GIB (6) + PRODUCTION_ISO_GIB (6) + QA_ISO_GIB (6)
+      #   = PEAK_GIB (18)
+      #   + SAFETY_MARGIN_GIB (4, since these are rough size estimates,
+      #     not measured)
+      #   = REQUIRED_GIB (22)
+      #
+      # (A second, lower candidate peak - base ISO 6 GiB + extracted
+      # tree growing to 6 GiB during extraction, before
+      # ephemeral_storage releases the base ISO - is ~12 GiB, below the
+      # QA-rebuild peak above, so it does not drive the requirement.)
       - name: Disk space preflight
         run: |
           df -h .
+          EXTRACTED_TREE_GIB=6
+          PRODUCTION_ISO_GIB=6
+          QA_ISO_GIB=6
+          SAFETY_MARGIN_GIB=4
+          PEAK_GIB=$((EXTRACTED_TREE_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB))
+          REQUIRED_GIB=$((PEAK_GIB + SAFETY_MARGIN_GIB))
+          REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))
           AVAILABLE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
-          REQUIRED_KB=$((12 * 1024 * 1024))
+          echo "PEAK_GIB=${PEAK_GIB} (extracted tree + production ISO + QA ISO being written)"
+          echo "REQUIRED_GIB=${REQUIRED_GIB} (peak + ${SAFETY_MARGIN_GIB} GiB safety margin)"
           echo "AVAILABLE_KB=${AVAILABLE_KB}"
           echo "REQUIRED_KB=${REQUIRED_KB}"
           if [ "${AVAILABLE_KB}" -lt "${REQUIRED_KB}" ]; then
@@ -181,25 +222,37 @@ jobs:
             exit 1
           }
 
+      # Runtime-only fact: this step only ever runs after a real
+      # download + verify-base-image.sh already succeeded (normal
+      # sequential step failure propagation - no `if:` override here),
+      # so a real value only ever appears once the actual file has
+      # genuinely been hashed. Never fabricated, never fall back to
+      # the pinned/expected value (Corrective C).
       - name: Record actual base ISO sha256
         id: base-sha
         run: |
-          BASE_FILENAME="$(jq -r '.filename' distribution/base-image.json)"
-          EXPECTED_SHA="$(jq -r '.sha256' distribution/base-image.json)"
+          BASE_FILENAME="${{ steps.pinned-base.outputs.filename }}"
           ACTUAL_SHA="$(sha256sum "cache/upstream/${BASE_FILENAME}" | cut -d' ' -f1)"
           echo "ACTUAL_BASE_SHA256=${ACTUAL_SHA}"
-          echo "EXPECTED_BASE_SHA256=${EXPECTED_SHA}"
-          echo "filename=${BASE_FILENAME}" >> "$GITHUB_OUTPUT"
-          echo "expected=${EXPECTED_SHA}" >> "$GITHUB_OUTPUT"
           echo "actual=${ACTUAL_SHA}" >> "$GITHUB_OUTPUT"
 
       - name: Save real base el-torito report (evidence)
         run: |
-          BASE_FILENAME="$(jq -r '.filename' distribution/base-image.json)"
+          BASE_FILENAME="${{ steps.pinned-base.outputs.filename }}"
           xorriso -indev "cache/upstream/${BASE_FILENAME}" -report_el_torito as_mkisofs \
             > dist/el-torito-base-report.txt
 
+      # S7.0RM2 Corrective B: `id: build` lets the evidence-assembly
+      # step read this step's own real outcome
+      # (`steps.build.outcome`: success/failure/skipped) to determine
+      # production_build/qa_build - never inferred from "does a
+      # manifest file happen to exist", which conflated "stage never
+      # began" with "stage began and failed" (the real defect a prior
+      # run exposed: an early base_fetch failure produced
+      # production_build=fail/qa_build=fail even though neither stage
+      # had ever started).
       - name: Build Serein Alpha ISO (production + QA variant)
+        id: build
         run: |
           EPHEMERAL_STORAGE=1 ./distribution/scripts/build-iso.sh || {
             mkdir -p dist
@@ -278,9 +331,10 @@ jobs:
       - name: Assemble Layer-B evidence
         if: always()
         run: |
-          # S7.0RM Corrective B: every input here is optional/tolerant
-          # of a missing file - this step must always produce valid
-          # evidence, even when nothing past the disk preflight ever ran.
+          # S7.0RM Corrective B / S7.0RM2 Corrective B refinement: every
+          # input here is optional/tolerant of a missing file - this
+          # step must always produce valid evidence, even when nothing
+          # past the disk preflight ever ran.
           ARGS=(--source-commit "${SOURCE_COMMIT}" --out dist/s7-0-layer-b-evidence.json)
 
           if [ -f dist/.failure_stage ]; then
@@ -290,24 +344,61 @@ jobs:
             ARGS+=(--failure-reason "$(cat dist/.failure_reason)")
           fi
 
-          ARGS+=(--base-filename "${{ steps.base-sha.outputs.filename }}")
-          ARGS+=(--base-sha256-expected "${{ steps.base-sha.outputs.expected }}")
+          # Corrective C: pinned/expected metadata is always known from
+          # distribution/base-image.json (recorded in the always-run
+          # "Record pinned base metadata" step) - never empty, even
+          # before/without a real download. The actual hash is only
+          # ever real runtime evidence from "Record actual base ISO
+          # sha256", which itself only ever ran (and only ever produced
+          # a value) after a real download+verify succeeded.
+          ARGS+=(--base-filename "${{ steps.pinned-base.outputs.filename }}")
+          ARGS+=(--base-sha256-expected "${{ steps.pinned-base.outputs.expected_sha256 }}")
           ARGS+=(--base-sha256-actual "${{ steps.base-sha.outputs.actual }}")
 
           if [ -f dist/serein-alpha-26.04-amd64.iso.manifest.json ]; then
             ARGS+=(--production-manifest dist/serein-alpha-26.04-amd64.iso.manifest.json)
-            ARGS+=(--production-build pass)
-          else
-            ARGS+=(--production-build fail)
           fi
-          ARGS+=(--production-inspection "${{ steps.inspect-prod.outputs.status || 'not_performed' }}")
-
           if [ -f dist/serein-alpha-26.04-amd64-qa.iso.manifest.json ]; then
             ARGS+=(--qa-manifest dist/serein-alpha-26.04-amd64-qa.iso.manifest.json)
-            ARGS+=(--qa-build pass)
-          else
-            ARGS+=(--qa-build fail)
           fi
+
+          # Corrective B: derive production_build/qa_build from the
+          # build step's OWN real outcome (success/failure/skipped),
+          # never from "does a manifest file happen to exist" - a
+          # skipped build step (an earlier required step failed, e.g.
+          # base_fetch) means both stages genuinely never began, which
+          # must serialize as "not_performed", not "fail".
+          BUILD_OUTCOME="${{ steps.build.outcome }}"
+          case "${BUILD_OUTCOME}" in
+            success)
+              ARGS+=(--production-build pass)
+              if [ -f dist/serein-alpha-26.04-amd64-qa.iso.manifest.json ]; then
+                ARGS+=(--qa-build pass)
+              else
+                # the build step succeeded overall, but QA_BUILD was
+                # BLOCKED (e.g. no GRUB config candidate) - QA was
+                # genuinely attempted and did not complete, distinct
+                # from production's real success.
+                ARGS+=(--qa-build fail)
+              fi
+              ;;
+            failure)
+              ARGS+=(--production-build fail)
+              # run_build() never begins the QA transition until AFTER
+              # the production manifest is written, so a production
+              # failure means QA genuinely never started.
+              ARGS+=(--qa-build not_performed)
+              ;;
+            *)
+              # "skipped" (an earlier required step, e.g. base_fetch,
+              # already failed) or "cancelled" - the build step itself
+              # never ran at all.
+              ARGS+=(--production-build not_performed)
+              ARGS+=(--qa-build not_performed)
+              ;;
+          esac
+
+          ARGS+=(--production-inspection "${{ steps.inspect-prod.outputs.status || 'not_performed' }}")
           ARGS+=(--qa-inspection "${{ steps.inspect-qa.outputs.status || 'not_performed' }}")
 
           if [ -f dist/boot-smoke-result.json ]; then
