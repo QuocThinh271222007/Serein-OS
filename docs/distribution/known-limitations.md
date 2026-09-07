@@ -33,62 +33,81 @@
 - **Physical hardware boot not verified.** `REAL_PHYSICAL_BOOT=NOT_PERFORMED`
   - out of scope without a disposable physical machine (Section 96).
 
-## Real Layer B validation status - this implementation pass (S7.0R)
+## Real Layer B validation status (S7.0RM)
 
-This pass, like the original S7.0 pass before it, ran entirely inside a
-Windows/MSYS2 (Git Bash) development environment with no `xorriso`,
-`squashfs-tools`, `mtools`/`dosfstools`, `qemu-system-x86_64`,
-`pycdlib`, or `jq` installed, and no root/admin path to install them
-without user action. All five S7.0R correctives (A-E) are implemented
-and exercised by a fully injectable fake-`xorriso`/fake-QEMU Layer-A
-test suite (`tests/test_distribution.py`) - including a genuinely real,
-unmocked wheel build against this repository - but the *real* Layer-B
-sequence (download the actual ~6.0 GB ISO, build both real ISOs, run
-the strict inspector against real xorriso output, boot the QA ISO in
-real QEMU) has not been executed in this environment:
+**A real Layer-B run has now occurred.** After the S7.0R pass, an
+independent reviewer applied the `run-iso-smoke` label to PR #9,
+triggering `.github/workflows/iso-smoke.yml` for real on a
+GitHub-hosted `ubuntu-latest` runner:
+
+```text
+RUN_ID=34131219916
+RUN_NUMBER=2
+HEAD=fae55499ab992978347a1440f229c1e7d5620ed6
+EVENT=pull_request
+RESULT=FAILURE
+```
+
+The exact-head checkout worked correctly (`EXPECTED_SOURCE_SHA` ==
+`ACTUAL_CHECKED_OUT_SHA`, both `fae55499...`), confirming Corrective
+A's PR-trigger and exact-head model are sound. The run then failed at
+the **disk space preflight**: the runner had ~13 GiB free
+(`AVAILABLE_KB=13599352`) against the S7.0R workflow's fixed 20 GiB
+requirement, before any base ISO was ever downloaded. The subsequent
+evidence-assembly step then crashed with `FileNotFoundError` on a
+production manifest that legitimately never got written - a second,
+independent defect (Corrective B).
+
+**S7.0RM fixes both** (see `docs/distribution/iso-build.md`'s "Storage
+model" and this file's own "Implementation-scope limitations" below for
+exactly what changed) and adds Correctives C-G on top. This development
+environment still has no `xorriso`/`qemu`/`squashfs-tools` installed
+(unchanged from every prior pass this session), so the corrective code
+itself has only been validated via the fully injectable fake-`xorriso`/
+fake-QEMU Layer-A test suite (`tests/test_distribution.py`, 1199 tests
+passing) plus one genuinely real, unmocked wheel build against this
+repository - not against a second real Layer-B run:
 
 | Field | Status | Why |
 |---|---|---|
-| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **NOT_PERFORMED** | The real ~6.0 GB `ubuntu-26.04.1-desktop-amd64.iso` was never downloaded in this environment - only `SHA256SUMS`/`SHA256SUMS.gpg` (small text files) were fetched and GPG-verified, which authenticates the *pinned checksum value*, not the ISO's actual bytes. See `docs/distribution/security.md`. |
-| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **NOT_PERFORMED** | Requires the verified base ISO (above) plus `xorriso`, neither available here. |
-| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **NOT_PERFORMED** (real .iso, strict) / lenient structural inspection **DID** run against a fixture extracted tree (`distribution/test-fixtures/extracted-tree-ok/`, all checks pass) | No real built ISO exists to inspect yet; the strict inspector's logic is proven against a fully-faked `xorriso` (`tests/test_distribution.py::TestStrictInspector`), not real tool output. |
-| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **NOT_PERFORMED** | Same blocker - the QA-variant rebuild step (`qa_boot.prepare_qa_variant` + a second `xorriso -as mkisofs`) is proven against the real fixture tree's real `grub.cfg` (`tests/test_distribution.py::TestQaBoot`), never against a real base image's GRUB config. |
-| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** | `qemu-system-x86_64` is not installed in this environment; no ISO exists to boot regardless. |
+| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **NOT_PERFORMED** (this pass) | The real run above never reached the download step (blocked at preflight). The ~6.0 GB ISO has still never been downloaded from this development environment either. |
+| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **NOT_PERFORMED** | Same blocker. |
+| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **NOT_PERFORMED** (real .iso, strict) / lenient structural inspection **DID** run against a fixture extracted tree, all checks pass | The strict inspector's logic is proven against a fully-faked `xorriso` (`tests/test_distribution.py::TestStrictInspector`), never real tool output. |
+| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **NOT_PERFORMED** | The in-place QA transition (Corrective A/B) is proven against the real fixture tree's real `grub.cfg`, never a real base image's GRUB config. |
+| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** | No ISO exists to boot yet. The marker-aware monitor (Corrective D) is proven with a fully faked `Popen`/clock (`tests/test_distribution.py::TestBootSmoke`), never a real QEMU process. |
 | `REAL_INSTALLER_REACHABILITY` | **NOT_PERFORMED** | Depends on the above. |
-| `REAL_UEFI_BOOT` | **NOT_PERFORMED** | No OVMF firmware image available. |
+| `REAL_UEFI_BOOT` | **NOT_PERFORMED** | No OVMF firmware image available locally; `--require-uefi` fail-closed logic is unit-tested, never exercised against real OVMF. |
 | `REAL_BIOS_BOOT` | **NOT_PERFORMED** | No QEMU available. |
 | `REAL_SECURE_BOOT` | **NOT_PERFORMED** | No Secure-Boot-capable test environment. |
 | `REAL_PHYSICAL_BOOT` | **NOT_PERFORMED** | No disposable physical machine. |
 
 **A WSL2 Ubuntu-24.04 environment is present on this machine** with real
 network access and ~895 GB free disk - genuinely capable of running the
-full Layer B pipeline (`apt install xorriso squashfs-tools qemu-system-x86
-ovmf jq`, then the real fetch/verify/build/inspect/boot-smoke sequence).
-It was not used in this pass because installing packages there requires
-`sudo`, which requires a password this session does not have and should
-not request interactively - see `docs/distribution/s7-roadmap.md` for
-how to complete Layer B as an explicit follow-up once that one blocker
-is cleared (a human running one `apt-get install` command via `!` is
-the only missing step).
+full Layer B pipeline locally. Not used in this pass for the same
+reason as every prior pass this session: installing packages there
+requires `sudo`, which requires a password this session does not have
+and should not request interactively.
 
-**`.github/workflows/iso-smoke.yml` is now PR-runnable** (S7.0R
-Corrective A - opt in with the `run-iso-smoke` label, or trigger it
-manually), which is the intended way to actually obtain real Layer-B
-evidence before merge. It has not been run in this pass: this
-repository's `gh` CLI remains unavailable in this environment
-(consistent with every prior phase this session), so neither applying
-the label nor manually dispatching the workflow was possible from here.
+**PR #9 retains the `run-iso-smoke` label.** Per Section 51 of the
+S7.0RM corrective, `iso-smoke.yml` already supports `pull_request:
+synchronize` while the label remains attached - pushing this
+corrective's commits should automatically trigger a new Layer-B run on
+the new exact HEAD, with no separate action needed. This repository's
+`gh` CLI remains unavailable in this environment (consistent with every
+prior phase this session), so this pass could not itself observe that
+new run's outcome.
 
 ```text
-S7_0R_LAYER_B_TRIGGER_READY=true
-S7_0R_LAYER_B_RUN=NOT_PERFORMED_EXTERNAL_TRIGGER_REQUIRED
+S7_0RM_LAYER_B_TRIGGER_READY=true
+S7_0RM_LAYER_B_RUN=NOT_PERFORMED_FROM_THIS_ENVIRONMENT (auto-triggered by push; outcome must be observed externally)
 ```
 
-Per Section 51/79: **`S7_0_READY_FOR_MERGE=NO`** until Layer B evidence
-above turns to real PASS results - this document states that blocker
-honestly rather than fabricating success. The independent reviewer is
-expected to apply the `run-iso-smoke` label (or manually dispatch the
-workflow) and observe the real run.
+Per Section 74: **`S7_0_READY_FOR_MERGE=NO`** until a Layer-B run
+against the exact final S7.0RM commit turns every `REAL_*` field above
+to a genuine PASS - this document states that blocker honestly rather
+than fabricating success. The independent reviewer should watch the
+automatically-triggered run (or re-apply/re-trigger it if needed) on
+the new HEAD.
 
 ## Implementation-scope limitations (this alpha pass specifically)
 
@@ -102,13 +121,20 @@ workflow) and observe the real run.
   the actual `-report_el_torito` output (the workflow already does
   this, to `dist/el-torito-base-report.txt`) and confirm or correct
   this marker list.
-- **The QEMU boot-smoke harness does not terminate early on a positive
-  marker.** Section 49 of the S7.0R corrective explicitly makes this
-  optional ("You may improve... do not sacrifice log integrity") - the
-  harness still runs for its full bounded timeout even after a success
-  marker appears in the log, rather than killing QEMU immediately. A
-  future pass could add early termination without changing the
-  positive-evidence contract.
+- **Resolved in S7.0RM**: the QEMU boot-smoke harness now terminates
+  immediately once a positive marker is observed (Corrective D), rather
+  than running for its full bounded timeout regardless - see
+  `docs/distribution/boot-validation.md`.
+- **The ephemeral-runner-cleanup allowlist has not been validated
+  against a real `ubuntu-latest` runner's actual installed SDK paths.**
+  `/usr/local/lib/android`, `/usr/share/dotnet`, `/opt/ghc`,
+  `/usr/local/.ghcup`, `/usr/share/swift` are GitHub's own
+  commonly-documented preinstalled tool locations, not independently
+  confirmed present-and-large on the specific runner image this
+  workflow uses - the cleanup step existence-checks each one and skips
+  silently if absent, so an inaccurate guess only means *less* space is
+  reclaimed, never an error, but the actual `SPACE_RECLAIMED_KB` this
+  produces has not been observed from a real run yet.
 - **`SOURCE_DATE_EPOCH` is not yet threaded through the actual `xorriso`
   invocation.** `BuildManifest.source_date_epoch` exists as a schema
   field and hook (Section 18), but `run_build` does not currently

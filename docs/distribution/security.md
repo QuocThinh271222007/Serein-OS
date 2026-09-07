@@ -1,4 +1,4 @@
-# Distribution Security Model (S7.0; Layer-B workflow hardening in S7.0R)
+# Distribution Security Model (S7.0; Layer-B workflow hardening in S7.0R/S7.0RM)
 
 ## Layer-B CI trust model (S7.0R Corrective A)
 
@@ -16,6 +16,45 @@ checkout step pins the exact PR head SHA
 a dedicated verification step fails the job if the checked-out SHA
 ever disagrees with that expected value - so a build manifest's
 provenance can never silently drift from the reviewed commit.
+
+## Ephemeral runner SDK cleanup (S7.0RM Corrective A, Section 10-12)
+
+A real Layer-B run failed a disk-space preflight on a stock
+GitHub-hosted runner (~13 GiB free). Reducing peak pipeline storage was
+the primary fix (`docs/distribution/iso-build.md`'s "Storage model"),
+but the workflow also reclaims a small, exact allowlist of large
+preinstalled SDK trees this build never uses:
+
+```
+/usr/local/lib/android
+/usr/share/dotnet
+/opt/ghc
+/usr/local/.ghcup
+/usr/share/swift
+```
+
+Every removal is scoped and verified before it happens:
+
+- **`runner.environment == 'github-hosted'` only** - this step never
+  runs on a self-hosted runner or a developer machine (`if:` at the
+  step level, not just documented intent).
+- **Exact-path match, never a glob.** Each candidate is
+  `realpath -m`'d and compared against itself and a literal `case`
+  allowlist before `rm -rf --one-file-system` ever runs on it - no
+  `rm -rf /opt/*`, no `rm -rf /usr/local/*`, no deleting an
+  environment variable's value unchecked.
+- **Existence-checked first** - a candidate that isn't present is
+  silently skipped, never treated as an error.
+- **Never touches** the Python `setup-python` installed, `xorriso`,
+  `qemu-system-x86`, or `ovmf` - those are exactly what this job needs.
+- **Logged before/after** - `FREE_SPACE_BEFORE_CLEANUP_KB`/
+  `FREE_SPACE_AFTER_CLEANUP_KB`/`SPACE_RECLAIMED_KB` are printed so the
+  reclaimed space is real, observable evidence, not an assumption.
+
+This is `EPHEMERAL_CI_BUILD_HOST_CLEANUP`, categorically distinct from
+`SEREIN_TARGET_HOST_MUTATION` (Section 12-13) - it never runs against
+any host Serein itself would ever manage, and this repository performs
+zero mutation of that kind regardless.
 
 ## Checksum + signature trust chain (Section 10-11)
 
