@@ -6,7 +6,7 @@ ecosystem. It orchestrates and configures mature upstream components on top
 of Ubuntu LTS for local AI workloads, software development, cybersecurity
 research, and privacy-oriented workflows.
 
-**Current development phase: S5 — Cybersecurity Workspace.** Serein OS
+**Current development phase: S6 — Veil / Privacy Isolation.** Serein OS
 is not yet a usable Linux distribution ISO — disk/image production is
 S7's job, not this phase's. S1 (complete) added the desktop
 *integration layer*: a declarative KDE Plasma package manifest,
@@ -28,22 +28,31 @@ hardware presence with CUDA/ROCm readiness (`serein ai capabilities`),
 and produces a deterministic, evidence-based install plan for drivers,
 CUDA/ROCm, PyTorch, Transformers, and local inference runtimes (Ollama,
 llama.cpp) with no hidden execution (`serein ai plan [component]`). S5
-extends the existing hardware `cyber` profile into a real cybersecurity
-workspace: it classifies which tools belong on the daily host (light
-network/capture/reverse-engineering diagnostics), which belong in an
-isolated Distrobox/Podman toolbox (specialized/risky tooling — password
-audit, exploit frameworks, wireless auditing, web-security suites), and
-which require a full VM boundary (Kali, untrusted binaries, kernel
-labs) — `serein cyber status`/`capabilities`/`plan [component]`/
-`doctor`. Packet-capture *privilege* is modeled separately from tool
-presence (`dumpcap -D`, read-only, never a real capture); Serein is not
-Kali Linux and never automates an offensive action. **No driver,
-CUDA/ROCm package, Python package, model file, cyber tool, container,
-or VM is ever installed/created/captured/scanned by this repository**
-— see `docs/ai/architecture.md`, `docs/cyber/architecture.md`,
-`docs/development/architecture.md`, `docs/hardware/architecture.md`,
-and `docs/desktop/installation-plan.md` for exactly which parts of the
-install lifecycle exist today versus remain future work.
+(complete) extended the existing hardware `cyber` profile into a real
+cybersecurity workspace: it classifies which tools belong on the daily
+host (light network/capture/reverse-engineering diagnostics), which
+belong in an isolated Distrobox/Podman toolbox (specialized/risky
+tooling — password audit, exploit frameworks, wireless auditing,
+web-security suites), and which require a full VM boundary (Kali,
+untrusted binaries, kernel labs) —
+`serein cyber status`/`capabilities`/`plan [component]`/`doctor`.
+Packet-capture *privilege* is modeled separately from tool presence
+(`dumpcap -D`, read-only, never a real capture); Serein is not Kali
+Linux and never automates an offensive action. S6 adds a privacy
+isolation workspace ("Veil"): Tor client, Tor Browser, DNS-leak, and
+Whonix Gateway/Workstation capability modeling and deterministic
+planning (`serein veil status`/`capabilities`/`plan [tor|workspace|
+whonix]`/`doctor`) — privacy is an explicit, opt-in workspace, never an
+invisible global side effect; normal host networking, DNS, firewall
+rules, and proxy settings are never mutated by this phase. **No driver,
+CUDA/ROCm package, Python package, model file, cyber tool, Tor daemon,
+Tor Browser/Whonix image, container, VM, or network namespace is ever
+installed/created/captured/scanned/downloaded by this repository** —
+see `docs/ai/architecture.md`, `docs/cyber/architecture.md`,
+`docs/veil/architecture.md`, `docs/development/architecture.md`,
+`docs/hardware/architecture.md`, and `docs/desktop/installation-plan.md`
+for exactly which parts of the install lifecycle exist today versus
+remain future work.
 
 ## Status
 
@@ -58,7 +67,9 @@ container) and known limitations are documented under
 (NVIDIA/AMD/Intel, PyTorch, local inference, security) and known
 limitations are documented under [`docs/ai/`](docs/ai/). Cybersecurity
 host/toolbox/VM tiering, packet-capture privilege modeling, and known
-limitations are documented under [`docs/cyber/`](docs/cyber/).
+limitations are documented under [`docs/cyber/`](docs/cyber/). Veil
+privacy-isolation architecture, threat model, Tor/Whonix strategy, and
+known limitations are documented under [`docs/veil/`](docs/veil/).
 
 ## Repository maturity
 

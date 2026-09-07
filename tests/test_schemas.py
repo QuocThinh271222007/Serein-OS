@@ -30,6 +30,10 @@ from serein.hardware.doctor import run_hardware_checks
 from serein.hardware.planner import VALID_PROFILES, build_hardware_plan
 from serein.hardware.probe import probe_hardware
 from serein.profiles.models import ProfileManifest
+from serein.veil.capabilities import build_veil_capabilities
+from serein.veil.doctor import run_veil_checks
+from serein.veil.planner import VALID_COMPONENTS as VEIL_VALID_COMPONENTS
+from serein.veil.planner import build_veil_plan
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMAS_DIR = REPO_ROOT / "schemas"
@@ -55,6 +59,8 @@ def _load_schema(name: str) -> dict:
         "ai-capabilities.schema.json",
         "cyber-plan.schema.json",
         "cyber-capabilities.schema.json",
+        "veil-plan.schema.json",
+        "veil-capabilities.schema.json",
     ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:
@@ -215,4 +221,29 @@ def test_cyber_focused_plan_validates_against_schema(component: str) -> None:
 def test_cyber_doctor_report_validates_against_schema() -> None:
     schema = _load_schema("doctor-report.schema.json")
     report = run_cyber_checks()
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+def test_veil_capabilities_validates_against_schema() -> None:
+    schema = _load_schema("veil-capabilities.schema.json")
+    report = build_veil_capabilities()
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+def test_veil_plan_validates_against_schema() -> None:
+    schema = _load_schema("veil-plan.schema.json")
+    plan = build_veil_plan()
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+@pytest.mark.parametrize("component", list(VEIL_VALID_COMPONENTS))
+def test_veil_focused_plan_validates_against_schema(component: str) -> None:
+    schema = _load_schema("veil-plan.schema.json")
+    plan = build_veil_plan(component)
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+def test_veil_doctor_report_validates_against_schema() -> None:
+    schema = _load_schema("doctor-report.schema.json")
+    report = run_veil_checks()
     jsonschema.validate(instance=report.to_dict(), schema=schema)

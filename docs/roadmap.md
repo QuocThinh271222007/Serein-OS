@@ -85,7 +85,7 @@ exactly what "implemented" means at this phase. CUDA/PyTorch
 installation into the developer's own host never happens; live GPU
 runtime evidence is out of scope for this pass (`docs/ai/known-limitations.md`).
 
-## S5 — Cybersecurity *(this repository, in progress)*
+## S5 — Cybersecurity *(complete, merged to main)*
 
 Host/toolbox/VM tool tiering for cybersecurity workflows — network
 diagnostics, packet-capture privilege modeling, reverse engineering,
@@ -109,11 +109,28 @@ classifies and plans, it never automates an offensive action. Real
 container/VM provisioning, and any full-Kali or malware-analysis VM
 image, remain future work (S7/S8-adjacent, not scheduled).
 
-## S6 — Veil / Privacy
+## S6 — Veil / Privacy *(this repository, in progress)*
 
-Tor/Whonix-style privacy workflow isolation, kept separate from the
-trusted host per the security model. Not declared as a profile yet in S0
-(will be added when this phase starts).
+Tor client, Tor Browser, DNS-leak, private-workspace, and Whonix
+Gateway/Workstation capability modeling and deterministic planning -
+kept separate from the trusted host per the security model. Privacy is
+an explicit, opt-in workspace boundary, never an invisible global side
+effect: normal host networking, DNS, firewall rules, and proxy settings
+remain untouched unless a user explicitly enters a Veil workspace. Adds
+`serein veil status`, `serein veil capabilities [--json]`,
+`serein veil doctor [--json]`, and
+`serein veil plan [tor|workspace|whonix] [--json]`. See
+[`docs/veil/`](veil/architecture.md) for the full design and
+[ADR-0021](adr/0021-veil-privacy-is-opt-in-workspace.md) through
+[ADR-0024](adr/0024-no-direct-whonix-workstation-clearnet-egress.md).
+**No Tor daemon is started, no system DNS/firewall/proxy is mutated, no
+Tor Browser or Whonix image is ever downloaded, no VM/container/network
+namespace is ever created, and no external network probe (Tor
+connectivity check, public-IP lookup) is ever performed by this
+repository** - see `docs/veil/architecture.md` for exactly what
+"implemented" means at this phase. No profile is registered for S6 -
+see `docs/veil/architecture.md` for why. Real workspace/VM provisioning
+remains future work (S7/S8-adjacent, not scheduled).
 
 ## S7 — Distribution
 

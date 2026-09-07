@@ -126,3 +126,20 @@ jobs:
           # runner should always exit 0 here.
           serein cyber doctor
           serein cyber doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: Veil CLI smoke test
+        run: |
+          serein veil status
+          serein veil capabilities
+          serein veil capabilities --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein veil plan
+          serein veil plan --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein veil plan tor
+          serein veil plan workspace
+          serein veil plan whonix
+          # veil doctor never FAILs merely because no Tor/Whonix tooling
+          # is installed (see docs/veil/architecture.md) — a stock CI
+          # runner should always exit 0 here. No Tor daemon, network,
+          # KVM, browser, root, or Whonix image is required.
+          serein veil doctor
+          serein veil doctor --json | python -c "import json,sys; json.load(sys.stdin)"
