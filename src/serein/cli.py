@@ -49,6 +49,11 @@ from serein.hardware.probe import probe_hardware
 from serein.hardware.storage_policy import detect_storage_policy
 from serein.hardware.thermal import detect_thermal
 from serein.profiles.registry import list_profiles
+from serein.veil.capabilities import build_veil_capabilities
+from serein.veil.doctor import run_veil_checks
+from serein.veil.planner import VALID_COMPONENTS as VEIL_VALID_COMPONENTS
+from serein.veil.planner import build_veil_plan
+from serein.veil.status import build_veil_status
 
 _CAPABILITY_LABELS = {
     "cpu_governor_control": "CPU governor control",
@@ -109,6 +114,19 @@ _CYBER_CAPABILITY_LABELS = {
     "wireless_tooling": "Wireless tooling",
     "container_toolbox": "Container toolbox",
     "vm_isolation": "VM isolation",
+}
+
+_VEIL_CAPABILITY_LABELS = {
+    "tor_client": "Tor client",
+    "tor_socks": "torsocks",
+    "tor_browser": "Tor Browser",
+    "private_browser_profile": "Private browser profile",
+    "dns_isolation": "DNS isolation",
+    "tor_only_routing": "Tor-only routing",
+    "kill_switch": "Kill switch",
+    "private_workspace": "Private workspace",
+    "whonix_vm": "Whonix VM",
+    "vm_privacy_boundary": "VM privacy boundary",
 }
 
 
@@ -639,6 +657,89 @@ def _cmd_cyber_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_veil_status(_args: argparse.Namespace) -> int:
+    status = build_veil_status()
+    print("SEREIN VEIL")
+    print()
+    print("Tor")
+    print(_tool_line("tor", status.tor.binary))
+    print(f"  service        {_yes_no_unknown(status.tor.service_active)}")
+    print(f"  SOCKS          {_yes_no_unknown(status.tor.config.socks_port_configured)}")
+    print(f"  control        {_yes_no_unknown(status.tor.config.control_port_configured)}")
+    print(f"  usable         {_yes_no_unknown(status.tor.usable)}")
+    print(_tool_line("torsocks", status.tor.torsocks))
+    print(_tool_line("nyx", status.tor.nyx))
+    print(_tool_line("obfs4proxy", status.tor.obfs4proxy))
+    print()
+    print("Browser")
+    print(_tool_line("Tor Browser launcher", status.tor_browser.launcher))
+    print("  isolated profile no (S6 never creates one)")
+    print()
+    print("Leak protection")
+    print(f"  DNS isolation  {_yes_no_unknown(status.dns.dns_isolation_proven)}")
+    print(f"  kill switch    {_yes_no_unknown(status.kill_switch.usable)}")
+    print()
+    print("Workspace")
+    print(f"  privacy level  {status.workspace.privacy_level}")
+    print(f"  usable         {_yes_no_unknown(status.workspace.usable)}")
+    print()
+    print("Whonix")
+    print(f"  VM ready       {_yes_no_unknown(status.whonix.vm_readiness.usable)}")
+    print(f"  Gateway image  {_yes_no_unknown(status.whonix.gateway_image_present)}")
+    print(f"  Workstation image {_yes_no_unknown(status.whonix.workstation_image_present)}")
+    print(f"  topology       {_yes_no_unknown(status.whonix.usable)}")
+    return 0
+
+
+def _cmd_veil_doctor(args: argparse.Namespace) -> int:
+    report = run_veil_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN VEIL DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_veil_capabilities(args: argparse.Namespace) -> int:
+    report = build_veil_capabilities()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN VEIL CAPABILITIES")
+    print()
+    for capability in report.capabilities:
+        label = _VEIL_CAPABILITY_LABELS.get(capability.id, capability.id)
+        usable = _yes_no_unknown(capability.usable)
+        print(f"{label:<24}available={_yes_no_unknown(capability.available):<9}usable={usable}")
+    return 0
+
+
+def _cmd_veil_plan(args: argparse.Namespace) -> int:
+    plan = build_veil_plan(getattr(args, "component", None))
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    header = "SEREIN VEIL PLAN"
+    if getattr(args, "component", None):
+        header += f" - {args.component}"
+    print(header)
+    print()
+    for step in plan.actions:
+        target = f" -> {step.target}" if step.target else ""
+        current = f" (current: {step.current})" if step.current else ""
+        print(f"  [{step.status:<7}] {step.component}.{step.action}: {step.tool}{target}{current}")
+        print(f"            reason: {step.reason}")
+        print(
+            f"            risk: {step.risk} | reversible: {'yes' if step.reversible else 'no'} | "
+            f"requires_root: {'yes' if step.requires_root else 'no'} | source: {step.source}"
+        )
+        print(f"            verify: {step.verification}")
+    return 0
+
+
 def _cmd_profile_list(args: argparse.Namespace) -> int:
     profiles = list_profiles()
     if args.json:
@@ -875,6 +976,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     cyber_plan_parser.set_defaults(func=_cmd_cyber_plan)
+
+    veil_parser = subparsers.add_parser("veil", help="Privacy isolation workspace")
+    veil_subparsers = veil_parser.add_subparsers(dest="veil_command", required=True)
+
+    veil_subparsers.add_parser(
+        "status", help="Show Tor/privacy-workspace/Whonix state"
+    ).set_defaults(func=_cmd_veil_status)
+
+    veil_doctor_parser = veil_subparsers.add_parser(
+        "doctor", help="Run Veil-level diagnostics"
+    )
+    veil_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    veil_doctor_parser.set_defaults(func=_cmd_veil_doctor)
+
+    veil_capabilities_parser = veil_subparsers.add_parser(
+        "capabilities", help="Show which privacy mechanisms Serein can provision"
+    )
+    veil_capabilities_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    veil_capabilities_parser.set_defaults(func=_cmd_veil_capabilities)
+
+    veil_plan_parser = veil_subparsers.add_parser(
+        "plan", help="Show the Veil privacy plan"
+    )
+    veil_plan_parser.add_argument(
+        "component", nargs="?", choices=VEIL_VALID_COMPONENTS, default=None,
+        help="Show only actions for this component (tor, workspace, whonix)",
+    )
+    veil_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    veil_plan_parser.set_defaults(func=_cmd_veil_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
