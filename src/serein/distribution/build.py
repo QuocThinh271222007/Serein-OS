@@ -1,30 +1,37 @@
 """The single canonical Serein ISO build entrypoint (S7.0 Section 13;
-wheel embedding, clean workspace, and QA variant added by S7.0R).
+wheel embedding, clean workspace, and QA variant added by S7.0R;
+storage-efficient sequencing added by S7.0RM Corrective A).
 
 ``run_build`` is what ``distribution/scripts/build-iso.sh`` and
 ``python -m serein.distribution build`` both call - there is exactly one
-build pipeline, not several competing paths. It never runs implicitly
-(no import of this module triggers a build), never downloads anything
-(the base image must already be fetched and verified - see
-``serein.distribution.base``), and fails closed at the first
-unverified/unsafe step rather than continuing best-effort.
+build pipeline, not several competing paths (Section 9 of the S7.0RM
+corrective forbids a second "ci-special" build script). It never runs
+implicitly (no import of this module triggers a build), never
+downloads anything (the base image must already be fetched and
+verified - see ``serein.distribution.base``), and fails closed at the
+first unverified/unsafe step rather than continuing best-effort.
 
-Pipeline (Sections 6, 21-28, 29-34, 35, 53-54 of the S7.0R corrective):
+Pipeline (storage-aware ordering - Section 48 of the S7.0RM corrective):
 
     verify base checksum
     -> reset extraction workspace (guaranteed empty - Corrective D)
     -> extract base ISO (rootless, read-only source)
+    -> capture the base image's own El Torito report (needs base_iso)
+    -> [ephemeral_storage only] release the cached base ISO - it is
+       never needed again after extraction + the report above
     -> apply static overlay (allowlisted destinations only)
     -> build + content-verify the Serein wheel (Corrective C)
-    -> assemble resource payload + wheel artifact
+    -> assemble resource payload + wheel artifact, copy into the tree
     -> write dynamic media marker + payload manifest
-    -> copy payload (resources + wheel) into the extracted tree
-    -> derive real boot flags from the extracted tree's own base image
-    -> rebuild canonical production ISO with xorriso
+    -> rebuild CANONICAL production ISO with xorriso (bytes finalized)
     -> record production build manifest + sha256
-    -> prepare + rebuild QA serial-boot variant ISO (Corrective B)
+    -> transition the SAME extraction in place into QA boot form
+       (Corrective B/A - no second multi-GB tree copy; every file
+       outside the GRUB config + checksum catalog is hash-verified
+       unchanged, or the QA step is blocked, never silently unsafe)
+    -> rebuild QA ISO reusing the same boot flags
     -> record QA build manifest + sha256 (best-effort - QA_BUILD may be
-       BLOCKED without failing the production build)
+       BLOCKED without failing the already-finalized production build)
 """
 
 from __future__ import annotations
@@ -52,7 +59,12 @@ from serein.distribution.models import (
 from serein.distribution.overlay import apply_overlay
 from serein.distribution.pathsafety import resolve_within
 from serein.distribution.payload import build_wheel, inspect_wheel_contents, wheel_artifact
-from serein.distribution.qa_boot import QaBootError, prepare_qa_variant
+from serein.distribution.qa_boot import (
+    QaBootError,
+    QaProtectedFileMutationError,
+    transition_to_qa_in_place,
+)
+from serein.distribution.storage import release_base_iso
 from serein.distribution.workspace import reset_extracted_workspace
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -76,10 +88,6 @@ class BuildPaths:
     @property
     def extracted_dir(self) -> Path:
         return self.work_dir / "extracted"
-
-    @property
-    def qa_extracted_dir(self) -> Path:
-        return self.work_dir / "extracted-qa"
 
     @property
     def qa_output_iso(self) -> Path:
@@ -157,6 +165,7 @@ def run_build(
     source_commit: str = "",
     subprocess_runner: object = subprocess.run,
     build_qa_variant: bool = True,
+    ephemeral_storage: bool = False,
 ) -> BuildResult:
     """Run the full build pipeline and return both the production and
     (if not blocked) QA build manifests.
@@ -166,6 +175,16 @@ def run_build(
     the same positional/``check`` signature; it is used for every
     external tool invocation this pipeline makes (extraction, wheel
     build, El Torito report, both ISO rebuilds).
+
+    ``ephemeral_storage=True`` (Section 8-9 of the S7.0RM corrective)
+    deletes the cached base ISO from ``cache/upstream/`` immediately
+    after it is no longer needed (extraction + the El Torito report
+    both already captured) - intended **only** for an ephemeral CI
+    runner's Layer-B job, never for a normal developer build, which
+    must keep its verified cache. The canonical distribution builder
+    stays the single shared pipeline either way (Section 9 - "do not
+    create two competing build pipelines"); this is one explicit
+    keyword argument, not a parallel script.
     """
     if not source_commit:
         raise BuildError("source_commit is required - a build must record real provenance")
@@ -191,6 +210,17 @@ def run_build(
     reset_extracted_workspace(paths.work_dir, paths.extracted_dir)
     _run(subprocess_runner, build_extract_command(base_iso, paths.extracted_dir))
 
+    # El Torito report captured right after extraction, while base_iso
+    # still exists - this is the last pipeline step that needs it, so
+    # ephemeral_storage can release the ~6 GB file immediately after,
+    # before the two ISO rebuilds (the phase with the highest disk
+    # pressure) ever begin.
+    report_result = _run(subprocess_runner, build_report_command(base_iso), capture=True)
+    boot_flags = parse_el_torito_report(report_result)
+
+    if ephemeral_storage:
+        release_base_iso(base_iso, paths.cache_dir)
+
     overlay_source = repo_root / "distribution" / "overlay"
     apply_overlay(overlay_source, paths.extracted_dir)
 
@@ -200,9 +230,6 @@ def run_build(
     payload_manifest_sha256 = _copy_payload_into_tree(
         paths.extracted_dir, repo_root, source_commit, spec, wheel_path
     )
-
-    report_result = _run(subprocess_runner, build_report_command(base_iso), capture=True)
-    boot_flags = parse_el_torito_report(report_result)
 
     paths.output_iso.parent.mkdir(parents=True, exist_ok=True)
     rebuild_cmd = build_rebuild_command(
@@ -222,13 +249,22 @@ def run_build(
     if not build_qa_variant:
         return BuildResult(production=production_manifest, qa=None)
 
+    # Production ISO bytes are already finalized on disk above - only
+    # now may the QA transition begin (Section 6's required invariant).
     try:
-        qa_result = prepare_qa_variant(paths.extracted_dir, paths.qa_extracted_dir)
+        transition_to_qa_in_place(paths.extracted_dir)
+    except QaProtectedFileMutationError as exc:
+        # A genuine safety violation (something outside the GRUB
+        # config/checksum catalog changed) - never silently degrade to
+        # "QA blocked, production still fine"; the production ISO is
+        # already finalized and unaffected, but this signals the QA
+        # transition logic itself is unsafe and must fail loudly.
+        raise BuildError(f"QA transition safety check failed: {exc}") from exc
     except QaBootError as exc:
         return BuildResult(production=production_manifest, qa=None, qa_blocked_reason=str(exc))
 
     qa_rebuild_cmd = build_rebuild_command(
-        qa_result.qa_extracted_dir, boot_flags, paths.qa_output_iso, VOLUME_ID
+        paths.extracted_dir, boot_flags, paths.qa_output_iso, VOLUME_ID
     )
     _run(subprocess_runner, qa_rebuild_cmd)
 

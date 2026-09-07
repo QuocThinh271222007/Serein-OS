@@ -1,13 +1,9 @@
-"""QA-only serial boot variant (S7.0R Corrective B).
+"""QA-only serial boot variant (S7.0R Corrective B; storage-efficient
+in-place transition added by S7.0RM Corrective A).
 
 A template GRUB entry existing in Git (``distribution/boot/qa-serial-entry.cfg``)
 never proves the *built* media actually selects it - this module makes
-that real. It builds a second, QA-only ISO
-(``serein-alpha-<release>-<arch>-qa.iso``) from the **same** extracted
-base + overlay + payload as the canonical production ISO
-(``serein.distribution.build.run_build`` copies the already-assembled
-production extraction tree rather than re-extracting/re-overlaying), and
-patches only the discovered GRUB boot configuration to:
+that real. It patches the discovered GRUB boot configuration to:
 
 - add a new, distinctly-titled QA menu entry that reuses the *real*
   ``linux``/``initrd`` paths found in the base image's own default
@@ -21,9 +17,26 @@ patches only the discovered GRUB boot configuration to:
 GRUB config discovery is fail-closed (Section 14): if none of the
 known candidate paths exist in the extracted tree,
 :func:`discover_grub_config` raises :class:`QaBootError` rather than
-guessing a path from an old tutorial. The canonical production ISO is
-completely unaffected - it is built first, from its own untouched
-extraction, before this module ever runs.
+guessing a path from an old tutorial.
+
+Two ways to apply this:
+
+- :func:`transition_to_qa_in_place` (used by
+  ``serein.distribution.build.run_build`` as of S7.0RM) - patches the
+  **same** extraction directory the canonical production ISO was
+  already, immutably, built from. This is the storage-efficient path a
+  real CI runner needs (Section 6-7 of the S7.0RM corrective): no
+  second multi-GB tree copy. Safe only because the production ISO's
+  bytes are already finalized before this ever runs, and because every
+  file outside the one GRUB config (plus an internal checksum catalog,
+  if present) is hash-verified unchanged before vs. after - any
+  unexpected mutation of the SquashFS, kernel, initramfs, payload, or
+  wheel raises :class:`QaProtectedFileMutationError` rather than
+  silently shipping corrupted QA media.
+- :func:`prepare_qa_variant` - the original copy-based transform,
+  still available (and still tested) for callers that specifically
+  want an independent QA tree rather than mutating the production
+  extraction (e.g. exploratory local use).
 """
 
 from __future__ import annotations
@@ -56,6 +69,86 @@ class QaBootError(ValueError):
     """Raised when a QA boot variant cannot be safely prepared - e.g.
     no known GRUB config candidate exists in the extracted tree
     (``QA_BUILD=BLOCKED``, never guessed - Section 14)."""
+
+
+class QaProtectedFileMutationError(ValueError):
+    """Raised when an in-place QA transition would touch (or did touch)
+    a file outside the explicit GRUB-config/checksum-catalog allowlist
+    - e.g. the SquashFS, kernel, initramfs, payload, or wheel. Fail
+    closed rather than ship media whose non-boot-config content
+    silently diverged from what production inspection already
+    verified."""
+
+
+@dataclass(frozen=True)
+class QaTransitionResult:
+    """Result of :func:`transition_to_qa_in_place` - no
+    ``qa_extracted_dir`` field, since it is the same directory the
+    production ISO was already built from."""
+
+    grub_config_relative_path: str
+    qa_entry_title: str
+    checksum_catalog_updated: bool
+
+
+def _protected_file_manifest(extracted_dir: Path, excluded_relative: set[str]) -> dict[str, str]:
+    """sha256 of every file under ``extracted_dir`` except the paths in
+    ``excluded_relative`` - deliberately generic (every file, not a
+    named list of "kernel"/"squashfs" paths) so it catches an
+    unexpected mutation anywhere, not only in the specific files this
+    module happens to know about."""
+    import hashlib
+
+    manifest: dict[str, str] = {}
+    for path in sorted(extracted_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(extracted_dir).as_posix()
+        if relative in excluded_relative:
+            continue
+        manifest[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return manifest
+
+
+def transition_to_qa_in_place(extracted_dir: Path) -> QaTransitionResult:
+    """Patch ``extracted_dir`` (the SAME directory the canonical
+    production ISO was already, immutably, built from) into QA boot
+    form, storage-efficiently - no second multi-GB tree copy
+    (S7.0RM Corrective A).
+
+    Every file except the discovered GRUB config and an internal
+    checksum catalog (if present) is hash-verified byte-identical
+    before and after - any other change raises
+    :class:`QaProtectedFileMutationError` and leaves the caller unable
+    to proceed to a QA rebuild on unverified content.
+    """
+    grub_relative = discover_grub_config(extracted_dir)
+    catalog_relative = "md5sum.txt"
+    excluded = {grub_relative, catalog_relative}
+
+    before = _protected_file_manifest(extracted_dir, excluded)
+
+    grub_path = extracted_dir / grub_relative
+    original_text = grub_path.read_text(encoding="utf-8")
+    qa_entry_text = derive_qa_menuentry(original_text)
+    patched_text = install_qa_entry_as_default(original_text, qa_entry_text)
+    grub_path.write_text(patched_text, encoding="utf-8")
+
+    catalog_updated = update_checksum_catalog_if_present(extracted_dir, grub_relative)
+
+    after = _protected_file_manifest(extracted_dir, excluded)
+    if before != after:
+        differing = {k for k in before if before[k] != after.get(k)}
+        changed = sorted(set(before) ^ set(after) | differing)
+        raise QaProtectedFileMutationError(
+            f"QA transition modified protected files it must never touch: {changed}"
+        )
+
+    return QaTransitionResult(
+        grub_config_relative_path=grub_relative,
+        qa_entry_title=QA_ENTRY_TITLE,
+        checksum_catalog_updated=catalog_updated,
+    )
 
 
 @dataclass(frozen=True)

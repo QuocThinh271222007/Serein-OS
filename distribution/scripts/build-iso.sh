@@ -13,6 +13,10 @@
 # the expected PR feature-head SHA before calling this script - Section
 # 6-7 of the S7.0R corrective). Local/default usage derives it from
 # `git rev-parse HEAD` as before.
+#
+# Set EPHEMERAL_STORAGE=1 to delete the cached base ISO once no longer
+# needed (S7.0RM Corrective A) - ephemeral CI runners only, never a
+# normal developer build; leave unset for local use.
 
 set -euo pipefail
 
@@ -34,4 +38,11 @@ echo "==> Verifying base image before build (fail-closed)"
 
 SOURCE_COMMIT="${SOURCE_COMMIT:-$(git rev-parse HEAD)}"
 echo "==> Building Serein Alpha ISO from commit ${SOURCE_COMMIT}"
-"${PYTHON_BIN}" -m serein.distribution build --source-commit "${SOURCE_COMMIT}"
+
+BUILD_ARGS=(--source-commit "${SOURCE_COMMIT}")
+if [ "${EPHEMERAL_STORAGE:-}" = "1" ]; then
+    echo "==> EPHEMERAL_STORAGE=1 - cached base ISO will be released once no longer needed"
+    BUILD_ARGS+=(--ephemeral-storage)
+fi
+
+"${PYTHON_BIN}" -m serein.distribution build "${BUILD_ARGS[@]}"
