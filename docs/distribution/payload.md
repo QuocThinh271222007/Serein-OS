@@ -33,21 +33,30 @@ the payload has been installed into any target OS (Section 55) - see
      data files).
 
 2. **The built wheel** (`serein.distribution.payload.build_wheel`,
-   `python -m build --wheel`) - `src/serein/**`, which is where the AI
-   (`src/serein/ai/`), Cyber (`src/serein/cyber/`), Veil
+   `python -m build --wheel --no-isolation`) - `src/serein/**`, which is
+   where the AI (`src/serein/ai/`), Cyber (`src/serein/cyber/`), Veil
    (`src/serein/veil/`), and Focus (`src/serein/focus/`) subsystems keep
    their declarative manifests *as Python modules* rather than separate
-   data trees. Building the wheel proves "AI manifests, Cyber manifests,
-   Veil resources" (Section 23) are packageable without duplicating that
-   logic as a second, parallel data format. This is a deliberate,
-   separate step from resource-entry collection - never invoked by
-   `pytest`/`ruff`/`mypy`, only by the real build pipeline
-   (`serein.distribution.build.run_build` does not currently call it by
-   default in this alpha pass; see
-   `docs/distribution/known-limitations.md` for exactly what a real
-   build embeds today vs. what remains future work). Never uploaded
-   anywhere - the project stays `Private :: Do Not Upload`
-   (`pyproject.toml`).
+   data trees. As of S7.0R, `serein.distribution.build.run_build` calls
+   `build_wheel` and `inspect_wheel_contents` as part of every canonical
+   build and embeds the result via `wheel_artifact` at
+   `serein/payload/packages/<wheel filename>` - real media assembly,
+   not merely a helper function available somewhere (Section 21-22 of
+   the S7.0R corrective). `--no-isolation` keeps this fast and
+   network-free (this interpreter's already-installed `setuptools`/
+   `wheel`, never an isolated build environment needing a PyPI fetch) -
+   never invoked by `pytest`/`ruff`/`mypy` themselves, since neither
+   imports `build.run_build` with its wheel-building behavior active
+   without a caller opting in. Never uploaded anywhere - the project
+   stays `Private :: Do Not Upload` (`pyproject.toml`).
+
+   `PayloadArtifact` (`entry` + `source_path`) is the abstraction that
+   makes this safe: the public payload manifest only ever contains
+   `entry` (path/sha256/size_bytes); `source_path` (the wheel's real,
+   build-host-specific location under `build/work/wheel/`) is
+   build-time-only and never serialized anywhere -
+   `tests/test_distribution.py::TestWheelPayload::test_wheel_artifact_source_path_never_in_manifest_dict`
+   regresses this directly.
 
 ## Exclusions (Section 24)
 

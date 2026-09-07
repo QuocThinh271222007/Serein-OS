@@ -1,4 +1,21 @@
-# Distribution Security Model (S7.0)
+# Distribution Security Model (S7.0; Layer-B workflow hardening in S7.0R)
+
+## Layer-B CI trust model (S7.0R Corrective A)
+
+`.github/workflows/iso-smoke.yml` uses `pull_request` (never
+`pull_request_target`) so it never runs with write-capable repository
+secrets against untrusted feature-branch code; `permissions: contents:
+read` is the only permission the workflow requests, and no repository
+secret is referenced anywhere in it
+(`tests/test_distribution.py::TestLayerBWorkflow::test_no_secrets_referenced`
+regresses this). It only ever runs on an explicit `workflow_dispatch`
+or on a pull request an authorized user has deliberately labeled
+`run-iso-smoke` - never on an arbitrary PR's normal commits. The
+checkout step pins the exact PR head SHA
+(`github.event.pull_request.head.sha`, not the default merge ref), and
+a dedicated verification step fails the job if the checked-out SHA
+ever disagrees with that expected value - so a build manifest's
+provenance can never silently drift from the reviewed commit.
 
 ## Checksum + signature trust chain (Section 10-11)
 

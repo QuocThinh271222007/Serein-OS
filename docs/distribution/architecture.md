@@ -35,19 +35,30 @@ reproducible Serein Alpha media
 
 ```
 base.py       pinned base-image contract + fail-closed checksum verification
-payload.py    resource-entry collection (hashed) + wheel build (subprocess, explicit)
+payload.py    resource-entry collection (hashed) + real wheel build/content-check
+              (embedded in every canonical build as of S7.0R)
 overlay.py    allowlisted overlay application onto an extracted ISO tree
 iso.py        boot-flag derivation (from the real base image's own el-torito
               report) + xorriso extract/rebuild command construction
+workspace.py  guarantees the extraction workspace starts empty every build
+              (S7.0R Corrective D)
+qa_boot.py    derives and installs a QA-only serial-console boot entry into a
+              second, separate ISO variant (S7.0R Corrective B)
 build.py      the single canonical build pipeline (run_build) - orchestrates
-              the above, fails closed at the first unsafe/unverified step
+              the above, fails closed at the first unsafe/unverified step,
+              returns both the production and QA build manifests
 manifest.py   build-manifest assembly + <iso>.manifest.json/.sha256 recording
-inspect.py    read-only structural inspection (extracted tree or real .iso)
+inspect.py    structural inspection - lenient (extracted tree) and strict,
+              closure-grade (real .iso, S7.0R Corrective E)
 bootsmoke.py  bounded QEMU boot-validation harness, positive-marker only
+evidence.py   compact Layer-B evidence JSON assembly (S7.0R Corrective A)
 safety.py     static autoinstall-safety and credential-scan regressions
 pathsafety.py shared traversal/symlink-escape/safe-cleanup primitives
 status.py     read-only `serein distribution status` builder
 ```
+
+See `docs/distribution/iso-build.md` for the canonical-vs-QA-variant
+model and the full S7.0R pipeline stage list.
 
 Nothing in this list downloads anything or runs a build as a side
 effect of import - see Section 12 ("no silent network downloads") and
@@ -86,12 +97,16 @@ only. Making the latter true is S7.1/S7.2 territory - see
   command construction against fixtures. No network, no multi-GB
   download, no xorriso/qemu required.
 - **Layer B** (explicit tooling only -
-  `distribution/scripts/fetch-base-image.sh` through `boot-smoke.sh`):
-  the real download, checksum/signature verification, ISO build, ISO
-  inspection, and QEMU boot smoke. Never run implicitly. See
-  `docs/distribution/boot-validation.md` and
-  `docs/distribution/known-limitations.md` for this pass's actual
-  Layer B evidence and blockers.
+  `distribution/scripts/fetch-base-image.sh` through `boot-smoke.sh`,
+  or the `.github/workflows/iso-smoke.yml` CI workflow): the real
+  download, checksum/signature verification, ISO build (production +
+  QA variant), strict ISO inspection, and QEMU boot smoke. As of
+  S7.0R, this can run on a PR (opt-in via the `run-iso-smoke` label,
+  never automatically) as well as manually - see
+  `docs/distribution/boot-validation.md` for the exact trigger model.
+  Still never runs implicitly, and never on a normal commit without
+  the label. See `docs/distribution/known-limitations.md` for this
+  pass's actual Layer B evidence and blockers.
 
 ## Privacy/Cyber/Focus boundaries preserved on media (Sections 64-66)
 
