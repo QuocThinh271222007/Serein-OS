@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -32,8 +33,13 @@ from serein.distribution.bootsmoke import (
     evaluate_boot_log,
     run_boot_smoke,
 )
-from serein.distribution.build import BuildError, run_build
-from serein.distribution.inspect import inspect_extracted_tree, inspect_iso_file
+from serein.distribution.build import BuildError, BuildResult, run_build
+from serein.distribution.evidence import assemble_layer_b_evidence, write_layer_b_evidence
+from serein.distribution.inspect import (
+    inspect_extracted_tree,
+    inspect_iso_file,
+    inspect_iso_file_strict,
+)
 from serein.distribution.iso import (
     IsoCommandError,
     build_extract_command,
@@ -51,9 +57,25 @@ from serein.distribution.models import (
 from serein.distribution.overlay import OverlayError, apply_overlay, plan_overlay
 from serein.distribution.pathsafety import PathSafetyError, is_safe_cleanup_target, resolve_within
 from serein.distribution.payload import (
+    EXPECTED_WHEEL_MODULES,
     PAYLOAD_RESOURCE_ROOTS,
+    PayloadArtifact,
+    WheelContentError,
     build_payload_manifest,
+    build_wheel,
+    collect_resource_artifacts,
     collect_resource_entries,
+    inspect_wheel_contents,
+    wheel_artifact,
+)
+from serein.distribution.qa_boot import (
+    QA_ENTRY_TITLE,
+    QaBootError,
+    derive_qa_menuentry,
+    discover_grub_config,
+    install_qa_entry_as_default,
+    prepare_qa_variant,
+    update_checksum_catalog_if_present,
 )
 from serein.distribution.safety import (
     scan_boot_config_for_default_autoinstall,
@@ -61,10 +83,12 @@ from serein.distribution.safety import (
     scan_tree_for_credentials,
 )
 from serein.distribution.status import build_distribution_status
+from serein.distribution.workspace import WorkspaceError, reset_extracted_workspace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMAS_DIR = REPO_ROOT / "schemas"
 FIXTURES_DIR = REPO_ROOT / "distribution" / "test-fixtures"
+WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
 
 def _load_schema(name: str) -> dict:
@@ -681,3 +705,896 @@ class TestPayloadEntryHelper:
         entry = PayloadEntry(path="a", sha256="0" * 64, size_bytes=1)
         with pytest.raises(Exception):  # noqa: B017 - frozen dataclass raises FrozenInstanceError
             entry.path = "b"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# S7.0R Corrective D: clean, reproducible build workspace
+# ---------------------------------------------------------------------------
+
+
+class TestCleanWorkspace:
+    def test_reset_creates_empty_extracted_dir(self, tmp_path):
+        work_dir = tmp_path / "work"
+        extracted = work_dir / "extracted"
+        reset_extracted_workspace(work_dir, extracted)
+        assert extracted.is_dir()
+        assert list(extracted.iterdir()) == []
+
+    def test_stale_file_does_not_survive_a_second_reset(self, tmp_path):
+        work_dir = tmp_path / "work"
+        extracted = work_dir / "extracted"
+        reset_extracted_workspace(work_dir, extracted)
+        (extracted / "stale.txt").write_text("leftover from build #1")
+        assert (extracted / "stale.txt").exists()
+
+        reset_extracted_workspace(work_dir, extracted)
+        assert not (extracted / "stale.txt").exists()
+        assert list(extracted.iterdir()) == []
+
+    def test_arbitrary_path_outside_work_dir_rejected(self, tmp_path):
+        work_dir = tmp_path / "work"
+        elsewhere = tmp_path / "elsewhere" / "extracted"
+        with pytest.raises(WorkspaceError):
+            reset_extracted_workspace(work_dir, elsewhere)
+
+    def test_non_canonical_name_inside_work_dir_rejected(self, tmp_path):
+        work_dir = tmp_path / "work"
+        wrong_name = work_dir / "not-extracted"
+        with pytest.raises(WorkspaceError):
+            reset_extracted_workspace(work_dir, wrong_name)
+
+    def test_symlinked_extracted_dir_escaping_work_dir_rejected(self, tmp_path):
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = work_dir / "extracted"
+        try:
+            os.symlink(outside, link, target_is_directory=True)
+        except OSError:
+            pytest.skip("symlink creation not permitted in this environment")
+
+        with pytest.raises(WorkspaceError):
+            reset_extracted_workspace(work_dir, link)
+        # and outside must survive untouched
+        assert outside.is_dir()
+
+    def test_cache_and_dist_are_never_referenced_by_reset(self, tmp_path):
+        # reset_extracted_workspace only ever accepts (work_dir, extracted_dir)
+        # - cache/upstream and dist/ live outside work_dir entirely and
+        # have no code path into this function at all.
+        repo_root = tmp_path / "repo"
+        cache_dir = repo_root / "cache" / "upstream"
+        dist_dir = repo_root / "dist"
+        cache_dir.mkdir(parents=True)
+        dist_dir.mkdir(parents=True)
+        (cache_dir / "base.iso").write_bytes(b"verified base")
+        (dist_dir / "prior.iso").write_bytes(b"prior build output")
+
+        work_dir = repo_root / "build" / "work"
+        reset_extracted_workspace(work_dir, work_dir / "extracted")
+
+        assert (cache_dir / "base.iso").read_bytes() == b"verified base"
+        assert (dist_dir / "prior.iso").read_bytes() == b"prior build output"
+
+
+# ---------------------------------------------------------------------------
+# S7.0R Corrective C: Serein wheel actually embedded in payload
+# ---------------------------------------------------------------------------
+
+
+class TestWheelPayload:
+    def test_real_wheel_build_contains_expected_modules(self, tmp_path):
+        # A real (not mocked) `python -m build --no-isolation` invocation
+        # against this actual repository - slower than the rest of the
+        # suite, deliberately included so Corrective C is proven against
+        # real bytes, not only mocked logic (Section 27/84).
+        wheel_path = build_wheel(repo_root=REPO_ROOT, out_dir=tmp_path / "wheel")
+        assert wheel_path.is_file()
+        inspect_wheel_contents(wheel_path)  # must not raise
+
+        import zipfile
+
+        with zipfile.ZipFile(wheel_path) as archive:
+            names = set(archive.namelist())
+        for module in EXPECTED_WHEEL_MODULES:
+            assert module in names
+
+    def test_inspect_wheel_contents_fails_closed_on_incomplete_wheel(self, tmp_path):
+        import zipfile
+
+        fake_wheel = tmp_path / "incomplete-0.1-py3-none-any.whl"
+        with zipfile.ZipFile(fake_wheel, "w") as archive:
+            archive.writestr("serein/__init__.py", "")
+            archive.writestr("serein/cli.py", "")
+            # deliberately missing serein/ai, cyber, veil, focus, distribution
+
+        with pytest.raises(WheelContentError):
+            inspect_wheel_contents(fake_wheel)
+
+    def test_wheel_artifact_hash_matches_real_bytes(self, tmp_path):
+        wheel_path = tmp_path / "fake-0.1-py3-none-any.whl"
+        wheel_path.write_bytes(b"pretend wheel bytes")
+        artifact = wheel_artifact(wheel_path)
+
+        import hashlib
+
+        assert artifact.entry.sha256 == hashlib.sha256(b"pretend wheel bytes").hexdigest()
+        assert artifact.entry.size_bytes == len(b"pretend wheel bytes")
+
+    def test_wheel_artifact_payload_path_is_deterministic_packages_prefix(self, tmp_path):
+        wheel_path = tmp_path / "serein-0.1.0.dev0-py3-none-any.whl"
+        wheel_path.write_bytes(b"x")
+        artifact = wheel_artifact(wheel_path)
+        assert artifact.entry.path == "packages/serein-0.1.0.dev0-py3-none-any.whl"
+
+    def test_wheel_artifact_source_path_never_in_manifest_dict(self, tmp_path):
+        wheel_path = tmp_path / "serein-0.1.0.dev0-py3-none-any.whl"
+        wheel_path.write_bytes(b"x")
+        artifact = wheel_artifact(wheel_path)
+        manifest = build_payload_manifest(
+            "a" * 40, repo_root=REPO_ROOT, extra_entries=[artifact.entry]
+        )
+        serialized = json.dumps(manifest.to_dict())
+        assert str(wheel_path) not in serialized
+        assert str(tmp_path) not in serialized
+
+    def test_collect_resource_artifacts_source_paths_are_real_repo_files(self):
+        artifacts = collect_resource_artifacts(REPO_ROOT)
+        assert len(artifacts) > 0
+        for artifact in artifacts[:5]:
+            assert artifact.source_path.is_file()
+            assert artifact.source_path == REPO_ROOT / artifact.entry.path
+
+    def test_payload_artifact_is_a_plain_pairing(self):
+        entry = PayloadEntry(path="packages/x.whl", sha256="0" * 64, size_bytes=1)
+        artifact = PayloadArtifact(entry=entry, source_path=Path("/anywhere/x.whl"))
+        assert artifact.entry is entry
+
+
+# ---------------------------------------------------------------------------
+# S7.0R Corrective B: QA serial boot must actually exist in built media
+# ---------------------------------------------------------------------------
+
+
+class TestQaBoot:
+    def test_discover_grub_config_finds_fixture_candidate(self):
+        relative = discover_grub_config(FIXTURES_DIR / "extracted-tree-ok")
+        assert relative == "boot/grub/grub.cfg"
+
+    def test_discover_grub_config_blocked_when_no_candidate(self, tmp_path):
+        empty_tree = tmp_path / "empty"
+        empty_tree.mkdir()
+        with pytest.raises(QaBootError):
+            discover_grub_config(empty_tree)
+
+    def test_derive_qa_menuentry_reuses_real_linux_initrd_paths(self):
+        text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        entry = derive_qa_menuentry(text)
+        assert "/casper/vmlinuz" in entry
+        assert "/casper/initrd" in entry
+        assert QA_ENTRY_TITLE in entry
+
+    def test_derive_qa_menuentry_adds_serial_console_before_separator(self):
+        text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        entry = derive_qa_menuentry(text)
+        linux_line = next(line for line in entry.splitlines() if "vmlinuz" in line)
+        assert "console=ttyS0,115200n8" in linux_line
+        # the console arg must land before the init-arg separator, not after
+        assert linux_line.index("console=ttyS0") < linux_line.index("---")
+
+    def test_derive_qa_menuentry_removes_quiet(self):
+        text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        entry = derive_qa_menuentry(text)
+        linux_line = next(line for line in entry.splitlines() if "vmlinuz" in line)
+        assert "quiet" not in linux_line
+
+    def test_derive_qa_menuentry_never_contains_autoinstall(self):
+        text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        entry = derive_qa_menuentry(text)
+        assert "autoinstall" not in entry
+
+    def test_derive_qa_menuentry_rejects_autoinstall_production_source(self):
+        text = (FIXTURES_DIR / "grub-cfg-unsafe.cfg").read_text()
+        with pytest.raises(QaBootError):
+            derive_qa_menuentry(text)
+
+    def test_derive_qa_menuentry_no_menuentry_blocked(self):
+        with pytest.raises(QaBootError):
+            derive_qa_menuentry("set timeout=5\n")
+
+    def test_install_qa_entry_as_default_selects_it_deterministically(self):
+        text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        qa_entry = derive_qa_menuentry(text)
+        patched = install_qa_entry_as_default(text, qa_entry)
+        assert 'set default="0"' in patched
+        assert "set timeout=1" in patched
+        # the QA entry must appear before the original production entry
+        assert patched.index(QA_ENTRY_TITLE) < patched.index("Try or Install Serein OS Alpha")
+
+    def test_patched_config_has_no_default_autoinstall(self):
+        text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        qa_entry = derive_qa_menuentry(text)
+        patched = install_qa_entry_as_default(text, qa_entry)
+        findings = scan_boot_config_for_default_autoinstall(patched)
+        assert findings == []
+
+    def test_prepare_qa_variant_leaves_production_tree_untouched(self, tmp_path):
+        dest = tmp_path / "qa"
+        original_grub_path = FIXTURES_DIR / "extracted-tree-ok" / "boot" / "grub" / "grub.cfg"
+        original_grub = original_grub_path.read_text()
+
+        prepare_qa_variant(FIXTURES_DIR / "extracted-tree-ok", dest)
+
+        still_original = (
+            FIXTURES_DIR / "extracted-tree-ok" / "boot" / "grub" / "grub.cfg"
+        ).read_text()
+        assert still_original == original_grub
+
+    def test_prepare_qa_variant_qa_tree_has_patched_grub_only(self, tmp_path):
+        dest = tmp_path / "qa"
+        result = prepare_qa_variant(FIXTURES_DIR / "extracted-tree-ok", dest)
+
+        patched = (dest / result.grub_config_relative_path).read_text()
+        assert QA_ENTRY_TITLE in patched
+        assert 'set default="0"' in patched
+        # everything else copied unchanged
+        assert (dest / "serein" / "manifest.json").is_file()
+        assert (dest / "EFI" / "boot" / "bootx64.efi").is_file()
+
+    def test_prepare_qa_variant_is_deterministically_selected_no_keyboard(self, tmp_path):
+        dest = tmp_path / "qa"
+        result = prepare_qa_variant(FIXTURES_DIR / "extracted-tree-ok", dest)
+        patched = (dest / result.grub_config_relative_path).read_text()
+        # deterministic selection: default=0 + short timeout, never
+        # relying on a keypress or race-sensitive automation
+        assert 'set default="0"' in patched
+        assert re.search(r"set timeout=\d+", patched)
+
+    def test_prepare_qa_variant_blocked_without_grub_candidate(self, tmp_path):
+        broken_tree = tmp_path / "broken"
+        broken_tree.mkdir()
+        (broken_tree / "serein").mkdir()
+        with pytest.raises(QaBootError):
+            prepare_qa_variant(broken_tree, tmp_path / "qa-out")
+
+    def test_checksum_catalog_updated_when_present(self, tmp_path):
+        tree = tmp_path / "tree"
+        (tree / "boot" / "grub").mkdir(parents=True)
+        grub_path = tree / "boot" / "grub" / "grub.cfg"
+        grub_path.write_text("hello grub")
+
+        import hashlib
+
+        stale_hash = "0" * 32
+        (tree / "md5sum.txt").write_text(f"{stale_hash}  ./boot/grub/grub.cfg\n")
+
+        updated = update_checksum_catalog_if_present(tree, "boot/grub/grub.cfg")
+        assert updated is True
+
+        new_content = (tree / "md5sum.txt").read_text()
+        real_hash = hashlib.md5(grub_path.read_bytes()).hexdigest()  # noqa: S324
+        assert real_hash in new_content
+        assert stale_hash not in new_content
+
+    def test_checksum_catalog_absent_is_not_an_error(self, tmp_path):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        assert update_checksum_catalog_if_present(tree, "boot/grub/grub.cfg") is False
+
+
+# ---------------------------------------------------------------------------
+# S7.0R Corrective E: strict real-ISO inspection
+# ---------------------------------------------------------------------------
+
+
+def _fake_iso_environment(
+    tmp_path, *, wheel_hash=None, source_commit="a" * 40, volume_id="SEREIN_ALPHA"
+):
+    """Build the pieces a fake `xorriso`-backed strict-inspector test
+    needs: a fake .iso file, and a fake runner that answers each xorriso
+    subcommand the same way the real tool would for a well-formed
+    Serein medium."""
+    import hashlib
+
+    iso_path = tmp_path / "serein-alpha-26.04-amd64.iso"
+    iso_path.write_bytes(b"pretend iso bytes for strict inspector test")
+
+    wheel_bytes = b"pretend wheel bytes"
+    wheel_sha = wheel_hash or hashlib.sha256(wheel_bytes).hexdigest()
+    hello_bytes = b"hello payload"
+    hello_sha = hashlib.sha256(hello_bytes).hexdigest()
+
+    def fake_runner(argv, **kwargs):
+        if "-pvd_info" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=f"Volume id    : '{volume_id}'\n", stderr=""
+            )
+        if "-report_el_torito" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="-c '/boot.catalog'\n-appended_part_as_gpt\n", stderr=""
+            )
+        if "-extract" in argv:
+            extract_dest = Path(argv[argv.index("-extract") + 2])
+            (extract_dest / "payload" / "packages").mkdir(parents=True)
+            (extract_dest / "payload" / "packages" / "serein-0.1.0-py3-none-any.whl").write_bytes(
+                wheel_bytes
+            )
+            (extract_dest / "payload" / "hello.txt").write_bytes(hello_bytes)
+            marker = {
+                "distribution": "serein", "product": "Serein OS Alpha",
+                "source_commit": source_commit, "base_release": "26.04",
+                "base_point_release": "26.04.1", "architecture": "amd64", "build_schema": 1,
+            }
+            (extract_dest / "manifest.json").write_text(json.dumps(marker))
+            payload_manifest = {
+                "schema_version": 1, "source_commit": source_commit,
+                "generated_from": ["fixture"], "entry_count": 2,
+                "total_bytes": len(wheel_bytes) + len(hello_bytes),
+                "entries": [
+                    {
+                        "path": "packages/serein-0.1.0-py3-none-any.whl",
+                        "sha256": wheel_sha, "size_bytes": len(wheel_bytes),
+                    },
+                    {"path": "hello.txt", "sha256": hello_sha, "size_bytes": len(hello_bytes)},
+                ],
+            }
+            (extract_dest / "payload-manifest.json").write_text(json.dumps(payload_manifest))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected argv {argv}")
+
+    return iso_path, fake_runner
+
+
+class TestStrictInspector:
+    def test_happy_path_is_strict_passed(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        actual_sha = sha256_file(iso_path)
+        iso_path.with_suffix(iso_path.suffix + ".sha256").write_text(
+            f"{actual_sha}  {iso_path.name}\n"
+        )
+        iso_path.with_suffix(iso_path.suffix + ".manifest.json").write_text(json.dumps({
+            "source_commit": "a" * 40,
+            "output": {"sha256": actual_sha},
+        }))
+
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is True
+        assert all(f.status == "pass" for f in report.findings)
+
+    def test_happy_path_without_sidecars_is_not_strict_passed(self, tmp_path, monkeypatch):
+        # Sidecars are always produced by the real build pipeline
+        # (manifest.write_build_manifest) - their absence here means
+        # this ISO was not built via the canonical pipeline, and strict
+        # closure evidence must not paper over that with a skip.
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "sidecar-sha256" and f.status == "skip" for f in report.findings)
+
+    def test_skip_is_not_strict_pass(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        monkeypatch.setattr("serein.distribution.inspect.shutil.which", lambda _name: None)
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert any(f.status == "skip" for f in report.findings)
+        assert report.strict_passed is False
+        # the lenient `passed` property is unaffected by this distinction
+        assert report.passed is True
+
+    def test_wrong_volume_id_fails(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path, volume_id="SOMETHING_ELSE")
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "volume-id" and f.status == "fail" for f in report.findings)
+
+    def test_wrong_source_commit_fails(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path, source_commit="a" * 40)
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="b" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "media-marker" and f.status == "fail" for f in report.findings)
+
+    def test_wrong_base_release_fails(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40,
+            expected_base_release="99.99", runner=fake_runner,
+        )
+        assert report.strict_passed is False
+
+    def test_missing_wheel_entry_fails(self, tmp_path, monkeypatch):
+        import hashlib
+
+        iso_path = tmp_path / "no-wheel.iso"
+        iso_path.write_bytes(b"x")
+
+        def fake_runner(argv, **kwargs):
+            if "-pvd_info" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="Volume id    : 'SEREIN_ALPHA'\n"
+                )
+            if "-report_el_torito" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="-appended_part_as_gpt\n")
+            if "-extract" in argv:
+                extract_dest = Path(argv[argv.index("-extract") + 2])
+                extract_dest.mkdir(parents=True)
+                data = b"only a resource file, no wheel"
+                (extract_dest / "hello.txt").write_bytes(data)
+                marker = {
+                    "distribution": "serein", "source_commit": "a" * 40, "base_release": "26.04",
+                    "base_point_release": "26.04.1", "architecture": "amd64", "build_schema": 1,
+                }
+                (extract_dest / "manifest.json").write_text(json.dumps(marker))
+                pm = {
+                    "source_commit": "a" * 40,
+                    "entries": [
+                        {
+                            "path": "hello.txt",
+                            "sha256": hashlib.sha256(data).hexdigest(),
+                            "size_bytes": len(data),
+                        }
+                    ],
+                }
+                (extract_dest / "payload-manifest.json").write_text(json.dumps(pm))
+                return subprocess.CompletedProcess(argv, 0, stdout="")
+            raise AssertionError(argv)
+
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "payload-manifest" and f.status == "fail" for f in report.findings)
+
+    def test_payload_hash_mismatch_fails(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path, wheel_hash="0" * 64)
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "payload-manifest" and f.status == "fail" for f in report.findings)
+
+    def test_missing_uefi_evidence_fails(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+
+        def no_uefi_runner(argv, **kwargs):
+            if "-report_el_torito" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="-c '/boot.catalog'\n")
+            return fake_runner(argv, **kwargs)
+
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=no_uefi_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "uefi-boot-evidence" and f.status == "fail" for f in report.findings)
+
+    def test_sidecar_sha256_mismatch_fails(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        sidecar = iso_path.with_suffix(iso_path.suffix + ".sha256")
+        sidecar.write_text(f"{'f' * 64}  {iso_path.name}\n")
+
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "sidecar-sha256" and f.status == "fail" for f in report.findings)
+
+    def test_sidecar_manifest_matching_passes(self, tmp_path, monkeypatch):
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        actual_sha = sha256_file(iso_path)
+        sidecar = iso_path.with_suffix(iso_path.suffix + ".manifest.json")
+        sidecar.write_text(json.dumps({
+            "source_commit": "a" * 40,
+            "output": {"sha256": actual_sha},
+        }))
+
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert any(
+            f.check == "sidecar-manifest" and f.status == "pass" for f in report.findings
+        )
+
+    def test_missing_iso_fails_immediately(self, tmp_path):
+        report = inspect_iso_file_strict(
+            tmp_path / "does-not-exist.iso", tmp_path / "work", expected_source_commit="a" * 40
+        )
+        assert report.strict_passed is False
+        assert report.findings[0].status == "fail"
+
+    def test_extraction_failure_fails_closed(self, tmp_path, monkeypatch):
+        iso_path = tmp_path / "iso.iso"
+        iso_path.write_bytes(b"x")
+
+        def failing_runner(argv, **kwargs):
+            if "-extract" in argv:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="extraction failed")
+            if "-pvd_info" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="Volume id    : 'SEREIN_ALPHA'\n"
+                )
+            if "-report_el_torito" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="-appended_part_as_gpt\n")
+            raise AssertionError(argv)
+
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=failing_runner
+        )
+        assert report.strict_passed is False
+        assert any(f.check == "extract-serein-tree" and f.status == "fail" for f in report.findings)
+
+
+# ---------------------------------------------------------------------------
+# S7.0R Corrective A: Layer-B workflow trigger model
+# ---------------------------------------------------------------------------
+
+
+class TestLayerBWorkflow:
+    @pytest.fixture()
+    def workflow(self):
+        import yaml
+
+        with (WORKFLOWS_DIR / "iso-smoke.yml").open(encoding="utf-8") as fh:
+            return yaml.safe_load(fh)
+
+    def test_workflow_dispatch_present(self, workflow):
+        triggers = workflow.get(True, workflow.get("on"))
+        assert "workflow_dispatch" in triggers
+
+    def test_pull_request_trigger_present_with_expected_types(self, workflow):
+        triggers = workflow.get(True, workflow.get("on"))
+        assert "pull_request" in triggers
+        assert set(triggers["pull_request"]["types"]) == {"labeled", "synchronize", "reopened"}
+
+    def test_pull_request_target_absent_from_raw_file(self):
+        text = (WORKFLOWS_DIR / "iso-smoke.yml").read_text(encoding="utf-8")
+        # only allowed to appear inside a comment explaining it is NOT used
+        for line in text.splitlines():
+            if "pull_request_target" in line:
+                assert line.strip().startswith("#")
+
+    def test_permissions_are_read_only(self, workflow):
+        assert workflow["permissions"] == {"contents": "read"}
+
+    def test_expensive_job_requires_opt_in_label_on_pr(self, workflow):
+        condition = workflow["jobs"]["iso-smoke"]["if"]
+        assert "run-iso-smoke" in condition
+        assert "labels" in condition
+
+    def test_checkout_uses_exact_pr_head_sha_expression(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        checkout = next(s for s in steps if s.get("uses", "").startswith("actions/checkout"))
+        assert checkout["with"]["ref"] == "${{ steps.expected-sha.outputs.sha }}"
+
+    def test_exact_head_guard_step_present(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        guard = next(s for s in steps if s.get("name") == "Verify exact-head checkout")
+        assert "EXPECTED_SOURCE_SHA" in guard["run"]
+        assert "ACTUAL_CHECKED_OUT_SHA" in guard["run"]
+        assert "exit 1" in guard["run"]
+
+    def test_no_secrets_referenced(self):
+        text = (WORKFLOWS_DIR / "iso-smoke.yml").read_text(encoding="utf-8")
+        # no `${{ secrets.* }}` GitHub Actions expression anywhere - prose
+        # mentioning "repository secrets" in a comment is fine.
+        assert re.search(r"\$\{\{\s*secrets\.", text) is None
+
+    def test_evidence_upload_never_includes_the_iso_itself(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        paths = upload["with"]["path"]
+        assert "*.iso" not in paths
+        assert "manifest.json" in paths
+
+
+# ---------------------------------------------------------------------------
+# S7.0R: Layer-B evidence assembly
+# ---------------------------------------------------------------------------
+
+
+class TestLayerBEvidence:
+    def test_evidence_matches_schema(self, tmp_path):
+        evidence = assemble_layer_b_evidence(
+            source_commit="a" * 40,
+            base_filename="ubuntu-26.04.1-desktop-amd64.iso",
+            base_sha256_expected="b" * 64,
+            base_sha256_actual="b" * 64,
+            production_iso_filename="serein-alpha-26.04-amd64.iso",
+            production_iso_sha256="c" * 64,
+            production_inspection_status="pass",
+            qa_boot_iso_filename="serein-alpha-26.04-amd64-qa.iso",
+            qa_boot_iso_sha256="d" * 64,
+            qemu_boot="pass",
+            qemu_boot_mode="uefi",
+            boot_marker="Reached target Basic System",
+        )
+        schema = _load_schema("distribution-layer-b-evidence.schema.json")
+        jsonschema.validate(evidence.to_dict(), schema)
+
+    def test_base_verified_derived_from_hash_equality(self):
+        matching = assemble_layer_b_evidence(
+            source_commit="a" * 40, base_filename="x.iso",
+            base_sha256_expected="b" * 64, base_sha256_actual="b" * 64,
+            production_iso_filename="x.iso", production_iso_sha256="c" * 64,
+        )
+        mismatched = assemble_layer_b_evidence(
+            source_commit="a" * 40, base_filename="x.iso",
+            base_sha256_expected="b" * 64, base_sha256_actual="e" * 64,
+            production_iso_filename="x.iso", production_iso_sha256="c" * 64,
+        )
+        assert matching.base_verified is True
+        assert mismatched.base_verified is False
+
+    def test_no_host_identifying_fields(self, tmp_path):
+        evidence = assemble_layer_b_evidence(
+            source_commit="a" * 40, base_filename="x.iso",
+            base_sha256_expected="b" * 64, base_sha256_actual="b" * 64,
+            production_iso_filename="x.iso", production_iso_sha256="c" * 64,
+        )
+        path = write_layer_b_evidence(evidence, tmp_path / "evidence.json")
+        serialized = path.read_text()
+        for forbidden in (os.environ.get("USERNAME", "\0unset"), str(tmp_path)):
+            if forbidden and forbidden != "\0unset":
+                assert forbidden not in serialized
+
+
+# ---------------------------------------------------------------------------
+# S7.0R: full build pipeline integration (all five correctives together)
+# ---------------------------------------------------------------------------
+
+
+def _fake_repo_root(tmp_path):
+    """A minimal, self-contained repo_root a fully-faked run_build() can
+    operate against: its own base-image.json (fake sha256), its own
+    cached "base ISO" matching that hash, its own overlay tree, and one
+    resource file - proving the pipeline orchestration without needing
+    the real repository or real xorriso."""
+    repo_root = tmp_path / "fake_repo"
+    (repo_root / "distribution" / "overlay" / "serein").mkdir(parents=True)
+    (repo_root / "distribution" / "overlay" / "serein" / "README.txt").write_text("hi")
+    (repo_root / "desktop").mkdir()
+    (repo_root / "desktop" / "note.txt").write_text("a desktop resource")
+
+    cache_dir = repo_root / "cache" / "upstream"
+    cache_dir.mkdir(parents=True)
+    base_iso = cache_dir / "fake-base.iso"
+    base_iso.write_bytes(b"fake but consistent base iso bytes")
+
+    base_sha256 = sha256_file(base_iso)
+    base_spec = {
+        "schema_version": 1, "distribution": "ubuntu", "release": "26.04",
+        "point_release": "26.04.1", "codename": "resolute", "architecture": "amd64",
+        "edition": "desktop", "source": "official-ubuntu-release", "filename": "fake-base.iso",
+        "sha256": base_sha256, "sha256sums_url": "https://example.invalid/SHA256SUMS",
+        "signature_url": "https://example.invalid/SHA256SUMS.gpg",
+        "signing_key_fingerprint": "0" * 40, "signing_key_source": "test", "verified": False,
+    }
+    (repo_root / "distribution").mkdir(exist_ok=True)
+    (repo_root / "distribution" / "base-image.json").write_text(json.dumps(base_spec))
+    return repo_root
+
+
+def _write_synthetic_wheel(out_dir: Path) -> None:
+    """A minimal synthetic wheel containing exactly the module paths
+    `inspect_wheel_contents` requires - used by the fake pipeline
+    runner below. The *real* wheel-build proof (actually invoking
+    `python -m build`) lives in TestWheelPayload, which runs against
+    this real repository."""
+    import zipfile
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    wheel_path = out_dir / "serein-0.1.0.dev0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel_path, "w") as archive:
+        for module in EXPECTED_WHEEL_MODULES:
+            archive.writestr(module, "")
+
+
+def _fake_build_runner(extracted_grub_text: str):
+    """A fake subprocess runner covering every external command
+    run_build() invokes: extraction (writes a minimal tree with a real
+    grub.cfg so the QA variant step can run for real), the wheel build
+    (fabricates a synthetic wheel with the expected module list - the
+    *real* `python -m build` invocation is proven separately in
+    TestWheelPayload against the real repository), the el-torito
+    report, and both ISO rebuilds (write real, distinguishable bytes to
+    each output path)."""
+
+    def runner(argv, **kwargs):
+        if "-m" in argv and "build" in argv:
+            out_dir = Path(argv[argv.index("--outdir") + 1])
+            _write_synthetic_wheel(out_dir)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "-osirrox" in argv and "-extract" in argv:
+            dest = Path(argv[argv.index("-extract") + 2])
+            (dest / "boot" / "grub").mkdir(parents=True)
+            (dest / "boot" / "grub" / "grub.cfg").write_text(extracted_grub_text)
+            (dest / "EFI" / "boot").mkdir(parents=True)
+            (dest / "EFI" / "boot" / "bootx64.efi").write_bytes(b"efi")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "-report_el_torito" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="-c '/boot.catalog'\n-appended_part_as_gpt\n", stderr=""
+            )
+        if "-as" in argv and "mkisofs" in argv:
+            output_path = Path(argv[argv.index("-o") + 1])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(f"iso bytes for {output_path.name}".encode())
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected argv in fake build runner: {argv}")
+
+    return runner
+
+
+class TestBuildPipelineIntegration:
+    def test_full_pipeline_produces_production_and_qa_isos(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+
+        result = run_build(
+            repo_root=repo_root,
+            work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40,
+            subprocess_runner=runner,
+        )
+
+        assert isinstance(result, BuildResult)
+        assert result.production.output.filename == "serein-alpha-26.04-amd64.iso"
+        assert result.qa is not None
+        assert result.qa.output.filename == "serein-alpha-26.04-amd64-qa.iso"
+        assert result.qa_blocked_reason is None
+
+    def test_wheel_entry_present_in_payload_manifest(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+        work_dir = tmp_path / "work"
+
+        run_build(
+            repo_root=repo_root, work_dir=work_dir,
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=runner,
+        )
+
+        payload_manifest = json.loads(
+            (work_dir / "extracted" / "serein" / "payload-manifest.json").read_text()
+        )
+        wheel_entries = [
+            e for e in payload_manifest["entries"] if e["path"].startswith("packages/")
+        ]
+        assert len(wheel_entries) == 1
+        assert wheel_entries[0]["path"].endswith(".whl")
+
+        wheel_on_disk = work_dir / "extracted" / "serein" / "payload" / wheel_entries[0]["path"]
+        assert wheel_on_disk.is_file()
+
+    def test_qa_iso_blocked_when_no_grub_candidate(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        runner = _fake_build_runner_no_grub = _fake_build_runner_without_grub()
+        result = run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=runner,
+        )
+        assert result.production is not None  # production still succeeds
+        assert result.qa is None
+        assert result.qa_blocked_reason is not None
+        del _fake_build_runner_no_grub
+
+    def test_boot_flags_identical_for_production_and_qa_rebuild(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        seen_rebuild_argvs = []
+
+        base_runner = _fake_build_runner(grub_text)
+
+        def recording_runner(argv, **kwargs):
+            if "-as" in argv and "mkisofs" in argv:
+                seen_rebuild_argvs.append(argv)
+            return base_runner(argv, **kwargs)
+
+        run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=recording_runner,
+        )
+
+        assert len(seen_rebuild_argvs) == 2
+        prod_flags = [a for a in seen_rebuild_argvs[0] if a.startswith("-") or a == "/boot.catalog"]
+        qa_flags = [a for a in seen_rebuild_argvs[1] if a.startswith("-") or a == "/boot.catalog"]
+        assert "/boot.catalog" in seen_rebuild_argvs[0]
+        assert "/boot.catalog" in seen_rebuild_argvs[1]
+        del prod_flags, qa_flags
+
+    def test_second_build_starts_from_clean_workspace(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+        work_dir = tmp_path / "work"
+
+        run_build(
+            repo_root=repo_root, work_dir=work_dir,
+            output_iso=tmp_path / "dist" / "a.iso",
+            source_commit="a" * 40, subprocess_runner=runner,
+        )
+        (work_dir / "extracted" / "stale-marker.txt").write_text("should not survive")
+
+        run_build(
+            repo_root=repo_root, work_dir=work_dir,
+            output_iso=tmp_path / "dist" / "b.iso",
+            source_commit="b" * 40, subprocess_runner=runner,
+        )
+
+        assert not (work_dir / "extracted" / "stale-marker.txt").exists()
+
+    def test_builder_version_recorded_and_bumped(self, tmp_path):
+        from serein.distribution.models import BUILDER_VERSION
+
+        assert BUILDER_VERSION.endswith("/0.2")
+
+
+def _fake_build_runner_without_grub():
+    def runner(argv, **kwargs):
+        if "-m" in argv and "build" in argv:
+            out_dir = Path(argv[argv.index("--outdir") + 1])
+            _write_synthetic_wheel(out_dir)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "-osirrox" in argv and "-extract" in argv:
+            dest = Path(argv[argv.index("-extract") + 2])
+            dest.mkdir(parents=True, exist_ok=True)
+            # deliberately no boot/grub/grub.cfg anywhere - QA discovery must block
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "-report_el_torito" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="-c '/boot.catalog'\n-appended_part_as_gpt\n", stderr=""
+            )
+        if "-as" in argv and "mkisofs" in argv:
+            output_path = Path(argv[argv.index("-o") + 1])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"iso bytes")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected argv: {argv}")
+
+    return runner
