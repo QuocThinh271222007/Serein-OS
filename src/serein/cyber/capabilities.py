@@ -23,7 +23,12 @@ from serein.cyber.models import CYBER_CAPABILITIES_SCHEMA_VERSION, CyberCapabili
 from serein.cyber.models import CyberCapability as Capability
 from serein.cyber.network import detect_network_status
 from serein.cyber.reverse import detect_reverse_status
-from serein.cyber.toolbox import detect_host_hygiene, detect_toolbox_status
+from serein.cyber.toolbox import (
+    container_toolbox_installed,
+    container_toolbox_reason,
+    detect_host_hygiene,
+    detect_toolbox_status,
+)
 from serein.cyber.virtualization import detect_vm_status, evaluate_vm_readiness
 from serein.development.containers import container_capability_available
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
@@ -145,16 +150,12 @@ def build_cyber_capabilities(
         )
     )
 
-    container_installed = containers.podman.installed or containers.docker.installed
     capabilities.append(
         Capability(
-            "container_toolbox", container_available, container_installed, None,
+            "container_toolbox", container_available,
+            container_toolbox_installed(containers), None,
             "podman + distrobox", "ubuntu-repository", "high",
-            "Reuses S3's container detection directly - engine/Distrobox "
-            "presence is confirmed, but Serein never runs/creates a "
-            "container merely to prove rootless runtime usability "
-            "(S5R Section 32-34); usable is always None, conservative by "
-            "design, never inferred from binary presence alone.",
+            container_toolbox_reason(containers),
         )
     )
 

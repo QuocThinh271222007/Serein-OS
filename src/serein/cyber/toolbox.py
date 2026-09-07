@@ -29,6 +29,34 @@ def detect_toolbox_status(runner: CommandRunner = DEFAULT_RUNNER) -> CyberContai
     )
 
 
+def container_toolbox_installed(containers: CyberContainerStatusInfo) -> bool:
+    """A "container toolbox" is the engine *and* Distrobox together
+    (Section 2-3 of the S5RM corrective) - an engine alone (or Distrobox
+    alone, with no engine to back it) is not a complete, usable toolbox
+    subsystem, so it must not be reported as ``installed``."""
+    engine_present = containers.podman.installed or containers.docker.installed
+    return engine_present and containers.distrobox.installed
+
+
+def container_toolbox_reason(containers: CyberContainerStatusInfo) -> str:
+    """Reason text that reflects which half (engine/Distrobox) is
+    actually present, rather than always claiming both are confirmed
+    (Section 6 of the S5RM corrective)."""
+    engine_present = containers.podman.installed or containers.docker.installed
+    distrobox_present = containers.distrobox.installed
+    if engine_present and distrobox_present:
+        return (
+            "A supported container engine and Distrobox are installed; "
+            "runtime usability remains unverified because Serein does not "
+            "create/run a container during detection (S5R Section 32-34)."
+        )
+    if engine_present and not distrobox_present:
+        return "A container engine is installed, but Distrobox is not."
+    if distrobox_present and not engine_present:
+        return "Distrobox is installed, but no supported container engine is detected."
+    return "No container engine or Distrobox installation is detected."
+
+
 def detect_host_hygiene(runner: CommandRunner = DEFAULT_RUNNER) -> HostHygieneStatus:
     return HostHygieneStatus(
         hashcat=probe_tool("hashcat", "hashcat", version_args=("--version",), runner=runner),

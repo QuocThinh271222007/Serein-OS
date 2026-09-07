@@ -25,7 +25,12 @@ from serein.cyber.network import detect_network_status
 from serein.cyber.planner import VALID_COMPONENTS, build_cyber_plan
 from serein.cyber.reverse import detect_reverse_status
 from serein.cyber.status import build_cyber_status
-from serein.cyber.toolbox import detect_host_hygiene, detect_toolbox_status
+from serein.cyber.toolbox import (
+    container_toolbox_installed,
+    container_toolbox_reason,
+    detect_host_hygiene,
+    detect_toolbox_status,
+)
 from serein.cyber.tools import (
     HOST_NETWORK_TOOLS,
     TOOLBOX_EXPLOIT_DEV_TOOLS,
@@ -296,6 +301,65 @@ class TestToolbox:
         })
         status = detect_toolbox_status(runner=runner)
         assert status.podman.installed and status.docker.installed
+
+
+class TestContainerToolboxInstalled:
+    """S5RM: ``container_toolbox.installed`` requires engine AND
+    Distrobox together - neither component alone is a complete
+    toolbox."""
+
+    def test_neither_present_is_not_installed(self):
+        status = detect_toolbox_status(runner=FakeCommandRunner({}))
+        assert container_toolbox_installed(status) is False
+
+    def test_engine_only_is_not_installed(self):
+        runner = FakeCommandRunner({"podman": _ok("podman", "podman version 5.7.0")})
+        status = detect_toolbox_status(runner=runner)
+        assert container_toolbox_installed(status) is False
+
+    def test_distrobox_only_is_not_installed(self):
+        runner = FakeCommandRunner({"distrobox": _ok("distrobox", "distrobox: 1.8.2.4")})
+        status = detect_toolbox_status(runner=runner)
+        assert container_toolbox_installed(status) is False
+
+    def test_podman_plus_distrobox_is_installed(self):
+        runner = FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.7.0"),
+            "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+        })
+        status = detect_toolbox_status(runner=runner)
+        assert container_toolbox_installed(status) is True
+
+    def test_docker_plus_distrobox_is_installed(self):
+        runner = FakeCommandRunner({
+            "docker": _ok("docker", "Docker version 27.0.0"),
+            "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+        })
+        status = detect_toolbox_status(runner=runner)
+        assert container_toolbox_installed(status) is True
+
+    def test_reason_text_matches_actual_state(self):
+        neither = detect_toolbox_status(runner=FakeCommandRunner({}))
+        assert "no container engine" in container_toolbox_reason(neither).lower()
+
+        engine_only = detect_toolbox_status(
+            runner=FakeCommandRunner({"podman": _ok("podman", "podman version 5.7.0")})
+        )
+        reason = container_toolbox_reason(engine_only)
+        assert "distrobox is not" in reason.lower()
+
+        distrobox_only = detect_toolbox_status(
+            runner=FakeCommandRunner({"distrobox": _ok("distrobox", "distrobox: 1.8.2.4")})
+        )
+        reason = container_toolbox_reason(distrobox_only)
+        assert "no supported container engine" in reason.lower()
+
+        both = detect_toolbox_status(runner=FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.7.0"),
+            "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+        }))
+        reason = container_toolbox_reason(both)
+        assert "unverified" in reason.lower()
 
 
 class TestHostHygiene:
@@ -723,6 +787,74 @@ class TestCapabilities:
         assert by_id["container_toolbox"].installed is False
         assert by_id["container_toolbox"].usable is None
 
+    def test_container_toolbox_podman_only_is_not_installed(self, tmp_path):
+        # S5RM Section 3-4: the toolbox is the engine *and* Distrobox
+        # together - an engine alone must not report installed=True.
+        runner = FakeCommandRunner({"podman": _ok("podman", "podman version 5.7.0")})
+        report = build_cyber_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["container_toolbox"].installed is False
+        assert by_id["container_toolbox"].usable is None
+
+    def test_container_toolbox_docker_only_is_not_installed(self, tmp_path):
+        runner = FakeCommandRunner({"docker": _ok("docker", "Docker version 27.3.1")})
+        report = build_cyber_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["container_toolbox"].installed is False
+        assert by_id["container_toolbox"].usable is None
+
+    def test_container_toolbox_distrobox_only_is_not_installed(self, tmp_path):
+        runner = FakeCommandRunner({"distrobox": _ok("distrobox", "distrobox: 1.8.2.4")})
+        report = build_cyber_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["container_toolbox"].installed is False
+        assert by_id["container_toolbox"].usable is None
+
+    def test_container_toolbox_docker_plus_distrobox_is_installed(self, tmp_path):
+        runner = FakeCommandRunner({
+            "docker": _ok("docker", "Docker version 27.3.1"),
+            "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+        })
+        report = build_cyber_capabilities(root=tmp_path, runner=runner)
+        by_id = {c.id: c for c in report.capabilities}
+        assert by_id["container_toolbox"].installed is True
+        assert by_id["container_toolbox"].usable is None
+
+    def test_container_toolbox_reason_reflects_which_half_is_missing(self, tmp_path):
+        engine_only = build_cyber_capabilities(
+            root=tmp_path,
+            runner=FakeCommandRunner({"podman": _ok("podman", "podman version 5.7.0")}),
+        )
+        reason = {c.id: c for c in engine_only.capabilities}["container_toolbox"].reason
+        assert "distrobox" in reason.lower()
+        assert "engine" in reason.lower()
+
+        distrobox_only = build_cyber_capabilities(
+            root=tmp_path,
+            runner=FakeCommandRunner({"distrobox": _ok("distrobox", "distrobox: 1.8.2.4")}),
+        )
+        reason = {c.id: c for c in distrobox_only.capabilities}["container_toolbox"].reason
+        assert "engine" in reason.lower()
+
+    def test_container_toolbox_installed_implies_engine_and_distrobox(self, tmp_path):
+        # S5RM Section 9 direct invariant.
+        for runner in (
+            FakeCommandRunner({
+                "podman": _ok("podman", "podman version 5.7.0"),
+                "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+            }),
+            FakeCommandRunner({
+                "docker": _ok("docker", "Docker version 27.3.1"),
+                "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+            }),
+        ):
+            report = build_cyber_capabilities(root=tmp_path, runner=runner)
+            containers = detect_toolbox_status(runner=runner)
+            toolbox = {c.id: c for c in report.capabilities}["container_toolbox"]
+            if toolbox.installed:
+                assert containers.distrobox.installed is True
+                assert containers.podman.installed or containers.docker.installed
+
     def test_to_dict_is_json_serializable(self):
         report = build_cyber_capabilities(runner=FakeCommandRunner({}))
         assert json.dumps(report.to_dict())
@@ -910,6 +1042,33 @@ class TestPlanner:
         plan = build_cyber_plan(root=tmp_path, runner=FakeCommandRunner({}))
         actions = self._actions_by_id(plan)
         assert actions["toolbox.distrobox"].status == "APPLY"
+
+    def test_toolbox_engine_present_distrobox_absent(self, tmp_path):
+        # S5RM Section 10: engine present / Distrobox absent must plan
+        # engine=NOOP, distrobox=APPLY - consistent with
+        # container_toolbox.installed=False in this same state.
+        runner = FakeCommandRunner({"podman": _ok("podman", "podman version 5.7.0")})
+        plan = build_cyber_plan(root=tmp_path, runner=runner)
+        actions = self._actions_by_id(plan)
+        assert actions["toolbox.engine"].status == "NOOP"
+        assert actions["toolbox.distrobox"].status == "APPLY"
+
+    def test_toolbox_engine_absent_distrobox_present(self, tmp_path):
+        runner = FakeCommandRunner({"distrobox": _ok("distrobox", "distrobox: 1.8.2.4")})
+        plan = build_cyber_plan(root=tmp_path, runner=runner)
+        actions = self._actions_by_id(plan)
+        assert actions["toolbox.engine"].status == "APPLY"
+        assert actions["toolbox.distrobox"].status == "NOOP"
+
+    def test_toolbox_engine_and_distrobox_both_present(self, tmp_path):
+        runner = FakeCommandRunner({
+            "podman": _ok("podman", "podman version 5.7.0"),
+            "distrobox": _ok("distrobox", "distrobox: 1.8.2.4"),
+        })
+        plan = build_cyber_plan(root=tmp_path, runner=runner)
+        actions = self._actions_by_id(plan)
+        assert actions["toolbox.engine"].status == "NOOP"
+        assert actions["toolbox.distrobox"].status == "NOOP"
 
     def test_vm_prerequisites_blocked_without_kvm(self, tmp_path):
         plan = build_cyber_plan(root=tmp_path, runner=FakeCommandRunner({}))

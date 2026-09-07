@@ -17,9 +17,33 @@ rootless engine's storage/network namespace actually works, or that
 Distrobox can genuinely create/start a container in this environment.
 Confirming that would require actually running/creating a container
 (`podman run`, `distrobox create`) — exactly what S5's detection layer
-must never do. `installed` still reflects real presence (engine +
-Distrobox both found); `usable` stays conservative rather than
-overstating what presence alone proves.
+must never do. `usable` stays conservative rather than overstating what
+presence alone proves.
+
+## `installed` requires the engine *and* Distrobox together
+
+A container toolbox is "engine + Distrobox", not either component alone
+(S5RM corrective, Section 2-4 — an earlier pass let a bare container
+engine, with no Distrobox, report `container_toolbox.installed=true`,
+which overstated what was actually present). `toolbox.py`'s
+`container_toolbox_installed()` is the single helper both
+`capabilities.py` and its tests use:
+
+```python
+def container_toolbox_installed(containers: CyberContainerStatusInfo) -> bool:
+    engine_present = containers.podman.installed or containers.docker.installed
+    return engine_present and containers.distrobox.installed
+```
+
+`container_toolbox_reason()` reports which half is actually missing
+("A container engine is installed, but Distrobox is not." /
+"Distrobox is installed, but no supported container engine is
+detected.") rather than always claiming both are confirmed. The
+planner's `toolbox.engine`/`toolbox.distrobox` actions were already
+independently derived from the same two signals, so they stay
+consistent with this stricter `installed` definition without any
+planner change: engine-only leaves `toolbox.engine=NOOP` /
+`toolbox.distrobox=APPLY`, and vice versa.
 
 ## Rootless by default; no privileged defaults, ever
 
