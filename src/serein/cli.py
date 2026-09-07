@@ -37,6 +37,14 @@ from serein.development.planner import build_development_plan
 from serein.development.status import build_development_status
 from serein.doctor.checks import run_checks
 from serein.doctor.models import CheckStatus, DoctorReport
+from serein.focus.capabilities import build_focus_capabilities
+from serein.focus.doctor import run_focus_checks
+from serein.focus.evidence import gather_focus_evidence
+from serein.focus.models import FOCUS_TARGETS
+from serein.focus.planner import build_focus_plan
+from serein.focus.policy import evaluate_domain_readiness
+from serein.focus.status import build_focus_status
+from serein.focus.transition import build_focus_transition_plan
 from serein.hardware._util import DEFAULT_ROOT
 from serein.hardware.capabilities import build_capabilities
 from serein.hardware.cpu_policy import detect_cpu_policy
@@ -127,6 +135,20 @@ _VEIL_CAPABILITY_LABELS = {
     "private_workspace": "Private workspace",
     "whonix_vm": "Whonix VM",
     "vm_privacy_boundary": "VM privacy boundary",
+}
+
+_FOCUS_CAPABILITY_LABELS = {
+    "cpu_weight_planning": "CPU weight planning",
+    "memory_budget_planning": "Memory budget planning",
+    "io_weight_planning": "IO weight planning",
+    "gpu_lease_intent": "GPU lease intent",
+    "service_lifecycle_planning": "Service lifecycle planning",
+    "container_lifecycle_planning": "Container lifecycle planning",
+    "vm_lifecycle_planning": "VM lifecycle planning",
+    "thermal_constraint_awareness": "Thermal constraint awareness",
+    "battery_constraint_awareness": "Battery constraint awareness",
+    "privacy_boundary_awareness": "Privacy boundary awareness",
+    "transition_simulation": "Transition simulation",
 }
 
 
@@ -741,6 +763,165 @@ def _cmd_veil_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_focus_status(_args: argparse.Namespace) -> int:
+    status = build_focus_status()
+    print("SEREIN FOCUS")
+    print()
+    print("Mode")
+    print(f"  {status.mode}")
+    print()
+    print("Primary focus")
+    print(f"  {status.applied_focus or 'none'}")
+    print()
+    print("Baseline")
+    print(f"  {status.policy_baseline}")
+    print()
+    print("Domains")
+    for domain, readiness in status.domain_readiness.items():
+        print(f"  {domain:<14} {readiness}")
+    print()
+    print("Runtime enforcement")
+    print(f"  {'available' if status.runtime_enforcement else 'unavailable in S6.5'}")
+    print()
+    print("Transition simulation")
+    print("  available")
+    return 0
+
+
+def _cmd_focus_domains(_args: argparse.Namespace) -> int:
+    evidence = gather_focus_evidence()
+    readiness = evaluate_domain_readiness(evidence)
+    print("SEREIN FOCUS DOMAINS")
+    print()
+    for domain in ("dev", "ai", "cyber", "private"):
+        state, reason = readiness[domain]
+        print(f"{domain:<10} {state}")
+        print(f"           {reason}")
+    return 0
+
+
+def _cmd_focus_capabilities(args: argparse.Namespace) -> int:
+    report = build_focus_capabilities()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0
+    print("SEREIN FOCUS CAPABILITIES")
+    print()
+    for capability in report.capabilities:
+        label = _FOCUS_CAPABILITY_LABELS.get(capability.id, capability.id)
+        plannable = "yes" if capability.plannable else "no"
+        enforceable = "yes" if capability.enforceable else "no"
+        print(
+            f"{label:<28}available={_yes_no_unknown(capability.available):<9}"
+            f"plannable={plannable:<5}enforceable={enforceable}"
+        )
+    return 0
+
+
+def _cmd_focus_plan(args: argparse.Namespace) -> int:
+    policy = build_focus_plan(args.target)
+    if args.json:
+        print(json.dumps(policy.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print(f"SEREIN FOCUS PLAN - {args.target}")
+    print()
+    print(f"Primary domain: {policy.primary_domain or 'none'}  readiness: {policy.readiness}")
+    print(policy.rationale)
+    print()
+    print("Domain roles")
+    for role in policy.domain_roles:
+        print(f"  {role.domain:<10} {role.state:<10} readiness={role.readiness}")
+    print()
+    print("Resource intents")
+    for intent in policy.resource_intents:
+        weight = intent.relative_weight if intent.relative_weight is not None else "n/a"
+        print(
+            f"  {intent.resource:<5} {intent.domain:<10} "
+            f"priority={intent.priority:<10} weight={weight}"
+        )
+    print()
+    print("Memory")
+    print(f"  system_reserve: {policy.memory_intent.system_reserve}")
+    print(
+        f"  primary_target: {policy.memory_intent.primary_target}  "
+        f"secondary_target: {policy.memory_intent.secondary_target}"
+    )
+    if policy.memory_intent.reclaim_candidates:
+        print(f"  reclaim_candidates: {', '.join(policy.memory_intent.reclaim_candidates)}")
+    print()
+    print("GPU")
+    print(
+        f"  preferred_domain: {policy.gpu_intent.preferred_domain or 'none'}  "
+        f"mode: {policy.gpu_intent.mode}  "
+        f"enforceable: {'yes' if policy.gpu_intent.enforceable else 'no'}"
+    )
+    print()
+    print("Lifecycle")
+    for lc in policy.lifecycle_intents:
+        print(f"  [{lc.status:<7}] {lc.kind}.{lc.target} ({lc.domain}): {lc.target_intent}")
+    print()
+    if policy.conflicts:
+        print("Conflicts")
+        for conflict in policy.conflicts:
+            print(f"  {conflict.resource}: {', '.join(conflict.domains)} - {conflict.resolution}")
+        print()
+    print("Constraints")
+    for constraint in policy.constraints:
+        print(f"  - {constraint}")
+    print()
+    print("Mutation: none")
+    return 0
+
+
+def _cmd_focus_transition(args: argparse.Namespace) -> int:
+    plan = build_focus_transition_plan(args.focus_from, args.focus_to)
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print(f"TRANSITION {plan.from_focus} -> {plan.to_focus}")
+    print()
+    print(f"Status: {plan.status}")
+    print()
+    if plan.prerequisites:
+        print("Prerequisites")
+        for prerequisite in plan.prerequisites:
+            print(f"  - {prerequisite}")
+        print()
+    print("Resource intent changes")
+    for change in plan.resource_changes:
+        print(f"  {change.resource:<7} {change.domain:<10} {change.before} -> {change.after}")
+    print()
+    print("Lifecycle candidates")
+    for lc in plan.lifecycle_changes:
+        print(f"  {lc.kind}.{lc.target} ({lc.domain})  {lc.target_intent}")
+    print()
+    print("Blockers")
+    for blocker in plan.blockers:
+        print(f"  - {blocker}")
+    if not plan.blockers:
+        print("  none")
+    print()
+    print("Warnings")
+    for warning in plan.warnings:
+        print(f"  - {warning}")
+    print()
+    print("Host mutations")
+    print("  none")
+    return 0
+
+
+def _cmd_focus_doctor(args: argparse.Namespace) -> int:
+    report = run_focus_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN FOCUS DOCTOR", report)
+    return report.exit_code
+
+
 def _cmd_profile_list(args: argparse.Namespace) -> int:
     profiles = list_profiles()
     if args.json:
@@ -1012,6 +1193,60 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     veil_plan_parser.set_defaults(func=_cmd_veil_plan)
+
+    focus_parser = subparsers.add_parser("focus", help="Workload focus planning")
+    focus_subparsers = focus_parser.add_subparsers(dest="focus_command", required=True)
+
+    focus_subparsers.add_parser(
+        "status", help="Show focus mode/baseline/domain readiness"
+    ).set_defaults(func=_cmd_focus_status)
+
+    focus_subparsers.add_parser(
+        "domains", help="Show each professional domain's readiness"
+    ).set_defaults(func=_cmd_focus_domains)
+
+    focus_capabilities_parser = focus_subparsers.add_parser(
+        "capabilities", help="Show which focus planning mechanisms Serein supports"
+    )
+    focus_capabilities_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    focus_capabilities_parser.set_defaults(func=_cmd_focus_capabilities)
+
+    focus_plan_parser = focus_subparsers.add_parser(
+        "plan", help="Show the resource-intent plan for a focus target"
+    )
+    focus_plan_parser.add_argument(
+        "target", choices=FOCUS_TARGETS, help="balanced, dev, ai, cyber, or private"
+    )
+    focus_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    focus_plan_parser.set_defaults(func=_cmd_focus_plan)
+
+    focus_transition_parser = focus_subparsers.add_parser(
+        "transition", help="Simulate a transition between two focus targets"
+    )
+    focus_transition_parser.add_argument(
+        "--from", dest="focus_from", required=True, choices=FOCUS_TARGETS,
+        help="Starting focus target",
+    )
+    focus_transition_parser.add_argument(
+        "--to", dest="focus_to", required=True, choices=FOCUS_TARGETS,
+        help="Destination focus target",
+    )
+    focus_transition_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    focus_transition_parser.set_defaults(func=_cmd_focus_transition)
+
+    focus_doctor_parser = focus_subparsers.add_parser(
+        "doctor", help="Run Focus-layer diagnostics"
+    )
+    focus_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    focus_doctor_parser.set_defaults(func=_cmd_focus_doctor)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)

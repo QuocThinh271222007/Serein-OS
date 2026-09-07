@@ -25,6 +25,12 @@ from serein.development.doctor import run_development_checks
 from serein.development.planner import VALID_COMPONENTS as DEV_VALID_COMPONENTS
 from serein.development.planner import build_development_plan
 from serein.doctor.checks import run_checks
+from serein.focus.capabilities import build_focus_capabilities
+from serein.focus.doctor import run_focus_checks
+from serein.focus.evidence import gather_focus_evidence
+from serein.focus.models import FOCUS_TARGETS
+from serein.focus.policy import build_focus_policy
+from serein.focus.transition import build_focus_transition
 from serein.hardware.capabilities import build_capabilities
 from serein.hardware.doctor import run_hardware_checks
 from serein.hardware.planner import VALID_PROFILES, build_hardware_plan
@@ -61,6 +67,9 @@ def _load_schema(name: str) -> dict:
         "cyber-capabilities.schema.json",
         "veil-plan.schema.json",
         "veil-capabilities.schema.json",
+        "focus-plan.schema.json",
+        "focus-capabilities.schema.json",
+        "focus-transition.schema.json",
     ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:
@@ -246,4 +255,44 @@ def test_veil_focused_plan_validates_against_schema(component: str) -> None:
 def test_veil_doctor_report_validates_against_schema() -> None:
     schema = _load_schema("doctor-report.schema.json")
     report = run_veil_checks()
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+@pytest.fixture(scope="module")
+def _focus_evidence():
+    # Gathered exactly once for the whole module - each individual
+    # build_focus_policy()/build_focus_transition() call below is a
+    # pure function of this snapshot, so there is no need to re-probe
+    # the real host (DEFAULT_RUNNER) once per target/pair combination.
+    return gather_focus_evidence()
+
+
+def test_focus_capabilities_validates_against_schema() -> None:
+    schema = _load_schema("focus-capabilities.schema.json")
+    report = build_focus_capabilities()
+    jsonschema.validate(instance=report.to_dict(), schema=schema)
+
+
+@pytest.mark.parametrize("target", list(FOCUS_TARGETS))
+def test_focus_plan_validates_against_schema(_focus_evidence, target: str) -> None:
+    schema = _load_schema("focus-plan.schema.json")
+    plan = build_focus_policy(target, _focus_evidence)
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+_FOCUS_TRANSITION_PAIRS = [(a, b) for a in FOCUS_TARGETS for b in FOCUS_TARGETS]
+
+
+@pytest.mark.parametrize("from_focus,to_focus", _FOCUS_TRANSITION_PAIRS)
+def test_focus_transition_validates_against_schema(
+    _focus_evidence, from_focus: str, to_focus: str
+) -> None:
+    schema = _load_schema("focus-transition.schema.json")
+    plan = build_focus_transition(from_focus, to_focus, _focus_evidence)
+    jsonschema.validate(instance=plan.to_dict(), schema=schema)
+
+
+def test_focus_doctor_report_validates_against_schema() -> None:
+    schema = _load_schema("doctor-report.schema.json")
+    report = run_focus_checks()
     jsonschema.validate(instance=report.to_dict(), schema=schema)

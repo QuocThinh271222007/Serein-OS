@@ -6,7 +6,7 @@ ecosystem. It orchestrates and configures mature upstream components on top
 of Ubuntu LTS for local AI workloads, software development, cybersecurity
 research, and privacy-oriented workflows.
 
-**Current development phase: S6 — Veil / Privacy Isolation.** Serein OS
+**Current development phase: S6.5 — Focus Architecture.** Serein OS
 is not yet a usable Linux distribution ISO — disk/image production is
 S7's job, not this phase's. S1 (complete) added the desktop
 *integration layer*: a declarative KDE Plasma package manifest,
@@ -38,21 +38,31 @@ untrusted binaries, kernel labs) —
 `serein cyber status`/`capabilities`/`plan [component]`/`doctor`.
 Packet-capture *privilege* is modeled separately from tool presence
 (`dumpcap -D`, read-only, never a real capture); Serein is not Kali
-Linux and never automates an offensive action. S6 adds a privacy
-isolation workspace ("Veil"): Tor client, Tor Browser, DNS-leak, and
-Whonix Gateway/Workstation capability modeling and deterministic
-planning (`serein veil status`/`capabilities`/`plan [tor|workspace|
-whonix]`/`doctor`) — privacy is an explicit, opt-in workspace, never an
-invisible global side effect; normal host networking, DNS, firewall
-rules, and proxy settings are never mutated by this phase. **No driver,
-CUDA/ROCm package, Python package, model file, cyber tool, Tor daemon,
-Tor Browser/Whonix image, container, VM, or network namespace is ever
-installed/created/captured/scanned/downloaded by this repository** —
-see `docs/ai/architecture.md`, `docs/cyber/architecture.md`,
-`docs/veil/architecture.md`, `docs/development/architecture.md`,
-`docs/hardware/architecture.md`, and `docs/desktop/installation-plan.md`
-for exactly which parts of the install lifecycle exist today versus
-remain future work.
+Linux and never automates an offensive action. S6 (complete) added a
+privacy isolation workspace ("Veil"): Tor client, Tor Browser,
+DNS-leak, and Whonix Gateway/Workstation capability modeling and
+deterministic planning (`serein veil status`/`capabilities`/
+`plan [tor|workspace|whonix]`/`doctor`) — privacy is an explicit,
+opt-in workspace, never an invisible global side effect; normal host
+networking, DNS, firewall rules, and proxy settings are never mutated
+by this phase. S6.5 adds Focus: a semantic layer above the normal OS
+scheduler expressing which professional domain (dev/AI/cyber/private)
+currently receives *preferential resource intent* — many domains may
+exist simultaneously, but Serein has at most one PRIMARY focus at any
+moment, and PRIMARY never means EXCLUSIVE
+(`serein focus status`/`domains`/`capabilities`/
+`plan <target>`/`transition --from X --to Y`/`doctor`), built entirely
+on S2-S6's own capability evidence — no second hardware/dev/AI/cyber/
+privacy detector exists. **No driver, CUDA/ROCm package, Python
+package, model file, cyber tool, Tor daemon, Tor Browser/Whonix image,
+container, VM, network namespace, cgroup write, systemd unit mutation,
+or resource enforcement of any kind is ever installed/created/
+captured/scanned/downloaded/mutated by this repository** — see
+`docs/ai/architecture.md`, `docs/cyber/architecture.md`,
+`docs/veil/architecture.md`, `docs/focus/architecture.md`,
+`docs/development/architecture.md`, `docs/hardware/architecture.md`,
+and `docs/desktop/installation-plan.md` for exactly which parts of the
+install lifecycle exist today versus remain future work.
 
 ## Status
 
@@ -70,6 +80,8 @@ host/toolbox/VM tiering, packet-capture privilege modeling, and known
 limitations are documented under [`docs/cyber/`](docs/cyber/). Veil
 privacy-isolation architecture, threat model, Tor/Whonix strategy, and
 known limitations are documented under [`docs/veil/`](docs/veil/).
+Focus one-primary domain architecture, resource-intent model, and
+known limitations are documented under [`docs/focus/`](docs/focus/).
 
 ## Repository maturity
 

@@ -109,7 +109,7 @@ classifies and plans, it never automates an offensive action. Real
 container/VM provisioning, and any full-Kali or malware-analysis VM
 image, remain future work (S7/S8-adjacent, not scheduled).
 
-## S6 — Veil / Privacy *(this repository, in progress)*
+## S6 — Veil / Privacy *(complete, merged to main)*
 
 Tor client, Tor Browser, DNS-leak, private-workspace, and Whonix
 Gateway/Workstation capability modeling and deterministic planning -
@@ -131,6 +131,31 @@ repository** - see `docs/veil/architecture.md` for exactly what
 "implemented" means at this phase. No profile is registered for S6 -
 see `docs/veil/architecture.md` for why. Real workspace/VM provisioning
 remains future work (S7/S8-adjacent, not scheduled).
+
+## S6.5 — Focus Architecture *(this repository, in progress)*
+
+A semantic layer above the normal OS scheduler: many professional
+domains (development, AI, cybersecurity, privacy) may exist
+simultaneously, but Serein may have at most one PRIMARY focus at any
+moment - and PRIMARY never means EXCLUSIVE. Formalizes domain
+readiness, one-primary role assignment, and CPU/IO/memory/GPU/
+lifecycle *resource intent* (never a mutation) built entirely on
+S2-S6's own capability evidence - no second hardware/dev/AI/cyber/
+privacy detector exists. Adds `serein focus status`,
+`serein focus domains`, `serein focus capabilities [--json]`,
+`serein focus plan <target> [--json]`, and
+`serein focus transition --from X --to Y [--json]`. See
+[`docs/focus/`](focus/architecture.md) for the full design and
+[ADR-0025](adr/0025-serein-permits-at-most-one-primary-focus.md)
+through
+[ADR-0028](adr/0028-gpu-ownership-is-intent-not-generic-enforceable-state.md).
+**No cgroup write, systemd unit mutation, service/container/VM
+start-stop, GPU power-mode change, CPU governor change, or focus
+persistence exists anywhere in this repository; every output carries
+`runtime_enforcement: false`** - see `docs/focus/architecture.md` for
+exactly what "implemented" means at this phase. Real resource
+enforcement (systemd slices, cgroup v2 weighting, a transition
+executor) remains future work - see `docs/focus/future-runtime.md`.
 
 ## S7 — Distribution
 
