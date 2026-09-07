@@ -63,7 +63,57 @@ hash, and never imports the image (`virsh define`). Real verification
 requires the exact procedure Whonix's own documentation describes,
 which a future phase would need to implement explicitly; trusting a
 file because its name matches `Whonix-Gateway.qcow2` is exactly the
-anti-pattern Section 31 calls out.
+anti-pattern Section 31 calls out
+(`tests/test_veil.py::TestWhonix::test_filename_presence_is_never_trusted_as_verified`).
+
+## The artifact trust lifecycle (S6R Corrective D)
+
+File presence, signature/hash verification, libvirt domain import, and
+network topology are four genuinely separate facts, never collapsed:
+
+```
+ABSENT -> PRESENT_UNVERIFIED -> VERIFIED -> DEFINED -> TOPOLOGY_CONFIGURED -> USABLE
+```
+
+`WhonixCapabilityInfo` keeps them as independent fields:
+`gateway_image_present`/`workstation_image_present` (file presence),
+`gateway_image_verified`/`workstation_image_verified` (always `None` -
+Serein performs no OpenPGP/signify/hash check, so this is never
+inferred `True` from presence), `gateway_domain_defined`/
+`workstation_domain_defined` (always `None` - see below), and
+`network_topology_configured` (always `False`). `lifecycle_stage`
+reports the *joint* stage - the weaker of the two artifacts' own
+stages, since Whonix as a whole can never be further along than its
+least-advanced half. In every build today the reachable stages are
+only `"absent"` and `"present_unverified"` - the vocabulary exists so
+a future phase has a named, tested state to advance into.
+
+**Why domain-definition state stays `None` (Section 33).** A safe,
+read-only `virsh list --all` probe was considered, but Serein has no
+way to strongly map a returned domain name back to the *specific*
+verified artifact it claims to represent - a domain literally named
+"Whonix-Gateway" could point its disk at any path. Rather than run the
+probe and overclaim from a name match, this field is left
+conservatively `None` ("cannot determine") in every build - the
+corrective brief explicitly endorses this: "if you cannot strongly map
+a domain to the specific verified artifact, keep defined=None...
+conservative is acceptable."
+
+**Planner consequence.** Because verification and domain-definition
+never advance past `None`/`False` in the current implementation, the
+`whonix.network_topology` plan action can never legitimately reach
+`APPLY` in any real build today - it stays `BLOCKED` at whichever gate
+(VM backend, images, verification, or domain-import) is actually
+unmet. This is the corrected behavior: an earlier pass let
+`whonix.gateway`/`whonix.workstation` reach `NOOP` (arguably read as
+"nothing more to do") merely because the image *files* were present,
+which then let `whonix.network_topology` reach `APPLY` on file
+presence alone - too far forward for what Serein has actually
+established. The artifact/verification split
+(`whonix.{gateway,workstation}_artifact` for presence,
+`whonix.{gateway,workstation}_verification` for the still-required,
+user-managed signature/hash check) makes this ordering explicit in the
+plan output itself.
 
 ## No download, ever (Section 30)
 

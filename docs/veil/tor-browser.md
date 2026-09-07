@@ -35,6 +35,16 @@ the *official* torproject.org release on the user's behalf. This is
 the "clean distro integration" Section 19 allows in place of treating
 the raw tarball as the only acceptable mechanism.
 
+**The launcher package itself is not an official Tor Project binary
+release** (S6R Corrective E, Section 42) - it is Ubuntu-maintained
+tooling whose job is fetching and verifying the real release. An
+earlier pass described the `tor_browser` capability's mechanism as
+"torbrowser-launcher (official Tor Project release)", which reads as
+though the launcher *is* the official release; the wording has been
+corrected to "Ubuntu-packaged torbrowser-launcher for downloading/
+verifying official Tor Browser releases" everywhere this is surfaced
+(`capabilities.py`, this doc).
+
 ## What Serein detects
 
 `detect_tor_browser_status()` only checks for `torbrowser-launcher`

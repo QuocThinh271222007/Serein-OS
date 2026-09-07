@@ -19,7 +19,7 @@ staying on the distro archive, per the same "prefer apt when
 reasonably current" default S5R's tool-source corrective established
 for cyber tooling.
 
-## Seven separate questions (Section 6), never collapsed
+## Six separate questions, never collapsed
 
 `TorStatusInfo` (`src/serein/veil/models.py`) keeps every signal
 independent:
@@ -27,68 +27,119 @@ independent:
 ```
 package_installed        - dpkg-confirmed or binary present
 binary                    - `tor --version`
-service_present/active     - systemctl evidence (see below)
-config                      - torrc/torrc.d directive presence (see dns-leak-model.md)
+service                    - TorServiceStatus (master vs. runtime - see below)
+config                      - torrc/%include directive evaluation (see below)
 socks_listener_detected      - local, read-only /proc/net/tcp[6] evidence
 usable                        - the single canonical verdict below
 ```
 
-## Tor package/service unit reality (Section 42-43)
+## Tor systemd packaging reality (S6R Corrective A, live-verified)
 
-The Debian/Ubuntu `tor` package's systemd unit naming is not hardcoded
-to a single name: `src/serein/veil/tor.py`'s `_probe_tor_service` tries
-`tor.service` first, then `tor@default.service`, using
-`systemctl is-enabled <unit>` (a "not-found" result means "try the next
-candidate") followed by `systemctl is-active <unit>` only for whichever
-unit is actually present - a purely read-only, informational query,
-never `enable`/`start`. If `systemctl` itself cannot be probed at all
-(no systemd - many WSL configurations, some containers),
-`service_present`/`service_active` are `None` ("unknown"), never
-guessed `False` ("confirmed absent").
-
-## The tri-state `usable` verdict
+Ubuntu 26.04's `tor` package ships exactly three systemd unit files
+(confirmed against the package's own file listing):
 
 ```
-binary not installed                              -> False (high confidence)
-service_present is None (no systemd probed)         -> None (low confidence)
-service_present is False (systemctl ran, no unit)     -> False (medium confidence)
-service_present True, service_active False              -> False (high confidence)
-service_active True, SocksPort explicitly "0"             -> False (high confidence)
-service_active True, SocksPort explicit non-zero OR
-  a local listener detected on port 9050                    -> True (medium confidence)
-service_active True, no directive, no listener evidence       -> None (low confidence)
+tor.service          - top-level/master orchestration unit
+tor@.service          - uninstantiated multi-instance template
+tor@default.service     - the concrete default-instance unit
 ```
 
-"Tor binary present" never implies "Tor usable" (Section 7); "service
-active" never implies "workspace safely routed" either - `usable=True`
-here only ever means the Tor *client* itself is confirmed reachable
-over SOCKS, nothing about any specific application's routing or DNS
-behavior (see `docs/veil/dns-leak-model.md`).
+**Only `tor@default.service` is real Tor-daemon runtime evidence.** An
+earlier S6 pass let a bare `tor.service active` result satisfy runtime-
+active evidence; this was incorrect and has been corrected.
+`TorServiceStatus` keeps the two apart explicitly:
 
-## The local SOCKS-listener check (Section 45)
+```
+master_unit_present/master_unit_active     - tor.service (diagnostic only, never runtime proof)
+runtime_unit_present/runtime_unit_active      - tor@default.service (the real evidence)
+runtime_unit_name                              - "tor@default.service" once found, else ""
+service_present/service_active                  - properties that ARE runtime_unit_present/active
+                                                    (every other module reads these two)
+```
+
+`src/serein/veil/tor.py`'s `_probe_tor_service` probes `tor.service`
+(master, diagnostic-only) and `tor@default.service` (runtime,
+authoritative) with `systemctl is-enabled`/`systemctl is-active` -
+purely read-only, never `enable`/`start`/`restart`. If `systemctl`
+itself cannot be probed at all (no systemd - many WSL configurations,
+some containers), every field is `None` ("unknown"), never guessed
+`False` ("confirmed absent"); if systemctl runs but the runtime unit
+genuinely does not exist, `runtime_unit_present` is a definite `False`.
+
+## The tri-state `usable` verdict (S6R Corrective C)
+
+```
+binary not installed                                       -> False (high confidence)
+runtime_unit_present is None (no systemd probed)              -> None (low confidence)
+runtime_unit_present is False (systemctl ran, no runtime unit)  -> False (medium confidence)
+runtime_unit_present True, runtime_unit_active False               -> False (high confidence)
+runtime_unit_active True, SocksPort explicitly "0"                    -> False (high confidence)
+runtime_unit_active True, local listener confirmed on port 9050          -> True (medium confidence)
+runtime_unit_active True, SocksPort configured but no confirmed listener    -> None (low confidence)
+runtime_unit_active True, no directive, no listener evidence                  -> None (low confidence)
+```
+
+Configuration intent is never runtime proof by itself: "SocksPort
+configured" alone - even an explicit, enabled `SocksPort 9050` line -
+never promotes `usable` to `True` without a real, local listener
+confirmation. `usable=True` requires BOTH the Tor daemon *runtime* unit
+confirmed active AND a real listener detected - "tor binary present"
+alone, "tor.service active" alone, or "SocksPort configured" alone all
+never imply usability (Section 7/20).
+
+## The local SOCKS-listener check (Section 21/45)
 
 `_local_socks_listener_present` reads `/proc/net/tcp`/`/proc/net/tcp6`
 (read-only) looking for a `LISTEN`-state (`0A`) entry on port 9050
 (Tor's compiled-in default `SocksPort`). This never connects anywhere
-(Section 44 - no `check.torproject.org`, no real SOCKS handshake). A
-different process could theoretically be listening on 9050 (a false
-positive) or Tor could be configured on a non-default port (a false
-negative for this specific check) - which is exactly why it is only
-ever *one* of two ways to reach `usable=True`, never the sole signal,
-and an absent listener alone never drives `usable` to `False` (see the
-table above - it falls to the honest "unknown" branch instead).
+(Section 44 - no `check.torproject.org`, no real SOCKS handshake).
+Serein has no safe, read-only way to tie a listening socket to the Tor
+process specifically - a different process could theoretically be
+listening on 9050 (a false positive), and a custom, non-default
+`SocksPort` (e.g. `9150`, Tor Browser's bundled port) would not be
+detected by this check (a false negative) - so this is only ever
+*medium-confidence, combined* evidence alongside a confirmed-active
+runtime unit, never sole proof, and a custom SocksPort with no matching
+listener correctly stays `usable=None`, never `True` (Section 22-23).
 
-## torrc/torrc.d parsing (Section 39-41)
+## torrc parsing: `%include`-aware, never an implicit `torrc.d` merge (S6R Corrective B)
 
-`parse_tor_config()` reads `/etc/tor/torrc` and every file in
-`/etc/tor/torrc.d/` (read-only), extracting only a small, named set of
-directives - `SocksPort`, `ControlPort`, `CookieAuthentication`,
-`TransPort`, `DNSPort`, `DataDirectory`, and `Bridge` line *presence*.
-It never reads or stores a raw directive value, a hashed control
-password, a cookie file's contents, or a bridge line's actual text
-(Section 39/92) - three directives get a tri-state
-(`None`=no directive found, `True`=non-`"0"` value, `False`=explicit
-`"0"`), three get presence-only booleans, and bridge lines get a single
-presence boolean. An absent directive is never treated as "unsafe" -
-Tor's own compiled-in defaults matter and are not asserted either way
-(Section 41).
+`parse_tor_config()` starts from `/etc/tor/torrc` **only**.
+`/etc/tor/torrc.d/` is never implicitly merged in - it is only read if
+the main torrc (or something it transitively includes) contains an
+explicit `%include` directive referencing it, exactly mirroring real
+Tor's own config-loading behavior (a depth-limited, cycle-guarded
+recursive resolver handles nested includes, both file and directory
+targets). This module could not confirm from research alone whether
+Ubuntu's shipped default `/etc/tor/torrc` itself contains a `%include`
+line (see `docs/veil/known-limitations.md`) - the parser is correct
+either way, since it only ever follows whatever `%include` state
+actually exists on the host.
+
+Directives are evaluated per their real Tor semantics, not one
+identical rule for all of them:
+
+```
+SocksPort/ControlPort/TransPort/DNSPort   - multi-valued/additive: "any
+                                              enabled occurrence found" -
+                                              an earlier disabling "0"
+                                              line never suppresses a
+                                              later enabled one
+CookieAuthentication                        - scalar: "last occurrence wins"
+DataDirectory                                - presence-only (never used
+                                                 as privacy-readiness
+                                                 evidence, raw path never
+                                                 exposed)
+Bridge                                         - line presence only, the
+                                                  matched text is never
+                                                  retained or returned
+```
+
+`SocksPort`/`ControlPort`/`TransPort`/`DNSPort` are each `bool | None`:
+`None` = no occurrence found anywhere reached through torrc/its
+includes, `True` = at least one enabled occurrence, `False` = every
+occurrence found is explicitly `0`. It never reads or stores a raw
+directive value, a hashed control password, a cookie file's contents,
+or a bridge line's actual text (Section 39/92). An absent directive is
+never treated as "unsafe" - Tor's own compiled-in defaults matter and
+are not asserted either way (Section 41).
