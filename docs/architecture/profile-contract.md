@@ -24,7 +24,7 @@ path that would actually apply a profile) is not implemented. Reporting an
 inactive profile as active would violate the "no fake PASS output" rule
 that also governs `doctor`.
 
-## Current scope (as of S4)
+## Current scope (as of S5)
 
 - `core` (S0): `profiles/core/core.profile.json`. Describes the
   unmodified host — empty `packages`/`services`/etc. — and exists to
@@ -34,20 +34,19 @@ that also governs `doctor`.
   `configuration_units`, and `verification_checks` — see
   `docs/desktop/architecture.md`. Still performs no installation; see
   `docs/desktop/installation-plan.md` for what "implemented" means here.
-- `balanced`, `dev`, `ai`, `battery`, `cyber` (S2 baseline — `dev` and
-  `ai` were since extended further, see below):
-  `profiles/<id>/<id>.profile.json`. Each carries a real hardware
-  resource-policy manifest (`packages: ["power-profiles-daemon",
-  "systemd-zram-generator"]`, a shared `zram-generator-defaults`
-  configuration unit, and the `hardware/*` doctor checks as
-  `verification_checks`) — see `docs/hardware/architecture.md`.
-  **"implemented" here means the hardware resource-policy layer is
-  real** (detection, capability modeling, and `serein hardware plan`
-  all work end to end); the application/tooling layer each of these
-  profiles will eventually also carry (S3 dev toolchain, S4 AI runtime,
-  S5 security tooling) remains entirely separate, unimplemented future
-  work — a profile being `implemented` is not a claim that its whole
-  eventual scope exists. `battery` additionally declares
+- `balanced`, `battery` (S2 baseline only — `dev`, `ai`, and `cyber`
+  were since extended further, see below): `profiles/<id>/<id>.profile.json`.
+  Each carries a real hardware resource-policy manifest (`packages:
+  ["power-profiles-daemon", "systemd-zram-generator"]`, a shared
+  `zram-generator-defaults` configuration unit, and the `hardware/*`
+  doctor checks as `verification_checks`) — see
+  `docs/hardware/architecture.md`. **"implemented" here means the
+  hardware resource-policy layer is real** (detection, capability
+  modeling, and `serein hardware plan` all work end to end); the
+  application/tooling layer each of these profiles will eventually also
+  carry remains entirely separate, unimplemented future work — a
+  profile being `implemented` is not a claim that its whole eventual
+  scope exists. `battery` additionally declares
   `hardware_conditions: ["battery_present"]`: on a battery-less host,
   `serein hardware plan battery` reports `profile_available: false`
   with a stated reason rather than pretending the profile applies.
@@ -86,6 +85,27 @@ that also governs `doctor`.
   (including the hardware-present-vs-runtime-usable distinction), and
   `serein ai plan` all work end to end, but there is still no Apply
   mechanism.
+- `cyber` (S5): `profiles/cyber/cyber.profile.json` (version `0.2.0`).
+  **Important distinction, called out explicitly per the S5 brief:**
+  this is the same `cyber` profile identity S2 already gave a hardware
+  resource-policy manifest to (CPU/memory/storage policy biased for
+  stable virtualization behavior, e.g. for running a VM-isolated
+  workload) — S5 does not create a second "cyber" profile, it extends
+  this one, exactly the pattern `dev` (S3) and `ai` (S4) already
+  established. Its `packages` field is the union of S2's 2 hardware
+  packages and S5's 14-package Host Cyber Light default apt manifest
+  (`serein.cyber.tools.default_apt_packages()` —
+  `bind9-dnsutils`/`binutils`/`ethtool`/`file`/
+  `libimage-exiftool-perl`/`mtr-tiny`/`netcat-openbsd`/`nmap`/
+  `openssl`/`socat`/`tcpdump`/`tshark`/`whois`/`wireshark`, live-
+  validated on Ubuntu 26.04 — see `docs/validation/s5/`); its
+  `verification_checks` field adds S5's six `cyber_*` doctor check ids
+  alongside S2's ten hardware checks. See `docs/cyber/architecture.md`
+  for what "implemented" means here — detection, capability modeling
+  (host/toolbox/VM tiering, packet-capture privilege modeling), and
+  `serein cyber plan` all work end to end, but there is still no Apply
+  mechanism: no package is installed, no container or VM is created, no
+  packet is captured, no network is scanned.
 - `DECLARED_ONLY_PROFILES` (`src/serein/profiles/registry.py`) is empty
   as of S2 — every roadmap profile now has a manifest. It remains the
   mechanism a future phase (e.g. S6's veil/privacy profile) will use

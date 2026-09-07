@@ -63,7 +63,7 @@ install, no `~/.gitconfig`/`~/.config/zed` write, and no Apply
 mechanism exists yet — see `docs/development/architecture.md` for
 exactly what "implemented" means at this phase.
 
-## S4 — AI *(this repository, in progress)*
+## S4 — AI *(complete, merged to main)*
 
 Hardware-backend classification (NVIDIA CUDA / AMD ROCm / Intel GPU /
 CPU) built on S2's existing GPU detection (never re-probed), NVIDIA
@@ -85,12 +85,29 @@ exactly what "implemented" means at this phase. CUDA/PyTorch
 installation into the developer's own host never happens; live GPU
 runtime evidence is out of scope for this pass (`docs/ai/known-limitations.md`).
 
-## S5 — Cybersecurity
+## S5 — Cybersecurity *(this repository, in progress)*
 
-Isolated security research/authorized-testing environments (container or
-VM-based), per [ADR-0004](adr/0004-workload-isolation.md). The `cyber`
-profile's hardware resource-policy layer was implemented in S2; the
-actual isolated tooling/VM images this phase adds belong here.
+Host/toolbox/VM tool tiering for cybersecurity workflows — network
+diagnostics, packet-capture privilege modeling, reverse engineering,
+web-security testing, password-audit/exploit/wireless tooling, and
+forensics — built on the isolation model from
+[ADR-0004](adr/0004-workload-isolation.md) and S3's Podman/Distrobox
+container architecture (never re-implemented). The `cyber` profile's
+hardware resource-policy layer was implemented in S2; this phase
+extends that same profile into a real workload profile (same pattern S3
+used for `dev` and S4 used for `ai`) and adds `serein cyber status`,
+`serein cyber capabilities [--json]`, `serein cyber doctor [--json]`,
+and `serein cyber plan [component] [--json]`. See
+[`docs/cyber/`](cyber/architecture.md) for the full design and
+[ADR-0017](adr/0017-cyber-host-toolbox-vm-tiering.md) through
+[ADR-0020](adr/0020-full-kali-and-untrusted-workloads-require-vm.md).
+**No cyber tool, container, or VM is ever installed, created, or
+scanned by this repository, no packet is ever captured, and no network
+is ever scanned** — see `docs/cyber/architecture.md` for exactly what
+"implemented" means at this phase. Serein is not Kali Linux; it
+classifies and plans, it never automates an offensive action. Real
+container/VM provisioning, and any full-Kali or malware-analysis VM
+image, remain future work (S7/S8-adjacent, not scheduled).
 
 ## S6 — Veil / Privacy
 

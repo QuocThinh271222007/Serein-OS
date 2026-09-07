@@ -20,6 +20,11 @@ from serein.ai.planner import VALID_COMPONENTS as AI_VALID_COMPONENTS
 from serein.ai.planner import build_ai_plan
 from serein.ai.status import build_ai_status
 from serein.core.status import build_status_report
+from serein.cyber.capabilities import build_cyber_capabilities
+from serein.cyber.doctor import run_cyber_checks
+from serein.cyber.planner import VALID_COMPONENTS as CYBER_VALID_COMPONENTS
+from serein.cyber.planner import build_cyber_plan
+from serein.cyber.status import build_cyber_status
 from serein.desktop.config import RESOURCES, missing_resources
 from serein.desktop.doctor import run_desktop_checks
 from serein.desktop.plan import build_desktop_plan
@@ -89,6 +94,21 @@ _AI_CAPABILITY_LABELS = {
     "onnxruntime": "ONNX Runtime",
     "tensorrt": "TensorRT",
     "ai_container_runtime": "AI container runtime",
+}
+
+_CYBER_CAPABILITY_LABELS = {
+    "network_diagnostics": "Network diagnostics",
+    "packet_capture_tools": "Packet capture tools",
+    "packet_capture_permission": "Capture permission",
+    "dns_diagnostics": "DNS diagnostics",
+    "tls_diagnostics": "TLS diagnostics",
+    "network_scanning_tools": "Network scanning tools",
+    "web_testing_toolbox": "Web testing toolbox",
+    "reverse_engineering": "Reverse engineering",
+    "forensics_toolbox": "Forensics toolbox",
+    "wireless_tooling": "Wireless tooling",
+    "container_toolbox": "Container toolbox",
+    "vm_isolation": "VM isolation",
 }
 
 
@@ -527,6 +547,98 @@ def _cmd_ai_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_cyber_status(_args: argparse.Namespace) -> int:
+    status = build_cyber_status()
+    print("SEREIN CYBER")
+    print()
+    print(f"Profile        {status.profile_id} ({status.profile_status})")
+    print()
+    print("Network diagnostics")
+    print(_tool_line("nmap", status.network.nmap))
+    print(_tool_line("tcpdump", status.network.tcpdump))
+    print(_tool_line("dig", status.network.dig))
+    print(_tool_line("whois", status.network.whois))
+    print(_tool_line("socat", status.network.socat))
+    print(_tool_line("netcat", status.network.netcat))
+    print(_tool_line("mtr", status.network.mtr))
+    print(_tool_line("ethtool", status.network.ethtool))
+    print(_tool_line("openssl", status.network.openssl))
+    print()
+    print("Packet capture")
+    print(_tool_line("wireshark", status.capture.wireshark))
+    print(_tool_line("tshark", status.capture.tshark))
+    print(_tool_line("dumpcap", status.capture.dumpcap))
+    print(f"  capture permitted {_yes_no_unknown(status.capture.capture_permitted)}")
+    print()
+    print("Reverse engineering")
+    print(_tool_line("file", status.reverse.file))
+    print(_tool_line("binutils", status.reverse.binutils))
+    print(_tool_line("gdb", status.reverse.gdb))
+    print(_tool_line("strace", status.reverse.strace))
+    print(_tool_line("radare2", status.reverse.radare2))
+    print(_tool_line("ghidra", status.reverse.ghidra))
+    print()
+    print("Isolation")
+    print(_tool_line("podman", status.containers.podman))
+    print(_tool_line("docker", status.containers.docker))
+    print(_tool_line("distrobox", status.containers.distrobox))
+    print(f"  KVM device     {'yes' if status.vm.kvm_device_present else 'no'}")
+    print(f"  KVM module     {'yes' if status.vm.kvm_module_loaded else 'no'}")
+    print(_tool_line("qemu", status.vm.qemu))
+    print(_tool_line("virsh", status.vm.libvirt))
+    print(f"  KVM access     {_yes_no_unknown(status.vm.user_access)}")
+    return 0
+
+
+def _cmd_cyber_doctor(args: argparse.Namespace) -> int:
+    report = run_cyber_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN CYBER DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_cyber_capabilities(args: argparse.Namespace) -> int:
+    report = build_cyber_capabilities()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN CYBER CAPABILITIES")
+    print()
+    for capability in report.capabilities:
+        label = _CYBER_CAPABILITY_LABELS.get(capability.id, capability.id)
+        usable = _yes_no_unknown(capability.usable)
+        print(f"{label:<24}available={_yes_no_unknown(capability.available):<9}usable={usable}")
+    return 0
+
+
+def _cmd_cyber_plan(args: argparse.Namespace) -> int:
+    plan = build_cyber_plan(getattr(args, "component", None))
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    header = "SEREIN CYBER PLAN"
+    if getattr(args, "component", None):
+        header += f" - {args.component}"
+    print(header)
+    print()
+    for step in plan.actions:
+        target = f" -> {step.target}" if step.target else ""
+        current = f" (current: {step.current})" if step.current else ""
+        print(f"  [{step.status:<7}] {step.component}.{step.action}: {step.tool}{target}{current}")
+        print(f"            reason: {step.reason}")
+        print(
+            f"            risk: {step.risk} | reversible: {'yes' if step.reversible else 'no'} | "
+            f"requires_root: {'yes' if step.requires_root else 'no'} | source: {step.source}"
+        )
+        print(f"            verify: {step.verification}")
+    return 0
+
+
 def _cmd_profile_list(args: argparse.Namespace) -> int:
     profiles = list_profiles()
     if args.json:
@@ -728,6 +840,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ai_plan_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     ai_plan_parser.set_defaults(func=_cmd_ai_plan)
+
+    cyber_parser = subparsers.add_parser("cyber", help="Cybersecurity workspace")
+    cyber_subparsers = cyber_parser.add_subparsers(dest="cyber_command", required=True)
+
+    cyber_subparsers.add_parser(
+        "status", help="Show cyber tool/isolation state"
+    ).set_defaults(func=_cmd_cyber_status)
+
+    cyber_doctor_parser = cyber_subparsers.add_parser(
+        "doctor", help="Run cyber-level diagnostics"
+    )
+    cyber_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    cyber_doctor_parser.set_defaults(func=_cmd_cyber_doctor)
+
+    cyber_capabilities_parser = cyber_subparsers.add_parser(
+        "capabilities", help="Show which cyber stacks Serein can provision"
+    )
+    cyber_capabilities_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    cyber_capabilities_parser.set_defaults(func=_cmd_cyber_capabilities)
+
+    cyber_plan_parser = cyber_subparsers.add_parser(
+        "plan", help="Show the cyber workspace plan"
+    )
+    cyber_plan_parser.add_argument(
+        "component", nargs="?", choices=CYBER_VALID_COMPONENTS, default=None,
+        help="Show only actions for this component (host, toolbox, vm)",
+    )
+    cyber_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    cyber_plan_parser.set_defaults(func=_cmd_cyber_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
