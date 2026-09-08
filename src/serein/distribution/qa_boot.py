@@ -1,5 +1,6 @@
 """QA-only serial boot variant (S7.0R Corrective B; storage-efficient
-in-place transition added by S7.0RM Corrective A).
+in-place transition added by S7.0RM Corrective A; safe read-only-file
+writability handling added by S7.0RM5 Corrective A).
 
 A template GRUB entry existing in Git (``distribution/boot/qa-serial-entry.cfg``)
 never proves the *built* media actually selects it - this module makes
@@ -44,8 +45,13 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+from serein.distribution.pathsafety import PathSafetyError, resolve_within
 
 #: Candidate GRUB config locations, most to least common on a modern
 #: Ubuntu Desktop hybrid ISO's ISO9660 tree. Checked in order; the
@@ -78,6 +84,43 @@ class QaProtectedFileMutationError(ValueError):
     closed rather than ship media whose non-boot-config content
     silently diverged from what production inspection already
     verified."""
+
+
+def _confine(extracted_dir: Path, relative: str) -> Path:
+    """Resolve ``relative`` against ``extracted_dir``, failing closed
+    (:class:`QaBootError` - ``QA_TRANSITION=BLOCKED``) if it does not
+    resolve inside the extraction root - e.g. a symlink whose target
+    escapes the tree (S7.0RM5 Corrective A/Section 7). Never chmods or
+    writes a path outside the extraction root."""
+    try:
+        return resolve_within(extracted_dir, relative)
+    except PathSafetyError as exc:
+        raise QaBootError(
+            f"QA_TRANSITION=BLOCKED: {relative!r} escapes the extraction root: {exc}"
+        ) from exc
+
+
+@contextmanager
+def _temporarily_owner_writable(path: Path) -> Iterator[None]:
+    """Ensure ``path`` has its owner-write bit set for the duration of
+    this context, then restore its exact original mode afterward - even
+    if the body raises (S7.0RM5 Corrective A/Section 6).
+
+    A real Ubuntu ISO extraction can preserve a non-owner-writable mode
+    on individual files (the real defect this corrective fixes - a real
+    Layer-B run hit ``PermissionError`` writing the discovered
+    ``boot/grub/grub.cfg``). This narrowly unblocks writing to exactly
+    the one already-path-confined file passed in - never a recursive
+    ``chmod``, and the final QA tree never retains a newly-added
+    writable bit that was not present in the original extraction.
+    """
+    original_mode = stat.S_IMODE(path.stat().st_mode)
+    try:
+        if not original_mode & stat.S_IWUSR:
+            path.chmod(original_mode | stat.S_IWUSR)
+        yield
+    finally:
+        path.chmod(original_mode)
 
 
 @dataclass(frozen=True)
@@ -128,11 +171,12 @@ def transition_to_qa_in_place(extracted_dir: Path) -> QaTransitionResult:
 
     before = _protected_file_manifest(extracted_dir, excluded)
 
-    grub_path = extracted_dir / grub_relative
+    grub_path = _confine(extracted_dir, grub_relative)
     original_text = grub_path.read_text(encoding="utf-8")
     qa_entry_text = derive_qa_menuentry(original_text)
     patched_text = install_qa_entry_as_default(original_text, qa_entry_text)
-    grub_path.write_text(patched_text, encoding="utf-8")
+    with _temporarily_owner_writable(grub_path):
+        grub_path.write_text(patched_text, encoding="utf-8")
 
     catalog_updated = update_checksum_catalog_if_present(extracted_dir, grub_relative)
 
@@ -260,6 +304,7 @@ def update_checksum_catalog_if_present(tree_root: Path, modified_relative_path: 
     catalog_path = tree_root / "md5sum.txt"
     if not catalog_path.is_file():
         return False
+    catalog_path = _confine(tree_root, "md5sum.txt")
 
     normalized_target = modified_relative_path.lstrip("./")
     lines = catalog_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -279,7 +324,8 @@ def update_checksum_catalog_if_present(tree_root: Path, modified_relative_path: 
         new_lines.append(line)
 
     if updated:
-        catalog_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        with _temporarily_owner_writable(catalog_path):
+            catalog_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     return updated
 
 
@@ -293,12 +339,13 @@ def prepare_qa_variant(extracted_dir: Path, qa_extracted_dir: Path) -> QaVariant
     shutil.copytree(extracted_dir, qa_extracted_dir)
 
     grub_relative = discover_grub_config(qa_extracted_dir)
-    grub_path = qa_extracted_dir / grub_relative
+    grub_path = _confine(qa_extracted_dir, grub_relative)
     original_text = grub_path.read_text(encoding="utf-8")
 
     qa_entry_text = derive_qa_menuentry(original_text)
     patched_text = install_qa_entry_as_default(original_text, qa_entry_text)
-    grub_path.write_text(patched_text, encoding="utf-8")
+    with _temporarily_owner_writable(grub_path):
+        grub_path.write_text(patched_text, encoding="utf-8")
 
     catalog_updated = update_checksum_catalog_if_present(qa_extracted_dir, grub_relative)
 

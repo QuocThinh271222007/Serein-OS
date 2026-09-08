@@ -1,4 +1,4 @@
-# Known Limitations (S7.0; updated by the S7.0R Layer-B closure corrective)
+# Known Limitations (S7.0; updated by the S7.0R Layer-B closure corrective; most recently S7.0RM5)
 
 ## Scope limitations (by design - Section 83)
 
@@ -33,9 +33,9 @@
 - **Physical hardware boot not verified.** `REAL_PHYSICAL_BOOT=NOT_PERFORMED`
   - out of scope without a disposable physical machine (Section 96).
 
-## Real Layer B validation status (S7.0RM4)
+## Real Layer B validation status (S7.0RM5)
 
-**Three real Layer-B runs have now occurred**, each on the exact
+**Four real Layer-B runs have now occurred**, each on the exact
 reviewed feature HEAD, each exposing a genuine defect this corrective
 history has fixed in turn:
 
@@ -84,13 +84,70 @@ Run 3 (after S7.0RM3):
   `-V "Ubuntu 26.04.1 LTS amd64"` replayed after Serein's own
   `-V SEREIN_ALPHA`, which would have silently won and retitled the
   media. Both fixed by S7.0RM4 (Correctives A and C).
+
+Run 4 (after S7.0RM4):
+  RUN_ID=34175627527, RUN_NUMBER=6
+  HEAD=5e6c60dccbfca8f6843050e9086b8828e37a14df
+  RESULT=FAILURE - the furthest real progress yet: base download,
+  sha256 verification, and signature verification all PASSED, the real
+  El Torito report PASSED, and - for the first time - the PRODUCTION
+  ISO ITSELF FULLY BUILT AND PASSED STRICT INSPECTION:
+    production ISO = serein-alpha-26.04-amd64.iso
+    sha256 = 6263ec532213958ddd0f0e7d24ffb6e229a2a1e5b4a3e94a03416c4ff6205add
+    volume-id = SEREIN_ALPHA, 33 boot flags, media-marker PASS,
+    payload-manifest 41 entries hash-verified, STRICT_PASSED.
+  The run then failed inside the in-place QA transition:
+    PermissionError: [Errno 13] Permission denied:
+    build/work/extracted/boot/grub/grub.cfg
+  - real Ubuntu ISO extraction preserves file modes such that
+  boot/grub/grub.cfg is not necessarily owner-writable, which no
+  fixture-based test had exercised. The evidence this run produced was
+  ALSO factually wrong: `production_build=fail`, even though production
+  had fully succeeded - because the entire "Build Serein Alpha ISO"
+  step is one combined shell invocation, so a failure anywhere inside
+  it (including after production was already done) looked identical to
+  an outright production failure. Both fixed by S7.0RM5 (Correctives A
+  and B).
 ```
 
-The exact-head checkout has now worked correctly in all three real
+The exact-head checkout has now worked correctly in all four real
 runs, confirming Corrective A (S7.0R)'s PR-trigger and exact-head model
 remain sound across this whole corrective history.
 
-**S7.0RM4 fixes the two defects Run 3 exposed:**
+**S7.0RM5 fixes the two defects Run 4 exposed:**
+
+- **Corrective A** - `serein.distribution.qa_boot` now inspects a
+  target file's real mode before writing it, temporarily sets the
+  owner-write bit only on that exact file if it is not already set,
+  writes, and restores the exact original mode afterward - even on
+  exception (`try`/`finally`). Applied narrowly at the two write sites
+  this module has (the discovered GRUB config, and the internal
+  `md5sum.txt` checksum catalog if present and if an update is actually
+  needed) plus, for consistency, the older copy-based
+  `prepare_qa_variant`. Never a recursive/tree-wide `chmod` - every
+  other file's mode is provably untouched
+  (`TestQaTransitionPermissions`). Every target path is resolved
+  through the same path-safety confinement used elsewhere in the
+  codebase (`serein.distribution.pathsafety.resolve_within`) before any
+  chmod/write is attempted, failing closed as `QA_TRANSITION=BLOCKED`
+  (never `sudo`) if a discovered path - e.g. a symlink - would resolve
+  outside the extraction root. The protected-file manifest/
+  `QaProtectedFileMutationError` invariant is unchanged and fully
+  intact.
+- **Corrective B** - `run_build()` now writes
+  `dist/build-stage-status.json` (schema v3 of the Layer-B evidence
+  model adds the matching `qa_transition` field) the instant each real
+  stage - `production_build`, then `qa_transition`, then `qa_build` -
+  genuinely completes or fails, never early. The evidence-assembly step
+  prefers this marker over the single combined step outcome whenever it
+  exists, so "production fully succeeded, QA transition then failed"
+  now correctly serializes as `production_build=pass,
+  qa_transition=fail, qa_build=not_performed` - never a fabricated
+  `production_build=fail`. The closure gate now also requires
+  `qa_transition=pass`, so a production-only success still never
+  satisfies closure.
+
+**S7.0RM4 fixed the two defects Run 3 exposed:**
 
 - **Corrective A** - the base ISO is now released (in
   `ephemeral_storage` mode) only after every xorriso command that could
@@ -137,22 +194,22 @@ remain sound across this whole corrective history.
 
 This development environment still has no `xorriso`/`qemu`/
 `squashfs-tools` installed (unchanged from every prior pass this
-session), so the S7.0RM4 corrective code itself has only been
+session), so the S7.0RM5 corrective code itself has only been
 validated via the fully injectable fake-`xorriso` Layer-A test suite
-(`tests/test_distribution.py`, 1225+ tests passing, including
-behavioral tests that record whether the base ISO file actually exists
-on disk at the moment each rebuild command is invoked) - not against a
-fourth real Layer-B run, which has not yet been observed from this
-environment:
+(`tests/test_distribution.py`, 1257+ tests passing, including real
+filesystem-mode-bit regressions that chmod a fixture file read-only
+before exercising the fix, and fake-runner regressions that fail the
+production vs. QA rebuild independently) - not against a fifth real
+Layer-B run, which has not yet been observed from this environment:
 
 | Field | Status | Why |
 |---|---|---|
-| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **PASS** (Run 3) | Confirmed real: base download, sha256 verify, and signature verify all passed on Run 3 against the real `ubuntu-26.04.1-desktop-amd64.iso`. |
-| `REAL_BASE_EL_TORITO_REPORT` | **PASS** (Run 3) | The S7.0RM3 fix worked - `dist/` is now guaranteed to exist before the redirect. |
-| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **NOT_PERFORMED** (this pass) | Run 3 reached the production xorriso rebuild but failed - base ISO already deleted (Corrective A) and a volume-ID conflict (Corrective C), both fixed here. Not yet re-run for real. |
-| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **NOT_PERFORMED** (real .iso, strict) / lenient structural inspection **DID** run against a fixture extracted tree, all checks pass | The strict inspector's logic is proven against a fully-faked `xorriso` (`tests/test_distribution.py::TestStrictInspector`), never real tool output. |
-| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **NOT_PERFORMED** | The in-place QA transition (Corrective A/B) is proven against the real fixture tree's real `grub.cfg`, never a real base image's GRUB config. |
-| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** | No ISO exists to boot yet. The marker-aware monitor (Corrective D) is proven with a fully faked `Popen`/clock (`tests/test_distribution.py::TestBootSmoke`), never a real QEMU process. |
+| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **PASS** (Run 4) | Confirmed real: base download, sha256 verify, and signature verify all passed on Run 4 against the real `ubuntu-26.04.1-desktop-amd64.iso`. |
+| `REAL_BASE_EL_TORITO_REPORT` | **PASS** (Run 4) | The S7.0RM3 fix continues to hold. |
+| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **PASS** (Run 4) | The production ISO fully built for the first time - `serein-alpha-26.04-amd64.iso`, sha256 `6263ec532213958ddd0f0e7d24ffb6e229a2a1e5b4a3e94a03416c4ff6205add`. |
+| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **PASS** (Run 4) | Strict inspection of the real production ISO passed: volume-id=SEREIN_ALPHA, 33 boot flags, media-marker PASS, payload-manifest 41 entries hash-verified. |
+| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **NOT_PERFORMED** (this pass) | Run 4 failed the in-place QA transition itself (`PermissionError` on a real read-only `boot/grub/grub.cfg`) before any QA rebuild command was even constructed. Fixed by S7.0RM5 Corrective A; not yet re-run for real. |
+| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** | No QA ISO has been produced by a real run yet. The marker-aware monitor (Corrective D) is proven with a fully faked `Popen`/clock (`tests/test_distribution.py::TestBootSmoke`), never a real QEMU process. |
 | `REAL_INSTALLER_REACHABILITY` | **NOT_PERFORMED** | Depends on the above. |
 | `REAL_UEFI_BOOT` | **NOT_PERFORMED** | No OVMF firmware image available locally; `--require-uefi` fail-closed logic is unit-tested, never exercised against real OVMF. |
 | `REAL_BIOS_BOOT` | **NOT_PERFORMED** | No QEMU available. |
@@ -169,18 +226,18 @@ and should not request interactively.
 **PR #9 retains the `run-iso-smoke` label.** `iso-smoke.yml` already
 supports `pull_request: synchronize` while the label remains attached -
 pushing this corrective's commits should automatically trigger a
-fourth real Layer-B run on the new exact HEAD, with no separate action
+fifth real Layer-B run on the new exact HEAD, with no separate action
 needed. This repository's `gh` CLI remains unavailable in this
 environment (consistent with every prior phase this session), so this
 pass could not itself observe that new run's outcome.
 
 ```text
-S7_0RM4_LAYER_B_TRIGGER_READY=true
-S7_0RM4_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
+S7_0RM5_LAYER_B_TRIGGER_READY=true
+S7_0RM5_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
 ```
 
 Per the corrective's own merge rule: **`S7_0_READY_FOR_MERGE=NO`**
-until a Layer-B run against the exact final S7.0RM4 commit turns every `REAL_*` field above
+until a Layer-B run against the exact final S7.0RM5 commit turns every `REAL_*` field above
 to a genuine PASS - this document states that blocker honestly rather
 than fabricating success. The independent reviewer should watch the
 automatically-triggered run (or re-apply/re-trigger it if needed) on
@@ -188,6 +245,23 @@ the new HEAD.
 
 ## Implementation-scope limitations (this alpha pass specifically)
 
+- **Resolved in S7.0RM5**: writing the discovered GRUB config (and the
+  internal `md5sum.txt` checksum catalog, if present) during the
+  in-place QA transition no longer assumes the file is owner-writable -
+  a real Ubuntu ISO extraction can preserve a non-owner-writable mode
+  on it. The fix is narrowly scoped to the exact file being
+  intentionally mutated (never a recursive `chmod`), confined by the
+  same path-safety primitive used elsewhere in the codebase, and
+  restores the file's exact original mode afterward even on exception.
+- **Resolved in S7.0RM5**: `production_build`/`qa_transition`/
+  `qa_build` are no longer derived solely from the "Build Serein Alpha
+  ISO" step's single combined outcome, which conflated "production
+  fully succeeded, QA transition then failed" with an outright
+  production failure. `run_build()` now writes a small, authoritative
+  `dist/build-stage-status.json` marker the instant each stage
+  genuinely completes or fails; the evidence-assembly step prefers it
+  whenever it exists, and the Layer-B closure gate now also requires
+  `qa_transition=pass`.
 - **Resolved in S7.0RM4**: the base ISO is no longer released (in
   `ephemeral_storage` mode) before both rebuild commands have actually
   run - a real report's replayed boot flags can reference the base

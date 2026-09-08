@@ -32,6 +32,10 @@ def enforce_layer_b_closure(evidence: LayerBEvidence, expected_source_commit: st
     - ``source_commit`` matches the expected PR head exactly
     - ``base_verified`` is true
     - ``production_build``/``production_inspection`` are both "pass"
+    - ``qa_transition`` is "pass" (S7.0RM5 Corrective B: a production
+      pass alone must never satisfy closure - a real run proved
+      production can fully succeed while the subsequent in-place QA
+      transition still fails)
     - ``qa_build``/``qa_inspection`` are both "pass"
     - ``qemu_boot`` is "pass" and ``qemu_boot_mode`` is "uefi"
     - ``boot_marker`` is non-empty
@@ -53,6 +57,8 @@ def enforce_layer_b_closure(evidence: LayerBEvidence, expected_source_commit: st
         failures.append(
             f"production_inspection={evidence.production_inspection!r} (require 'pass')"
         )
+    if evidence.qa_transition != "pass":
+        failures.append(f"qa_transition={evidence.qa_transition!r} (require 'pass')")
     if evidence.qa_build != "pass":
         failures.append(f"qa_build={evidence.qa_build!r} (require 'pass')")
     if evidence.qa_inspection != "pass":

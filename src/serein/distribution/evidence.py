@@ -16,6 +16,19 @@ file it assumed would exist). ``source_commit`` is known from the very
 first workflow step (the exact-head checkout), before anything else
 happens, so it is the only field this module ever requires as a plain
 argument rather than an optional stage result.
+
+**Schema v3 (S7.0RM5 Corrective B)** adds ``qa_transition`` - a real
+Layer-B run reached, for the first time, a state where the production
+ISO fully built and passed strict inspection but the in-place QA
+transition then failed (a real ``PermissionError`` patching the
+extracted GRUB config). The prior schema had no way to express that
+without either lying that production had failed (it had not) or
+lying that the QA build had failed (it never ran). ``qa_transition``
+sits between ``production_inspection`` and ``qa_build`` in the real
+pipeline order: "not_performed" before it is attempted (e.g. when
+production itself failed), "pass" once
+:func:`serein.distribution.qa_boot.transition_to_qa_in_place` returns
+successfully, "fail" if it raises.
 """
 
 from __future__ import annotations
@@ -24,7 +37,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-DISTRIBUTION_LAYER_B_EVIDENCE_SCHEMA_VERSION = 2
+DISTRIBUTION_LAYER_B_EVIDENCE_SCHEMA_VERSION = 3
 
 #: Valid values for every stage-result field below - "not_performed" is
 #: the honest default for a stage that never ran, never a guessed
@@ -48,6 +61,8 @@ class LayerBEvidence:
     production_build: str = "not_performed"
     production_inspection: str = "not_performed"
 
+    qa_transition: str = "not_performed"
+
     qa_iso_filename: str | None = None
     qa_iso_sha256: str | None = None
     qa_build: str = "not_performed"
@@ -65,7 +80,7 @@ class LayerBEvidence:
     def __post_init__(self) -> None:
         stage_fields = (
             "production_build", "production_inspection",
-            "qa_build", "qa_inspection", "qemu_boot",
+            "qa_transition", "qa_build", "qa_inspection", "qemu_boot",
         )
         for field_name in stage_fields:
             value = getattr(self, field_name)
@@ -86,6 +101,7 @@ class LayerBEvidence:
             "production_iso_sha256": self.production_iso_sha256,
             "production_build": self.production_build,
             "production_inspection": self.production_inspection,
+            "qa_transition": self.qa_transition,
             "qa_iso_filename": self.qa_iso_filename,
             "qa_iso_sha256": self.qa_iso_sha256,
             "qa_build": self.qa_build,
@@ -110,6 +126,7 @@ def assemble_layer_b_evidence(
     production_iso_sha256: str | None = None,
     production_build: str = "not_performed",
     production_inspection: str = "not_performed",
+    qa_transition: str = "not_performed",
     qa_iso_filename: str | None = None,
     qa_iso_sha256: str | None = None,
     qa_build: str = "not_performed",
@@ -145,6 +162,7 @@ def assemble_layer_b_evidence(
         production_iso_sha256=production_iso_sha256,
         production_build=production_build,
         production_inspection=production_inspection,
+        qa_transition=qa_transition,
         qa_iso_filename=qa_iso_filename,
         qa_iso_sha256=qa_iso_sha256,
         qa_build=qa_build,
@@ -179,6 +197,7 @@ def load_layer_b_evidence(path: Path) -> LayerBEvidence:
         production_iso_sha256=data.get("production_iso_sha256"),
         production_build=data.get("production_build", "not_performed"),
         production_inspection=data.get("production_inspection", "not_performed"),
+        qa_transition=data.get("qa_transition", "not_performed"),
         qa_iso_filename=data.get("qa_iso_filename"),
         qa_iso_sha256=data.get("qa_iso_sha256"),
         qa_build=data.get("qa_build", "not_performed"),

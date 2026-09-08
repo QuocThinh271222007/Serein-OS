@@ -71,7 +71,16 @@ repository builds an ISO.
                                          outside the GRUB config + checksum catalog is
                                          hash-verified unchanged, or a
                                          QaProtectedFileMutationError aborts the whole
-                                         build (never ships unverified QA media)
+                                         build (never ships unverified QA media). A real
+                                         extracted GRUB config is not necessarily
+                                         owner-writable - S7.0RM5 Corrective A temporarily
+                                         sets the owner-write bit on ONLY that exact file
+                                         (never a recursive chmod), writes, and restores
+                                         its exact original mode afterward, even on
+                                         exception; every target path is confined via
+                                         serein.distribution.pathsafety.resolve_within
+                                         first, failing closed as QA_TRANSITION=BLOCKED
+                                         on an escape (e.g. a symlink), never `sudo`
 
 12. rebuild QA ISO reusing the         same rebuild command (same filtered boot flags) as
     SAME boot flags from step 4          step 9, targeting the now-QA-form extraction
@@ -91,6 +100,47 @@ repository builds an ISO.
                                          on an exception path - a genuine failure keeps
                                          the base ISO on disk for forensic inspection.
 ```
+
+## Build-stage evidence marker (S7.0RM5 Corrective B)
+
+The entire `run_build()` call (steps 1-14 above) is invoked from ONE
+combined `./distribution/scripts/build-iso.sh` shell step in
+`.github/workflows/iso-smoke.yml` - a real Layer-B run proved that
+step's own overall outcome (success/failure) is too coarse to evaluate
+alone: production can fully succeed (steps 1-10) and the run can still
+fail afterward, purely in the QA transition (step 11) or QA rebuild
+(step 12).
+
+`run_build()` writes `dist/build-stage-status.json`
+(`serein.distribution.build.stage_status_path` /
+`BuildStageStatus` / `load_build_stage_status`) the instant - and only
+the instant - each of `production_build`, `qa_transition`, `qa_build`
+genuinely completes or genuinely fails, e.g.:
+
+```json
+{
+  "production_build": "pass",
+  "qa_transition": "fail",
+  "qa_build": "not_performed",
+  "failure_stage": "qa_transition",
+  "failure_reason": "QA transition safety check failed: ..."
+}
+```
+
+`python -m serein.distribution evidence --build-stage-status
+dist/build-stage-status.json` reads this marker when present and lets
+it override the coarser `--production-build`/`--qa-transition`/
+`--qa-build` flags (and `--failure-stage`/`--failure-reason`, if the
+marker recorded a failure) that `iso-smoke.yml` still passes as a
+fallback for the case where `run_build()` never got far enough to write
+it at all (e.g. an even earlier failure, before any stage began). This
+is deliberately the one stage-progress marker mechanism - never several
+competing ones - and its corresponding Layer-B evidence field is
+`qa_transition` (schema v3 of
+`schemas/distribution-layer-b-evidence.schema.json`); the closure gate
+(`serein.distribution.closure.enforce_layer_b_closure`) now also
+requires `qa_transition == "pass"`, so a production-only success can
+never by itself satisfy closure.
 
 ## Canonical production ISO vs. QA boot variant (Corrective B)
 

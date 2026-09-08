@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from dataclasses import replace
 from pathlib import Path
@@ -35,7 +36,13 @@ from serein.distribution.bootsmoke import (
     evaluate_boot_log,
     run_boot_smoke,
 )
-from serein.distribution.build import BuildError, BuildResult, run_build
+from serein.distribution.build import (
+    BuildError,
+    BuildResult,
+    load_build_stage_status,
+    run_build,
+    stage_status_path,
+)
 from serein.distribution.closure import ClosureError, enforce_layer_b_closure
 from serein.distribution.evidence import assemble_layer_b_evidence, write_layer_b_evidence
 from serein.distribution.inspect import (
@@ -1669,6 +1676,23 @@ class TestLayerBWorkflow:
         assert "sha256sum" in base_sha["run"]
         assert base_sha.get("id") == "base-sha"
 
+    # -- S7.0RM5 Corrective B: finer-grained build-stage marker --
+
+    def test_evidence_step_prefers_build_stage_status_marker_when_present(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        assemble = next(s for s in steps if s.get("name") == "Assemble Layer-B evidence")
+        script = assemble["run"]
+        assert "--build-stage-status" in script
+        assert "dist/build-stage-status.json" in script
+        # still passes --qa-transition as part of the coarse fallback,
+        # for when the marker itself does not exist
+        assert "--qa-transition" in script
+
+    def test_build_stage_status_marker_uploaded_as_evidence(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        assert "dist/build-stage-status.json" in upload["with"]["path"]
+
     # -- S7.0RM2 Corrective D: coherent disk-preflight arithmetic --
 
     def test_disk_preflight_arithmetic_is_internally_coherent(self, workflow):
@@ -1941,17 +1965,49 @@ class TestLayerBEvidence:
         with pytest.raises(ValueError, match="production_build"):
             assemble_layer_b_evidence(source_commit="a" * 40, production_build="maybe")  # type: ignore[arg-type]
 
+    def test_invalid_qa_transition_status_rejected(self):
+        with pytest.raises(ValueError, match="qa_transition"):
+            assemble_layer_b_evidence(source_commit="a" * 40, qa_transition="maybe")  # type: ignore[arg-type]
+
+    def test_qa_transition_defaults_not_performed(self):
+        # S7.0RM5 Corrective B: honest default for a build that never
+        # reached (or never started) the QA transition stage.
+        evidence = assemble_layer_b_evidence(source_commit="a" * 40)
+        assert evidence.qa_transition == "not_performed"
+
+    def test_schema_version_bumped_to_3(self):
+        evidence = assemble_layer_b_evidence(source_commit="a" * 40)
+        assert evidence.schema_version == 3
+        assert evidence.to_dict()["schema_version"] == 3
+
+    def test_production_pass_qa_transition_fail_qa_build_not_performed_matches_schema(self):
+        # The exact real S7.0RM5 run's true evidence shape (Section 4).
+        evidence = assemble_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="qa_transition",
+            failure_reason="failed to patch extracted GRUB config",
+            base_sha256_expected="b" * 64, base_sha256_actual="b" * 64,
+            production_build="pass", production_inspection="pass",
+            qa_transition="fail",
+        )
+        assert evidence.production_build == "pass"
+        assert evidence.qa_transition == "fail"
+        assert evidence.qa_build == "not_performed"
+        schema = _load_schema("distribution-layer-b-evidence.schema.json")
+        jsonschema.validate(evidence.to_dict(), schema)
+
     def test_round_trip_through_load(self, tmp_path):
         from serein.distribution.evidence import load_layer_b_evidence
 
         original = assemble_layer_b_evidence(
-            source_commit="a" * 40, production_build="pass", qa_build="fail",
-            failure_stage="qa_build", failure_reason="QA_BUILD=BLOCKED",
+            source_commit="a" * 40, production_build="pass", qa_transition="pass",
+            qa_build="fail", failure_stage="qa_build", failure_reason="QA_BUILD=BLOCKED",
         )
         path = write_layer_b_evidence(original, tmp_path / "evidence.json")
         reloaded = load_layer_b_evidence(path)
         assert reloaded.source_commit == original.source_commit
         assert reloaded.production_build == "pass"
+        assert reloaded.qa_transition == "pass"
         assert reloaded.qa_build == "fail"
         assert reloaded.failure_stage == "qa_build"
 
@@ -2038,6 +2094,72 @@ class TestEvidenceCliEndToEnd:
         assert data["production_build"] == "fail"
         assert data["qa_build"] == "not_performed"
         assert data["base_verified"] is True  # real hashes matched
+
+    def test_build_stage_status_marker_overrides_coarse_flags(self, tmp_path):
+        # S7.0RM5 Corrective B: the CLI-level integration point the
+        # workflow actually uses - when dist/build-stage-status.json
+        # exists, it is ground truth even though the plain
+        # --production-build/--qa-build flags (mirroring the workflow's
+        # coarse steps.build.outcome fallback) claim otherwise.
+        from serein.distribution.__main__ import main
+
+        marker_path = tmp_path / "build-stage-status.json"
+        marker_path.write_text(json.dumps({
+            "production_build": "pass",
+            "qa_transition": "fail",
+            "qa_build": "not_performed",
+            "failure_stage": "qa_transition",
+            "failure_reason": "failed to patch extracted GRUB config",
+        }))
+
+        out_path = tmp_path / "evidence.json"
+        argv = [
+            "evidence",
+            "--source-commit", "a" * 40,
+            # the coarse fallback the workflow's steps.build.outcome
+            # derivation would set for an overall-failed combined step -
+            # must be OVERRIDDEN by the marker, not trusted.
+            "--failure-stage", "production_or_qa_build",
+            "--failure-reason", "build-iso.sh failed",
+            "--production-build", "fail",
+            "--qa-transition", "not_performed",
+            "--qa-build", "not_performed",
+            "--base-sha256-expected", "b" * 64,
+            "--base-sha256-actual", "b" * 64,
+            "--build-stage-status", str(marker_path),
+            "--out", str(out_path),
+        ]
+        assert main(argv) == 0
+        data = json.loads(out_path.read_text())
+        assert data["production_build"] == "pass"
+        assert data["qa_transition"] == "fail"
+        assert data["qa_build"] == "not_performed"
+        assert data["failure_stage"] == "qa_transition"
+        assert data["failure_reason"] == "failed to patch extracted GRUB config"
+
+    def test_build_stage_status_missing_file_leaves_flags_untouched(self, tmp_path):
+        # --build-stage-status pointing at a nonexistent file (e.g. an
+        # even-earlier failure before run_build() ever wrote it) must
+        # never crash and must never fabricate anything - the plain
+        # flags remain authoritative.
+        from serein.distribution.__main__ import main
+
+        out_path = tmp_path / "evidence.json"
+        argv = [
+            "evidence",
+            "--source-commit", "a" * 40,
+            "--failure-stage", "base_fetch", "--failure-reason", "fetch failed",
+            "--production-build", "not_performed",
+            "--qa-transition", "not_performed",
+            "--qa-build", "not_performed",
+            "--build-stage-status", str(tmp_path / "does-not-exist.json"),
+            "--out", str(out_path),
+        ]
+        assert main(argv) == 0
+        data = json.loads(out_path.read_text())
+        assert data["production_build"] == "not_performed"
+        assert data["qa_transition"] == "not_performed"
+        assert data["failure_stage"] == "base_fetch"
 
     def test_closure_gate_cli_fails_closed_on_early_failure_evidence(self, tmp_path):
         from serein.distribution.__main__ import main
@@ -2292,6 +2414,168 @@ def _fake_build_runner_without_grub():
     return runner
 
 
+def _fake_build_runner_production_rebuild_fails(grub_text: str):
+    """Same as :func:`_fake_build_runner`, except the FIRST
+    ``-as mkisofs`` invocation (the production rebuild) fails - proves
+    a real production xorriso failure maps to
+    ``failure_stage=production_build`` (Test B1)."""
+    base_runner = _fake_build_runner(grub_text)
+
+    def runner(argv, **kwargs):
+        if "-as" in argv and "mkisofs" in argv:
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="simulated production xorriso failure"
+            )
+        return base_runner(argv, **kwargs)
+
+    return runner
+
+
+def _fake_build_runner_qa_rebuild_fails(grub_text: str):
+    """Same as :func:`_fake_build_runner`, except the SECOND
+    ``-as mkisofs`` invocation (the QA rebuild, after the production
+    rebuild already succeeded and the QA transition already succeeded)
+    fails - proves a future QA xorriso failure maps to
+    ``failure_stage=qa_build`` (Test B3)."""
+    base_runner = _fake_build_runner(grub_text)
+    call_count = {"mkisofs": 0}
+
+    def runner(argv, **kwargs):
+        if "-as" in argv and "mkisofs" in argv:
+            call_count["mkisofs"] += 1
+            if call_count["mkisofs"] == 2:
+                return subprocess.CompletedProcess(
+                    argv, 1, stdout="", stderr="simulated QA xorriso failure"
+                )
+        return base_runner(argv, **kwargs)
+
+    return runner
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM5 Corrective B: explicit build-stage evidence fidelity
+# (Tests B1-B5; B6 lives in TestClosureGate above)
+# ---------------------------------------------------------------------------
+
+
+class TestBuildStageStatusEvidence:
+    """A real Layer-B run produced factually wrong evidence
+    (``production_build=fail``) even though production had fully
+    succeeded, because the entire ``run_build()`` invocation is one
+    combined shell step. These prove ``dist/build-stage-status.json``
+    - written by ``run_build()`` itself, the instant each stage
+    genuinely completes or fails - gives the precise, truthful
+    per-stage picture a single combined step outcome cannot."""
+
+    def test_b1_production_failure_qa_never_attempted(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner_production_rebuild_fails(grub_text)
+        output_iso = tmp_path / "dist" / "serein-alpha-26.04-amd64.iso"
+
+        with pytest.raises(BuildError):
+            run_build(
+                repo_root=repo_root, work_dir=tmp_path / "work", output_iso=output_iso,
+                source_commit="a" * 40, subprocess_runner=runner,
+            )
+
+        status = load_build_stage_status(stage_status_path(output_iso))
+        assert status.production_build == "fail"
+        assert status.qa_transition == "not_performed"
+        assert status.qa_build == "not_performed"
+        assert status.failure_stage == "production_build"
+
+    def test_b2_production_pass_qa_transition_fail_is_the_real_regression(
+        self, tmp_path, monkeypatch
+    ):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+        work_dir = tmp_path / "work"
+        output_iso = tmp_path / "dist" / "serein-alpha-26.04-amd64.iso"
+
+        real_install = install_qa_entry_as_default
+
+        def corrupting_install(grub_cfg_text, qa_entry_text):
+            (work_dir / "extracted" / "EFI" / "boot" / "bootx64.efi").write_bytes(b"corrupted!")
+            return real_install(grub_cfg_text, qa_entry_text)
+
+        monkeypatch.setattr(
+            "serein.distribution.qa_boot.install_qa_entry_as_default", corrupting_install
+        )
+
+        with pytest.raises(BuildError):
+            run_build(
+                repo_root=repo_root, work_dir=work_dir, output_iso=output_iso,
+                source_commit="a" * 40, subprocess_runner=runner,
+            )
+
+        status = load_build_stage_status(stage_status_path(output_iso))
+        # the exact real-run regression: production must never be
+        # reported as failed merely because a later QA transition failed
+        assert status.production_build == "pass"
+        assert status.qa_transition == "fail"
+        assert status.qa_build == "not_performed"
+        assert status.failure_stage == "qa_transition"
+
+    def test_b3_qa_transition_pass_qa_rebuild_fail(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner_qa_rebuild_fails(grub_text)
+        output_iso = tmp_path / "dist" / "serein-alpha-26.04-amd64.iso"
+
+        with pytest.raises(BuildError):
+            run_build(
+                repo_root=repo_root, work_dir=tmp_path / "work", output_iso=output_iso,
+                source_commit="a" * 40, subprocess_runner=runner,
+            )
+
+        status = load_build_stage_status(stage_status_path(output_iso))
+        assert status.production_build == "pass"
+        assert status.qa_transition == "pass"
+        assert status.qa_build == "fail"
+        assert status.failure_stage == "qa_build"
+
+    def test_b4_full_build_success_all_stages_pass(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        runner = _fake_build_runner(grub_text)
+        output_iso = tmp_path / "dist" / "serein-alpha-26.04-amd64.iso"
+
+        result = run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work", output_iso=output_iso,
+            source_commit="a" * 40, subprocess_runner=runner,
+        )
+        assert result.qa is not None
+
+        status = load_build_stage_status(stage_status_path(output_iso))
+        assert status.production_build == "pass"
+        assert status.qa_transition == "pass"
+        assert status.qa_build == "pass"
+        assert status.failure_stage is None
+
+    def test_b5_early_base_failure_all_not_performed(self, tmp_path):
+        # Preserves S7.0RM2 semantics: a failure before run_build() ever
+        # begins the production stage must never fabricate "fail" for a
+        # stage that never started - no marker is even written.
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+        base_iso.write_bytes(b"corrupted bytes that will not match the pinned sha256")
+        output_iso = tmp_path / "dist" / "serein-alpha-26.04-amd64.iso"
+
+        with pytest.raises(BuildError):
+            run_build(
+                repo_root=repo_root, work_dir=tmp_path / "work", output_iso=output_iso,
+                source_commit="a" * 40,
+                subprocess_runner=_fake_build_runner("irrelevant, never reached"),
+            )
+
+        status = load_build_stage_status(stage_status_path(output_iso))
+        assert status.production_build == "not_performed"
+        assert status.qa_transition == "not_performed"
+        assert status.qa_build == "not_performed"
+
+
 # ---------------------------------------------------------------------------
 # S7.0RM2 Corrective A: git executable-bit correctness
 # ---------------------------------------------------------------------------
@@ -2491,6 +2775,160 @@ class TestQaInPlaceTransition:
 
 
 # ---------------------------------------------------------------------------
+# S7.0RM5 Corrective A: safe, narrow writability handling for a
+# read-only extracted file (Tests A1-A7)
+# ---------------------------------------------------------------------------
+
+
+class TestQaTransitionPermissions:
+    """A real Layer-B run hit ``PermissionError: [Errno 13] Permission
+    denied: build/work/extracted/boot/grub/grub.cfg`` - real Ubuntu ISO
+    extraction preserves file modes such that ``boot/grub/grub.cfg`` is
+    not necessarily owner-writable. These prove the fix inspects the
+    original mode, temporarily sets owner-write only on the exact file
+    being intentionally mutated, writes, and restores the exact
+    original mode - even on exception - and never touches any other
+    file's mode (never a recursive/tree-wide chmod)."""
+
+    def test_a1_readonly_grub_config_is_patched_successfully(self, tmp_path):
+        dest = tmp_path / "extracted"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", dest)
+        grub_path = dest / "boot" / "grub" / "grub.cfg"
+        grub_path.chmod(stat.S_IREAD)
+
+        result = transition_to_qa_in_place(dest)
+
+        assert QA_ENTRY_TITLE in grub_path.read_text()
+        assert result.grub_config_relative_path == "boot/grub/grub.cfg"
+
+    def test_a2_grub_config_mode_restored_after_success(self, tmp_path):
+        dest = tmp_path / "extracted"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", dest)
+        grub_path = dest / "boot" / "grub" / "grub.cfg"
+        grub_path.chmod(stat.S_IREAD)
+        readonly_mode = stat.S_IMODE(grub_path.stat().st_mode)
+
+        transition_to_qa_in_place(dest)
+
+        assert stat.S_IMODE(grub_path.stat().st_mode) == readonly_mode
+        assert not (readonly_mode & stat.S_IWUSR)
+
+    def test_a3_grub_config_mode_restored_after_forced_exception(self, tmp_path, monkeypatch):
+        dest = tmp_path / "extracted"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", dest)
+        grub_path = dest / "boot" / "grub" / "grub.cfg"
+        grub_path.chmod(stat.S_IREAD)
+        readonly_mode = stat.S_IMODE(grub_path.stat().st_mode)
+
+        real_write_text = Path.write_text
+
+        def failing_write_text(self, *args, **kwargs):
+            if self == grub_path:
+                raise OSError("simulated disk failure mid-write")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", failing_write_text)
+
+        with pytest.raises(OSError):
+            transition_to_qa_in_place(dest)
+
+        # restoration must happen even when the write fails
+        assert stat.S_IMODE(grub_path.stat().st_mode) == readonly_mode
+
+    def test_a4_readonly_checksum_catalog_updated_and_mode_restored(self, tmp_path):
+        dest = tmp_path / "extracted"
+        (dest / "boot" / "grub").mkdir(parents=True)
+        grub_path = dest / "boot" / "grub" / "grub.cfg"
+        grub_path.write_text(
+            'menuentry "Try or Install Serein OS Alpha" {\n'
+            "    linux   /casper/vmlinuz boot=casper splash ---\n"
+            "    initrd  /casper/initrd\n"
+            "}\n"
+        )
+        import hashlib
+
+        stale_hash = hashlib.md5(b"stale").hexdigest()  # noqa: S324
+        catalog_path = dest / "md5sum.txt"
+        catalog_path.write_text(f"{stale_hash}  ./boot/grub/grub.cfg\n")
+        catalog_path.chmod(stat.S_IREAD)
+        readonly_mode = stat.S_IMODE(catalog_path.stat().st_mode)
+
+        result = transition_to_qa_in_place(dest)
+
+        assert result.checksum_catalog_updated is True
+        assert stale_hash not in catalog_path.read_text()
+        assert stat.S_IMODE(catalog_path.stat().st_mode) == readonly_mode
+
+    def test_a5_checksum_catalog_without_relevant_entry_not_rewritten(self, tmp_path):
+        tree = tmp_path / "tree"
+        tree.mkdir()
+        catalog_path = tree / "md5sum.txt"
+        catalog_path.write_text("deadbeef" * 4 + "  ./unrelated/file.txt\n")
+        catalog_path.chmod(stat.S_IREAD)
+        readonly_mode = stat.S_IMODE(catalog_path.stat().st_mode)
+        original_content = catalog_path.read_text()
+
+        updated = update_checksum_catalog_if_present(tree, "boot/grub/grub.cfg")
+
+        assert updated is False
+        assert catalog_path.read_text() == original_content
+        # never chmod'd - a catalog with no relevant entry is never
+        # even opened for write
+        assert stat.S_IMODE(catalog_path.stat().st_mode) == readonly_mode
+
+    def test_a6_unrelated_readonly_protected_file_never_touched(self, tmp_path):
+        dest = tmp_path / "extracted"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", dest)
+        squashfs_like = dest / "casper" / "filesystem.squashfs"
+        squashfs_like.parent.mkdir(parents=True, exist_ok=True)
+        squashfs_like.write_bytes(b"pretend squashfs bytes")
+        squashfs_like.chmod(stat.S_IREAD)
+        readonly_mode = stat.S_IMODE(squashfs_like.stat().st_mode)
+        original_bytes = squashfs_like.read_bytes()
+
+        transition_to_qa_in_place(dest)
+
+        # proves no recursive/tree-wide chmod: an unrelated protected
+        # file's bytes AND mode are both untouched
+        assert squashfs_like.read_bytes() == original_bytes
+        assert stat.S_IMODE(squashfs_like.stat().st_mode) == readonly_mode
+
+    def test_a7_grub_config_symlink_escaping_root_blocked(self, tmp_path):
+        outside = tmp_path / "outside-grub.cfg"
+        outside.write_text("outside content")
+        outside_bytes_before = outside.read_bytes()
+        outside_mode_before = stat.S_IMODE(outside.stat().st_mode)
+
+        dest = tmp_path / "extracted"
+        (dest / "boot" / "grub").mkdir(parents=True)
+        link = dest / "boot" / "grub" / "grub.cfg"
+        try:
+            os.symlink(outside, link)
+        except OSError:
+            pytest.skip("symlink creation not permitted in this environment")
+
+        with pytest.raises(QaBootError, match="QA_TRANSITION=BLOCKED"):
+            transition_to_qa_in_place(dest)
+
+        # fail closed without ever touching the external symlink target
+        assert outside.read_bytes() == outside_bytes_before
+        assert stat.S_IMODE(outside.stat().st_mode) == outside_mode_before
+
+    def test_prepare_qa_variant_handles_readonly_source_grub(self, tmp_path):
+        # S7.0RM5 Corrective A applied for consistency to the older
+        # copy-based transform too.
+        source = tmp_path / "source"
+        shutil.copytree(FIXTURES_DIR / "extracted-tree-ok", source)
+        (source / "boot" / "grub" / "grub.cfg").chmod(stat.S_IREAD)
+
+        dest = tmp_path / "qa"
+        result = prepare_qa_variant(source, dest)
+
+        patched = (dest / result.grub_config_relative_path).read_text()
+        assert QA_ENTRY_TITLE in patched
+
+
+# ---------------------------------------------------------------------------
 # S7.0RM Corrective D/F: boot-mode derivation
 # ---------------------------------------------------------------------------
 
@@ -2513,6 +2951,7 @@ def _passing_evidence(**overrides):
         source_commit="a" * 40,
         base_sha256_expected="b" * 64, base_sha256_actual="b" * 64,
         production_build="pass", production_inspection="pass",
+        qa_transition="pass",
         qa_build="pass", qa_inspection="pass",
         qemu_boot="pass", qemu_boot_mode="uefi",
         boot_marker="Reached target Basic System",
@@ -2540,6 +2979,32 @@ class TestClosureGate:
         evidence = _passing_evidence(qa_build="fail")
         with pytest.raises(ClosureError, match="qa_build"):
             enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_qa_transition_fail_fails(self):
+        evidence = _passing_evidence(qa_transition="fail")
+        with pytest.raises(ClosureError, match="qa_transition"):
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+    def test_b6_production_pass_qa_transition_fail_never_satisfies_closure(self):
+        # S7.0RM5 Corrective B/Section 41 (Test B6) - the exact real
+        # regression: a real run had production_build=pass,
+        # production_inspection=pass, but qa_transition=fail (and
+        # everything downstream genuinely never ran). Closure must
+        # still FAIL - production success alone must never be enough.
+        evidence = assemble_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="qa_transition",
+            failure_reason="failed to patch extracted GRUB config",
+            base_sha256_expected="b" * 64, base_sha256_actual="b" * 64,
+            production_build="pass", production_inspection="pass",
+            qa_transition="fail",
+            qa_build="not_performed", qa_inspection="not_performed",
+            qemu_boot="not_performed",
+        )
+        with pytest.raises(ClosureError) as exc_info:
+            enforce_layer_b_closure(evidence, expected_source_commit="a" * 40)
+        message = str(exc_info.value)
+        assert "qa_transition" in message
 
     def test_qemu_boot_fail_fails(self):
         evidence = _passing_evidence(qemu_boot="fail")

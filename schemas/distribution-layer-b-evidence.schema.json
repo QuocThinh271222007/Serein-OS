@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://serein-os/schemas/distribution-layer-b-evidence.schema.json",
   "title": "Serein Distribution Layer-B Evidence",
-  "description": "Compact, machine-readable evidence a real Layer-B run (fetch/verify/build/inspect/boot) produces, uploaded as a small CI artifact instead of the multi-GB ISO itself (S7.0R Corrective A/Section 8-9). Version 2 (S7.0RM Corrective B) makes every field except source_commit constructible even when an earlier stage failed or never ran - stage-result fields use \"not_performed\" for that, never a fabricated pass/fail. Never includes a username, hostname, home directory, or token.",
+  "description": "Compact, machine-readable evidence a real Layer-B run (fetch/verify/build/inspect/boot) produces, uploaded as a small CI artifact instead of the multi-GB ISO itself (S7.0R Corrective A/Section 8-9). Version 2 (S7.0RM Corrective B) makes every field except source_commit constructible even when an earlier stage failed or never ran - stage-result fields use \"not_performed\" for that, never a fabricated pass/fail. Version 3 (S7.0RM5 Corrective B) adds qa_transition, distinguishing a successful production build followed by a failed in-place QA transition from an outright production build failure - a real run proved the two are not the same thing. Never includes a username, hostname, home directory, or token.",
   "type": "object",
   "required": [
     "schema_version",
@@ -17,6 +17,7 @@
     "production_iso_sha256",
     "production_build",
     "production_inspection",
+    "qa_transition",
     "qa_iso_filename",
     "qa_iso_sha256",
     "qa_build",
@@ -30,7 +31,7 @@
   ],
   "additionalProperties": false,
   "properties": {
-    "schema_version": { "const": 2 },
+    "schema_version": { "const": 3 },
     "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "failure_stage": { "type": ["string", "null"] },
     "failure_reason": { "type": ["string", "null"] },
@@ -42,6 +43,7 @@
     "production_iso_sha256": { "type": ["string", "null"] },
     "production_build": { "type": "string", "enum": ["pass", "fail", "not_performed"] },
     "production_inspection": { "type": "string", "enum": ["pass", "fail", "not_performed"] },
+    "qa_transition": { "type": "string", "enum": ["pass", "fail", "not_performed"] },
     "qa_iso_filename": { "type": ["string", "null"] },
     "qa_iso_sha256": { "type": ["string", "null"] },
     "qa_build": { "type": "string", "enum": ["pass", "fail", "not_performed"] },

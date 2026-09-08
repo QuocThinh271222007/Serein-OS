@@ -44,6 +44,24 @@ base-ISO lifetime corrected by S7.0RM4 Corrective A):
     the report-capture step. See ``docs/distribution/iso-build.md``'s
     "Storage model" for the corrected peak-storage accounting this
     implies.
+
+Stage-level evidence fidelity (S7.0RM5 Corrective B): a real Layer-B
+run reached, for the first time, a state where production fully
+succeeded (ISO built, manifest written, strict inspection passed) but
+the in-place QA transition then failed with a real ``PermissionError``
+- and the evidence the workflow assembled was factually wrong
+(``production_build=fail``) because the entire ``run_build()`` call is
+one combined GitHub Actions shell step, so a failure anywhere inside it
+looked identical to a production-only failure. ``run_build`` now writes
+one small, machine-readable marker (:func:`stage_status_path` -
+``dist/build-stage-status.json`` next to the output ISO by default) as
+soon as - and only as soon as - each real stage genuinely completes or
+genuinely fails: ``production_build``, then ``qa_transition``, then
+``qa_build``. This is the one marker mechanism (never several
+competing ones); ``python -m serein.distribution evidence
+--build-stage-status <path>`` reads it when present to assemble
+precise, truthful evidence even when the whole ``build-iso.sh``
+invocation exits non-zero.
 """
 
 from __future__ import annotations
@@ -116,6 +134,71 @@ class BuildResult:
     production: BuildManifest
     qa: BuildManifest | None
     qa_blocked_reason: str | None = None
+
+
+_STAGE_STATUSES = ("pass", "fail", "not_performed")
+
+
+@dataclass(frozen=True)
+class BuildStageStatus:
+    """The single machine-readable build-stage marker (S7.0RM5
+    Corrective B) - deliberately one mechanism, not several competing
+    ones. Every field defaults to "not_performed": the honest state for
+    a stage ``run_build`` never reached, e.g. because an earlier stage
+    (or something before ``run_build`` was ever called, such as base
+    verification) failed first."""
+
+    production_build: str = "not_performed"
+    qa_transition: str = "not_performed"
+    qa_build: str = "not_performed"
+    failure_stage: str | None = None
+    failure_reason: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "production_build": self.production_build,
+            "qa_transition": self.qa_transition,
+            "qa_build": self.qa_build,
+            "failure_stage": self.failure_stage,
+            "failure_reason": self.failure_reason,
+        }
+
+
+def stage_status_path(output_iso: Path) -> Path:
+    """Where ``run_build`` writes/updates its one stage-progress marker
+    - alongside the output ISO, e.g. ``dist/build-stage-status.json``
+    next to ``dist/serein-alpha-26.04-amd64.iso``."""
+    return output_iso.parent / "build-stage-status.json"
+
+
+def _write_stage_status(path: Path, status: BuildStageStatus) -> None:
+    """Persist ``status`` - called only right after a stage genuinely
+    completes or genuinely fails (never early, never speculatively)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(status.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_build_stage_status(path: Path) -> BuildStageStatus:
+    """Read a previously written marker. Tolerant of an absent file -
+    an even earlier failure (e.g. base verification, before
+    ``run_build`` ever wrote anything) means every stage is honestly
+    "not_performed", not an error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return BuildStageStatus()
+
+    def _stage(name: str) -> str:
+        value = data.get(name, "not_performed")
+        return value if value in _STAGE_STATUSES else "not_performed"
+
+    return BuildStageStatus(
+        production_build=_stage("production_build"),
+        qa_transition=_stage("qa_transition"),
+        qa_build=_stage("qa_build"),
+        failure_stage=data.get("failure_stage"),
+        failure_reason=data.get("failure_reason"),
+    )
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -227,37 +310,62 @@ def run_build(
 
     paths.work_dir.mkdir(parents=True, exist_ok=True)
     reset_extracted_workspace(paths.work_dir, paths.extracted_dir)
-    _run(subprocess_runner, build_extract_command(base_iso, paths.extracted_dir))
-
-    # El Torito report captured right after extraction, while base_iso
-    # still exists.
-    report_result = _run(subprocess_runner, build_report_command(base_iso), capture=True)
-    boot_flags = parse_el_torito_report(report_result)
-
-    overlay_source = repo_root / "distribution" / "overlay"
-    apply_overlay(overlay_source, paths.extracted_dir)
-
-    wheel_path = build_wheel(repo_root, subprocess_runner=subprocess_runner)
-    inspect_wheel_contents(wheel_path)
-
-    payload_manifest_sha256 = _copy_payload_into_tree(
-        paths.extracted_dir, repo_root, source_commit, spec, wheel_path
-    )
 
     paths.output_iso.parent.mkdir(parents=True, exist_ok=True)
-    rebuild_cmd = build_rebuild_command(
-        paths.extracted_dir, boot_flags, paths.output_iso, VOLUME_ID
-    )
-    _run(subprocess_runner, rebuild_cmd)
+    stage_status_file = stage_status_path(paths.output_iso)
 
-    production_manifest = assemble_build_manifest(
-        source_commit=source_commit,
-        base=spec,
-        payload_manifest_sha256=payload_manifest_sha256,
-        output_iso=paths.output_iso,
-        volume_id=VOLUME_ID,
-    )
-    write_build_manifest(production_manifest, paths.output_iso)
+    try:
+        _run(subprocess_runner, build_extract_command(base_iso, paths.extracted_dir))
+
+        # El Torito report captured right after extraction, while
+        # base_iso still exists.
+        report_result = _run(subprocess_runner, build_report_command(base_iso), capture=True)
+        boot_flags = parse_el_torito_report(report_result)
+
+        overlay_source = repo_root / "distribution" / "overlay"
+        apply_overlay(overlay_source, paths.extracted_dir)
+
+        wheel_path = build_wheel(repo_root, subprocess_runner=subprocess_runner)
+        inspect_wheel_contents(wheel_path)
+
+        payload_manifest_sha256 = _copy_payload_into_tree(
+            paths.extracted_dir, repo_root, source_commit, spec, wheel_path
+        )
+
+        rebuild_cmd = build_rebuild_command(
+            paths.extracted_dir, boot_flags, paths.output_iso, VOLUME_ID
+        )
+        _run(subprocess_runner, rebuild_cmd)
+
+        production_manifest = assemble_build_manifest(
+            source_commit=source_commit,
+            base=spec,
+            payload_manifest_sha256=payload_manifest_sha256,
+            output_iso=paths.output_iso,
+            volume_id=VOLUME_ID,
+        )
+        write_build_manifest(production_manifest, paths.output_iso)
+    except Exception as exc:
+        # S7.0RM5 Corrective B: this is the ONE stage a real failure
+        # anywhere from extraction through the production manifest maps
+        # to - "production_build=fail" - written the instant it is
+        # actually known, never guessed from an outer shell step's
+        # combined exit code.
+        _write_stage_status(
+            stage_status_file,
+            BuildStageStatus(
+                production_build="fail",
+                failure_stage="production_build",
+                failure_reason=str(exc),
+            ),
+        )
+        raise
+
+    # Production genuinely succeeded - recorded now, before QA is ever
+    # attempted, so a later QA failure can never retroactively make this
+    # look like a production failure (the exact real defect this
+    # corrective fixes).
+    _write_stage_status(stage_status_file, BuildStageStatus(production_build="pass"))
 
     if not build_qa_variant:
         # No further xorriso command will ever run against this base
@@ -280,28 +388,61 @@ def run_build(
         # release the base ISO here (S7.0RM4 Corrective A/Section 5) -
         # a genuine failure keeps it on disk for forensic inspection,
         # correctness/evidence fidelity outrank disk reclamation.
+        _write_stage_status(
+            stage_status_file,
+            BuildStageStatus(
+                production_build="pass", qa_transition="fail",
+                failure_stage="qa_transition", failure_reason=str(exc),
+            ),
+        )
         raise BuildError(f"QA transition safety check failed: {exc}") from exc
     except QaBootError as exc:
         # QA was cleanly blocked before any QA rebuild command was even
         # constructed - no further xorriso command will run, so this is
         # also a safe release point.
+        _write_stage_status(
+            stage_status_file,
+            BuildStageStatus(
+                production_build="pass", qa_transition="fail",
+                failure_stage="qa_transition", failure_reason=str(exc),
+            ),
+        )
         if ephemeral_storage:
             release_base_iso(base_iso, paths.cache_dir)
         return BuildResult(production=production_manifest, qa=None, qa_blocked_reason=str(exc))
 
-    qa_rebuild_cmd = build_rebuild_command(
-        paths.extracted_dir, boot_flags, paths.qa_output_iso, VOLUME_ID
+    _write_stage_status(
+        stage_status_file, BuildStageStatus(production_build="pass", qa_transition="pass")
     )
-    _run(subprocess_runner, qa_rebuild_cmd)
 
-    qa_manifest = assemble_build_manifest(
-        source_commit=source_commit,
-        base=spec,
-        payload_manifest_sha256=payload_manifest_sha256,
-        output_iso=paths.qa_output_iso,
-        volume_id=VOLUME_ID,
+    try:
+        qa_rebuild_cmd = build_rebuild_command(
+            paths.extracted_dir, boot_flags, paths.qa_output_iso, VOLUME_ID
+        )
+        _run(subprocess_runner, qa_rebuild_cmd)
+
+        qa_manifest = assemble_build_manifest(
+            source_commit=source_commit,
+            base=spec,
+            payload_manifest_sha256=payload_manifest_sha256,
+            output_iso=paths.qa_output_iso,
+            volume_id=VOLUME_ID,
+        )
+        write_build_manifest(qa_manifest, paths.qa_output_iso)
+    except Exception as exc:
+        _write_stage_status(
+            stage_status_file,
+            BuildStageStatus(
+                production_build="pass", qa_transition="pass", qa_build="fail",
+                failure_stage="qa_build", failure_reason=str(exc),
+            ),
+        )
+        raise
+
+    _write_stage_status(
+        stage_status_file,
+        BuildStageStatus(production_build="pass", qa_transition="pass", qa_build="pass"),
     )
-    write_build_manifest(qa_manifest, paths.qa_output_iso)
 
     # Both rebuild commands (production and QA) have now actually run -
     # this is the final consumer that could reference the base image

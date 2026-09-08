@@ -163,20 +163,47 @@ def _cmd_evidence(args: argparse.Namespace) -> int:
     qa = _load_json_optional(args.qa_manifest)
     boot_result = _load_json_optional(args.boot_smoke_result)
 
+    failure_stage = args.failure_stage
+    failure_reason = args.failure_reason
+    production_build = args.production_build
+    qa_transition = args.qa_transition
+    qa_build = args.qa_build
+
+    # S7.0RM5 Corrective B: when the build-stage marker exists, it is
+    # ground truth for these three fields - finer-grained than any
+    # single combined GitHub Actions step outcome could ever be (a real
+    # run proved production can fully succeed while a later QA
+    # transition still fails within the SAME shell step). Absent
+    # entirely (e.g. an even earlier failure before run_build() ever
+    # started) means the plain --production-build/--qa-transition/
+    # --qa-build flags below are all that is known, unchanged from
+    # before this corrective.
+    if args.build_stage_status and Path(args.build_stage_status).is_file():
+        from serein.distribution.build import load_build_stage_status
+
+        stage_status = load_build_stage_status(Path(args.build_stage_status))
+        production_build = stage_status.production_build
+        qa_transition = stage_status.qa_transition
+        qa_build = stage_status.qa_build
+        if stage_status.failure_stage:
+            failure_stage = stage_status.failure_stage
+            failure_reason = stage_status.failure_reason
+
     evidence = assemble_layer_b_evidence(
         source_commit=args.source_commit,
-        failure_stage=args.failure_stage,
-        failure_reason=args.failure_reason,
+        failure_stage=failure_stage,
+        failure_reason=failure_reason,
         base_filename=args.base_filename or None,
         base_sha256_expected=args.base_sha256_expected or None,
         base_sha256_actual=args.base_sha256_actual or None,
         production_iso_filename=prod["output"]["filename"] if prod else None,
         production_iso_sha256=prod["output"]["sha256"] if prod else None,
-        production_build=args.production_build,
+        production_build=production_build,
         production_inspection=args.production_inspection,
+        qa_transition=qa_transition,
         qa_iso_filename=qa["output"]["filename"] if qa else None,
         qa_iso_sha256=qa["output"]["sha256"] if qa else None,
-        qa_build=args.qa_build,
+        qa_build=qa_build,
         qa_inspection=args.qa_inspection,
         qemu_boot=boot_result["status"] if boot_result else args.qemu_boot,
         qemu_boot_mode=boot_result["boot_mode"] if boot_result else None,
@@ -280,6 +307,18 @@ def main(argv: list[str] | None = None) -> int:
     evidence_parser.add_argument(
         "--production-inspection", default="not_performed",
         choices=["pass", "fail", "not_performed"],
+    )
+    evidence_parser.add_argument(
+        "--qa-transition", default="not_performed", choices=["pass", "fail", "not_performed"],
+        help="Overridden by --build-stage-status when that marker file exists",
+    )
+    evidence_parser.add_argument(
+        "--build-stage-status", default=None,
+        help="Path to the build-stage-status.json marker run_build() writes "
+             "(S7.0RM5 Corrective B) - when present, its production_build/qa_transition/"
+             "qa_build (and, if it recorded one, failure_stage/failure_reason) take "
+             "precedence over the corresponding flags below, since a real run proved a "
+             "single combined build step's outcome is too coarse to distinguish them",
     )
     evidence_parser.add_argument("--qa-manifest", default=None)
     evidence_parser.add_argument(

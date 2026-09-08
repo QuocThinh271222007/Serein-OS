@@ -275,13 +275,25 @@ jobs:
 
       # S7.0RM2 Corrective B: `id: build` lets the evidence-assembly
       # step read this step's own real outcome
-      # (`steps.build.outcome`: success/failure/skipped) to determine
-      # production_build/qa_build - never inferred from "does a
-      # manifest file happen to exist", which conflated "stage never
-      # began" with "stage began and failed" (the real defect a prior
-      # run exposed: an early base_fetch failure produced
-      # production_build=fail/qa_build=fail even though neither stage
-      # had ever started).
+      # (`steps.build.outcome`: success/failure/skipped) as a FALLBACK
+      # to determine production_build/qa_build when the finer-grained
+      # marker below is absent - never inferred from "does a manifest
+      # file happen to exist", which conflated "stage never began" with
+      # "stage began and failed" (the real defect a prior run exposed:
+      # an early base_fetch failure produced production_build=fail/
+      # qa_build=fail even though neither stage had ever started).
+      #
+      # S7.0RM5 Corrective B: `steps.build.outcome` alone is too coarse
+      # - this ENTIRE step is one combined shell invocation covering
+      # both the production build and the in-place QA transition/
+      # rebuild, so a real run that fully succeeded at production and
+      # only THEN failed transitioning to QA still reported this step
+      # (and therefore production_build) as "failure". `run_build()`
+      # itself now writes `dist/build-stage-status.json` - the one
+      # authoritative, finer-grained marker - as each real stage
+      # (production_build, qa_transition, qa_build) genuinely completes
+      # or fails; the evidence-assembly step below prefers it whenever
+      # it exists.
       - name: Build Serein Alpha ISO (production + QA variant)
         id: build
         run: |
@@ -393,16 +405,24 @@ jobs:
             ARGS+=(--qa-manifest dist/serein-alpha-26.04-amd64-qa.iso.manifest.json)
           fi
 
-          # Corrective B: derive production_build/qa_build from the
-          # build step's OWN real outcome (success/failure/skipped),
-          # never from "does a manifest file happen to exist" - a
-          # skipped build step (an earlier required step failed, e.g.
-          # base_fetch) means both stages genuinely never began, which
-          # must serialize as "not_performed", not "fail".
+          # Corrective B (S7.0RM2) / Corrective B (S7.0RM5): derive
+          # production_build/qa_transition/qa_build from the build
+          # step's OWN real outcome (success/failure/skipped) as a
+          # FALLBACK only - never from "does a manifest file happen to
+          # exist", which conflated "stage never began" with "stage
+          # began and failed". The real, finer-grained source of truth
+          # is dist/build-stage-status.json, passed via
+          # --build-stage-status below: run_build() writes it the
+          # instant each stage genuinely completes or fails, so it can
+          # correctly distinguish "production fully succeeded, QA
+          # transition then failed" from an outright production
+          # failure - something this step's single combined outcome
+          # cannot (a real run proved that conflation happens for real,
+          # not just hypothetically).
           BUILD_OUTCOME="${{ steps.build.outcome }}"
           case "${BUILD_OUTCOME}" in
             success)
-              ARGS+=(--production-build pass)
+              ARGS+=(--production-build pass --qa-transition pass)
               if [ -f dist/serein-alpha-26.04-amd64-qa.iso.manifest.json ]; then
                 ARGS+=(--qa-build pass)
               else
@@ -414,7 +434,7 @@ jobs:
               fi
               ;;
             failure)
-              ARGS+=(--production-build fail)
+              ARGS+=(--production-build fail --qa-transition not_performed)
               # run_build() never begins the QA transition until AFTER
               # the production manifest is written, so a production
               # failure means QA genuinely never started.
@@ -424,10 +444,18 @@ jobs:
               # "skipped" (an earlier required step, e.g. base_fetch,
               # already failed) or "cancelled" - the build step itself
               # never ran at all.
-              ARGS+=(--production-build not_performed)
+              ARGS+=(--production-build not_performed --qa-transition not_performed)
               ARGS+=(--qa-build not_performed)
               ;;
           esac
+
+          # S7.0RM5 Corrective B: when run_build() actually wrote this
+          # marker, it overrides every fallback value set above with
+          # the real, per-stage truth (including a precise
+          # failure_stage/failure_reason for the qa_transition case).
+          if [ -f dist/build-stage-status.json ]; then
+            ARGS+=(--build-stage-status dist/build-stage-status.json)
+          fi
 
           ARGS+=(--production-inspection "${{ steps.inspect-prod.outputs.status || 'not_performed' }}")
           ARGS+=(--qa-inspection "${{ steps.inspect-qa.outputs.status || 'not_performed' }}")
@@ -450,6 +478,7 @@ jobs:
             dist/*.manifest.json
             dist/*.sha256
             dist/el-torito-base-report.txt
+            dist/build-stage-status.json
             dist/s7-0-layer-b-evidence.json
             dist/boot-smoke-result.json
             build/work/boot-smoke/boot-smoke-serial.log
