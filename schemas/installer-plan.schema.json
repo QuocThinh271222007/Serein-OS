@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/installer-plan.schema.json",
+  "title": "Serein Installer Destructive Plan",
+  "description": "Machine-readable destructive-operation plan produced by serein.installer.planner (S7.1 Section 19). validation.valid may only ever be true after every ancestry/GRUB-target safety check has passed - see serein.installer.diskguard.",
+  "type": "object",
+  "required": [
+    "schema_version", "target", "target_device_path", "protected_disks",
+    "operations", "boot", "validation"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "diskIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "serial": { "type": ["string", "null"] },
+        "wwn": { "type": ["string", "null"] },
+        "id_path": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "size_bytes": { "type": ["integer", "null"] },
+        "observed_device_path": { "type": ["string", "null"] }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": { "const": 1 },
+    "target": { "$ref": "#/$defs/diskIdentity" },
+    "target_device_path": { "type": "string" },
+    "protected_disks": { "type": "array", "items": { "$ref": "#/$defs/diskIdentity" } },
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id", "kind", "device", "target_disk_identity", "destructive",
+          "requires_confirmation", "reason"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string" },
+          "kind": { "type": "string" },
+          "device": { "type": "string" },
+          "target_disk_identity": { "$ref": "#/$defs/diskIdentity" },
+          "destructive": { "type": "boolean" },
+          "requires_confirmation": { "type": "boolean" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "boot": {
+      "type": "object",
+      "required": ["grub_target_device", "esp_device"],
+      "additionalProperties": false,
+      "properties": {
+        "grub_target_device": { "type": "string" },
+        "esp_device": { "type": "string" }
+      }
+    },
+    "validation": {
+      "type": "object",
+      "required": ["valid", "reasons"],
+      "additionalProperties": false,
+      "properties": {
+        "valid": { "type": "boolean" },
+        "reasons": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

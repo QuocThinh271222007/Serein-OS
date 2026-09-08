@@ -1,0 +1,484 @@
+name: Installer Smoke (real target-disk installation)
+
+# Layer B for S7.1 (Sections 42-52) - the real, multi-GB installer
+# execution path: builds the S7.0 production/QA media, embeds a real
+# QA-only autoinstall config, boots a real installer under real QEMU
+# against two real virtual disks (a protected fixture that MUST remain
+# byte-identical, and a target the install is explicitly allowed to
+# destroy), and then boots the INSTALLED target on its own to prove it
+# is genuinely self-contained. Mirrors iso-smoke.yml's conventions
+# exactly (same trigger model, same first-failure-wins evidence
+# discipline, same "evidence always uploaded, closure gate always
+# enforced" contract) - see docs/installer/architecture.md.
+#
+# Two ways to run it:
+#   - workflow_dispatch: manual, any time, optionally pinned to an
+#     exact SHA via the `sha` input.
+#   - pull_request (labeled/synchronize/reopened) + the
+#     `run-installer-smoke` label present: opt-in per PR, deliberately
+#     a SEPARATE label from S7.0's `run-iso-smoke` - this job is even
+#     more expensive (it also builds/boots real virtual disks) and
+#     must never run merely because a PR wants the S7.0 ISO smoke test.
+#
+# Deliberately `pull_request`, never `pull_request_target` - this
+# workflow executes code from the feature branch and must never run
+# with write-capable secrets. `permissions: contents: read` is the
+# only permission granted; no repository secret is required anywhere.
+#
+# REAL_PHYSICAL_DISK_PASSTHROUGH=false is enforced by construction:
+# every `-drive`/`-cdrom` argument anywhere in this workflow (and in
+# every installer/scripts/*.sh script it calls) names a path this job
+# itself created inside the ephemeral runner's own workspace - never
+# `/dev/sdX`/`/dev/nvme0n1` or any other physical device path.
+#
+# Evidence is ALWAYS assembled and uploaded (`if: always()`), even when
+# an early stage fails - a real defect must produce a FAILED workflow
+# run with a PRESENT evidence artifact, never a green run and never a
+# crash that loses the evidence. The final "Enforce Installer Layer-B
+# closure" step is the one explicit fail-closed gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Exact commit SHA to build (defaults to the current ref's HEAD)"
+        required: false
+        default: ""
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  installer-smoke:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'run-installer-smoke'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine expected source SHA
+        id: expected-sha
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ inputs.sha != '' && inputs.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.expected-sha.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact-head checkout
+        run: |
+          EXPECTED_SOURCE_SHA="${{ steps.expected-sha.outputs.sha }}"
+          ACTUAL_CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          echo "EXPECTED_SOURCE_SHA=${EXPECTED_SOURCE_SHA}"
+          echo "ACTUAL_CHECKED_OUT_SHA=${ACTUAL_CHECKED_OUT_SHA}"
+          if [ "${EXPECTED_SOURCE_SHA}" != "${ACTUAL_CHECKED_OUT_SHA}" ]; then
+            echo "::error::checked-out SHA does not match the expected feature-head SHA - refusing to build"
+            exit 1
+          fi
+          echo "SOURCE_COMMIT=${ACTUAL_CHECKED_OUT_SHA}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (editable, with dev dependencies)
+        run: python -m pip install -e ".[dev]"
+
+      # Ephemeral GitHub-hosted-runner setup only - never target-host
+      # mutation. Includes S7.0's own build tooling (this job first
+      # reuses run_build() unchanged) plus the additional real tools
+      # S7.1 needs to create/inspect real virtual disks: qemu-utils
+      # (qemu-img/qemu-nbd), parted, dosfstools (mkfs.vfat),
+      # e2fsprogs (mkfs.ext4) - never installed on, or run against, any
+      # host block device.
+      - name: Install build + installer tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso jq qemu-system-x86 qemu-utils ovmf \
+            parted dosfstools e2fsprogs
+
+      - name: Reclaim ephemeral runner SDK space
+        if: runner.environment == 'github-hosted'
+        run: |
+          FREE_BEFORE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
+          echo "FREE_SPACE_BEFORE_CLEANUP_KB=${FREE_BEFORE_KB}"
+
+          for candidate in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            ; do
+            resolved="$(realpath -m "${candidate}")"
+            if [ "${resolved}" != "${candidate}" ]; then
+              echo "skipping ${candidate}: does not resolve to itself" >&2
+              continue
+            fi
+            case "${resolved}" in
+              /usr/local/lib/android|/usr/share/dotnet|/opt/ghc|/usr/local/.ghcup|/usr/share/swift) ;;
+              *) echo "skipping ${candidate}: not on the exact allowlist" >&2; continue ;;
+            esac
+            if [ -d "${resolved}" ]; then
+              size="$(du -sh "${resolved}" 2>/dev/null | cut -f1 || echo '?')"
+              echo "removing ${resolved} (${size})"
+              sudo rm -rf --one-file-system -- "${resolved}"
+            fi
+          done
+
+          FREE_AFTER_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
+          echo "FREE_SPACE_AFTER_CLEANUP_KB=${FREE_AFTER_KB}"
+          echo "SPACE_RECLAIMED_KB=$((FREE_AFTER_KB - FREE_BEFORE_KB))"
+
+      # Disk-space preflight (Section 50) - a genuinely LARGER peak
+      # than S7.0's own 32 GiB requirement, since this job additionally
+      # extracts+rebuilds a THIRD ISO variant (QA-install, with
+      # autoinstall.yaml embedded) and creates two real virtual disks.
+      # Real observed simultaneous-peak moment: right after the
+      # QA-install ISO is rebuilt, before S7.0's own production/QA
+      # extraction tree or ISOs have been cleaned up, and before the
+      # fixture disks are created:
+      #
+      #   BASE_ISO_GIB (7, released by S7.0's own ephemeral_storage
+      #     mode immediately after its build, but budgeted here too
+      #     since it overlaps with the QA-install extraction/rebuild
+      #     that begins right after)
+      #   + PRODUCTION_ISO_GIB (7) + QA_ISO_GIB (7)   [from S7.0's build]
+      #   + QA_INSTALL_EXTRACTED_TREE_GIB (7)          [isoprep's own
+      #                                                  independent
+      #                                                  re-extraction]
+      #   + QA_INSTALL_ISO_GIB (7)
+      #   + PROTECTED_DISK_GIB (4) + TARGET_DISK_GIB (8)  [fixture qcow2s]
+      #   = PEAK_GIB (47)
+      #   + SAFETY_MARGIN_GIB (8, generous - these are rough size
+      #     estimates, not measured; this number is expected to be
+      #     revised after a real run, exactly like S7.0's own
+      #     preflight arithmetic was revised across S7.0RM/RM2/RM4)
+      #   = REQUIRED_GIB (55)
+      - name: Disk space preflight
+        run: |
+          df -h .
+          BASE_ISO_GIB=7
+          PRODUCTION_ISO_GIB=7
+          QA_ISO_GIB=7
+          QA_INSTALL_EXTRACTED_TREE_GIB=7
+          QA_INSTALL_ISO_GIB=7
+          PROTECTED_DISK_GIB=4
+          TARGET_DISK_GIB=8
+          SAFETY_MARGIN_GIB=8
+          PEAK_GIB=$((BASE_ISO_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB + \
+            QA_INSTALL_EXTRACTED_TREE_GIB + QA_INSTALL_ISO_GIB + \
+            PROTECTED_DISK_GIB + TARGET_DISK_GIB))
+          REQUIRED_GIB=$((PEAK_GIB + SAFETY_MARGIN_GIB))
+          REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))
+          AVAILABLE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
+          echo "PEAK_GIB=${PEAK_GIB}"
+          echo "REQUIRED_GIB=${REQUIRED_GIB} (peak + ${SAFETY_MARGIN_GIB} GiB safety margin)"
+          echo "AVAILABLE_KB=${AVAILABLE_KB}"
+          echo "REQUIRED_KB=${REQUIRED_KB}"
+          if [ "${AVAILABLE_KB}" -lt "${REQUIRED_KB}" ]; then
+            ./distribution/scripts/record-failure.sh "disk_preflight" \
+              "insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required"
+            echo "::error::insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required"
+            exit 1
+          fi
+
+      # Reuses S7.0's own, unmodified, already-closed pipeline
+      # (Section 3-4: "prefer configuration and adapters, never
+      # reopening S7.0 internals"). production_build/qa_transition/
+      # qa_build evidence for THIS run comes from THIS pipeline
+      # succeeding here, exactly as in iso-smoke.yml.
+      - name: Fetch pinned base image
+        run: |
+          ./distribution/scripts/fetch-base-image.sh || {
+            ./distribution/scripts/record-failure.sh "base_fetch" "fetch-base-image.sh failed"
+            exit 1
+          }
+
+      - name: Verify base image (fail-closed, checksum + signature)
+        run: |
+          ./distribution/scripts/verify-base-image.sh || {
+            ./distribution/scripts/record-failure.sh "base_verification" \
+              "verify-base-image.sh failed - checksum or signature mismatch"
+            exit 1
+          }
+
+      - name: Build Serein Alpha ISO (production + QA variant)
+        id: build
+        run: |
+          EPHEMERAL_STORAGE=1 ./distribution/scripts/build-iso.sh || {
+            ./distribution/scripts/record-failure.sh "production_or_qa_build" "build-iso.sh failed"
+            exit 1
+          }
+
+      - name: Strict-inspect production ISO
+        id: inspect-prod
+        if: always()
+        run: |
+          PROD_ISO="dist/serein-alpha-26.04-amd64.iso"
+          if [ ! -f "${PROD_ISO}" ]; then
+            echo "status=not_performed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if python -m serein.distribution inspect "${PROD_ISO}" --strict \
+              --work-dir dist/inspect-strict-work/production \
+              --expected-source-commit "${SOURCE_COMMIT}"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "production_inspection" \
+              "strict production ISO inspection failed"
+            exit 1
+          fi
+
+      - name: Strict-inspect QA ISO
+        id: inspect-qa
+        if: always()
+        run: |
+          QA_ISO="dist/serein-alpha-26.04-amd64-qa.iso"
+          if [ ! -f "${QA_ISO}" ]; then
+            echo "status=not_performed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if python -m serein.distribution inspect "${QA_ISO}" --strict \
+              --work-dir dist/inspect-strict-work/qa \
+              --expected-source-commit "${SOURCE_COMMIT}"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "qa_inspection" \
+              "strict QA ISO inspection failed"
+            exit 1
+          fi
+
+      # S7.1 begins here - everything above is unmodified S7.0.
+      #
+      # Explicit, fixed serials (never an implicit/largest-disk
+      # selection - Section 9): run-qa-install.sh always attaches the
+      # protected fixture FIRST (serial=SEREIN-PROTECTED-DISK, -> guest
+      # /dev/vda) and the target fixture SECOND
+      # (serial=SEREIN-TARGET-DISK, -> guest /dev/vdb). The rendered
+      # autoinstall.yaml's storage `match` stanza references
+      # SEREIN-TARGET-DISK's serial directly - this is the real,
+      # in-guest analog of Section 11's "prefer stable evidence" for a
+      # virtual disk that has no real hardware serial of its own.
+      - name: Render QA autoinstall config
+        id: render-autoinstall
+        if: always() && steps.inspect-qa.outputs.status == 'pass'
+        run: |
+          if python -m serein.installer render-autoinstall \
+              --target-device-path /dev/vdb --target-serial SEREIN-TARGET-DISK \
+              --protected-disk SEREIN-PROTECTED-DISK:/dev/vda \
+              --source-commit "${SOURCE_COMMIT}" --source-media-version "26.04.1" \
+              --out-yaml dist/autoinstall.yaml --out-plan dist/installer-plan.json \
+              --qa-allow-autoinstall; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installer_config_invalid" \
+              "render-autoinstall failed - plan invalid or renderer refused"
+            exit 1
+          fi
+
+      - name: Prepare QA-install ISO
+        id: prepare-qa-install-iso
+        if: always() && steps.render-autoinstall.outputs.status == 'pass'
+        run: |
+          if python -m serein.installer prepare-qa-install-iso \
+              --qa-iso dist/serein-alpha-26.04-amd64-qa.iso \
+              --autoinstall-yaml dist/autoinstall.yaml \
+              --work-dir build/installer-work \
+              --out dist/serein-alpha-26.04-amd64-qa-install.iso; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installer_config_invalid" \
+              "prepare-qa-install-iso failed"
+            exit 1
+          fi
+
+      - name: Create fixture disks (protected + target)
+        id: create-fixtures
+        if: always() && steps.prepare-qa-install-iso.outputs.status == 'pass'
+        run: |
+          if ./installer/scripts/create-fixture-disks.sh dist/installer-fixtures; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installer_unavailable" \
+              "create-fixture-disks.sh failed"
+            exit 1
+          fi
+
+      # The real installer execution (Section 42-43). QA-only autoinstall
+      # (Section 7) - never production media, never a physical disk
+      # (Section 49-50).
+      - name: Run real QA autoinstall
+        id: run-install
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          if ./installer/scripts/run-qa-install.sh \
+              dist/serein-alpha-26.04-amd64-qa-install.iso \
+              dist/installer-fixtures/disk-protected.qcow2 \
+              dist/installer-fixtures/disk-target.qcow2 \
+              --timeout 1800; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "install_failed" \
+              "real QA autoinstall run failed - see qa-install-serial.log"
+            exit 1
+          fi
+
+      # The central S7.1 proof (Section 44-46) - hash BOTH disk images
+      # after the install, regardless of whether the install step
+      # itself reported success, so a defect that corrupts the
+      # protected disk is caught even if the install otherwise
+      # "succeeded".
+      - name: Record post-install disk hashes
+        id: post-install-hashes
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          PROTECTED_AFTER="$(sha256sum dist/installer-fixtures/disk-protected.qcow2 | cut -d' ' -f1)"
+          TARGET_AFTER="$(sha256sum dist/installer-fixtures/disk-target.qcow2 | cut -d' ' -f1)"
+          echo "protected_after=${PROTECTED_AFTER}" >> "$GITHUB_OUTPUT"
+          echo "target_after=${TARGET_AFTER}" >> "$GITHUB_OUTPUT"
+          echo "REAL_PROTECTED_DISK_SHA256_AFTER=${PROTECTED_AFTER}"
+          echo "REAL_TARGET_DISK_SHA256_AFTER=${TARGET_AFTER}"
+
+      - name: Inspect target disk layout
+        id: inspect-target-layout
+        if: always() && steps.run-install.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/inspect-target-layout.sh \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "install_failed" \
+              "target disk layout inspection failed"
+            exit 1
+          }
+
+      # Section 47: the target must boot ON ITS OWN, no install medium
+      # attached - the primary evidence this closure gate consumes.
+      - name: Boot installed target (self-contained, no protected disk)
+        id: installed-boot
+        if: always() && steps.inspect-target-layout.outcome == 'success'
+        run: |
+          if ./installer/scripts/boot-installed-target.sh \
+              dist/installer-fixtures/disk-target.qcow2 \
+              --result-json dist/installed-boot-result.json; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installed_boot_failed" \
+              "installed target failed to boot on its own - see installed-boot-serial.log"
+            exit 1
+          fi
+
+      # Section 15's acceptance scenario (secondary, non-gating -
+      # informational only): the target must ALSO still boot with the
+      # protected disk present alongside it.
+      - name: Boot installed target (with protected disk present)
+        id: installed-boot-with-protected
+        if: always() && steps.inspect-target-layout.outcome == 'success'
+        continue-on-error: true
+        run: |
+          ./installer/scripts/boot-installed-target.sh \
+            dist/installer-fixtures/disk-target.qcow2 \
+            --protected-disk dist/installer-fixtures/disk-protected.qcow2 \
+            --result-json dist/installed-boot-with-protected-result.json
+
+      - name: Assemble Installer Layer-B evidence
+        if: always()
+        run: |
+          ARGS=(--source-commit "${SOURCE_COMMIT}" --out dist/s7-1-installer-layer-b-evidence.json)
+
+          if [ -f dist/.failure_stage ]; then
+            ARGS+=(--failure-stage "$(cat dist/.failure_stage)")
+          fi
+          if [ -f dist/.failure_reason ]; then
+            ARGS+=(--failure-reason "$(cat dist/.failure_reason)")
+          fi
+
+          ARGS+=(--installer-backend curtin)
+          ARGS+=(--target-serial SEREIN-TARGET-DISK --target-device-path /dev/vdb)
+          ARGS+=(--protected-disk SEREIN-PROTECTED-DISK:/dev/vda)
+          ARGS+=(--target-explicit --target-identity-revalidated)
+
+          if [ "${{ steps.render-autoinstall.outputs.status }}" = "pass" ] && \
+             [ -f dist/installer-plan.json ] && \
+             [ "$(python -c "import json;print(json.load(open('dist/installer-plan.json'))['validation']['valid'])")" = "True" ]; then
+            ARGS+=(--installer-backend-available --plan-valid --all-destructive-ops-on-target)
+          fi
+
+          if [ -n "${{ steps.post-install-hashes.outputs.protected_after }}" ]; then
+            PROTECTED_BEFORE="$(cut -d' ' -f1 dist/installer-fixtures/disk-protected.sha256-before 2>/dev/null || echo "")"
+            TARGET_BEFORE="$(cut -d' ' -f1 dist/installer-fixtures/disk-target.sha256-before 2>/dev/null || echo "")"
+            if [ -n "${PROTECTED_BEFORE}" ]; then
+              ARGS+=(--protected-before-sha256 "${PROTECTED_BEFORE}")
+            fi
+            ARGS+=(--protected-after-sha256 "${{ steps.post-install-hashes.outputs.protected_after }}")
+            if [ -n "${TARGET_BEFORE}" ]; then
+              ARGS+=(--target-disk-before-sha256 "${TARGET_BEFORE}")
+            fi
+            ARGS+=(--target-disk-after-sha256 "${{ steps.post-install-hashes.outputs.target_after }}")
+            # Section 46: a byte-identical protected disk trivially
+            # proves its own ESP sub-region is unchanged too - never a
+            # separate claim.
+            if [ "${PROTECTED_BEFORE}" = "${{ steps.post-install-hashes.outputs.protected_after }}" ] && \
+               [ -n "${PROTECTED_BEFORE}" ]; then
+              ARGS+=(--protected-esp-unchanged)
+            fi
+          fi
+
+          if [ "${{ steps.inspect-target-layout.outputs.target_esp_present }}" = "true" ]; then
+            ARGS+=(--target-esp-present)
+          fi
+          if [ "${{ steps.inspect-target-layout.outputs.target_root_present }}" = "true" ]; then
+            ARGS+=(--target-root-present)
+          fi
+
+          ARGS+=(--installation-status "${{ steps.run-install.outputs.status || 'not_performed' }}")
+
+          if [ -f dist/installed-boot-result.json ]; then
+            ARGS+=(--installed-boot-result dist/installed-boot-result.json)
+            ARGS+=(--install-media-removed-for-boot)
+          fi
+
+          if [ "${{ steps.inspect-target-layout.outputs.serein_core_present }}" = "true" ]; then
+            ARGS+=(--serein-core-present)
+          fi
+          FIRSTBOOT="${{ steps.inspect-target-layout.outputs.firstboot_provisioning || 'unknown' }}"
+          ARGS+=(--firstboot-provisioning "${FIRSTBOOT}")
+
+          python -m serein.installer evidence "${ARGS[@]}"
+          cat dist/s7-1-installer-layer-b-evidence.json
+
+      - name: Upload compact Installer Layer-B evidence (never disk images/ISOs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serein-s7-1-installer-layer-b-evidence
+          path: |
+            dist/installer-plan.json
+            dist/s7-1-installer-layer-b-evidence.json
+            dist/installer-fixtures/*.sha256-before
+            dist/installed-boot-result.json
+            dist/installed-boot-with-protected-result.json
+            dist/installer-fixtures/qa-install-serial.log
+            dist/installer-fixtures/installed-boot/installed-boot-serial.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce Installer Layer-B closure
+        if: always()
+        run: |
+          python -m serein.installer closure-gate \
+            --evidence dist/s7-1-installer-layer-b-evidence.json \
+            --expected-source-commit "${SOURCE_COMMIT}"

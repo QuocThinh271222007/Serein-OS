@@ -177,3 +177,23 @@ jobs:
           serein distribution status
           serein distribution inspect distribution/test-fixtures/extracted-tree-ok
           serein distribution inspect distribution/test-fixtures/extracted-tree-ok --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: Installer CLI smoke test
+        run: |
+          # Read-only only (Section 23-24 of the S7.1 contract) - never
+          # wipes/formats/mounts/partitions/installs anything. No real
+          # target-disk installation happens in this job; see
+          # installer-smoke.yml for the separate, label-gated real
+          # target-disk installer validation workflow.
+          serein installer status
+          serein installer disks
+          serein installer disks --json | python -c "import json,sys; json.load(sys.stdin)"
+          serein installer doctor
+          serein installer doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+          # no disk exists to target on a stock CI runner - proves the
+          # explicit-target requirement fails closed, never silently
+          # picks a default.
+          if serein installer plan --target /dev/does-not-exist; then
+            echo "::error::installer plan unexpectedly succeeded with no real target"
+            exit 1
+          fi

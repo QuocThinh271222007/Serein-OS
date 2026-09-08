@@ -183,14 +183,18 @@ means at this phase, including this pass's real (Layer B) validation
 status. This is **not** a public release - the project has no selected
 license yet (`docs/distribution/licensing-and-release-boundary.md`).
 
-### S7.1 — Installer Integration *(future, not started)*
+### S7.1 — Installer Integration *(in progress)*
 
 Builds on the S0 installer *contract* (not before it) and S7.0's
 base-image/payload contracts to integrate real Subiquity-driven target
 installation. This is the first phase that may perform real host
 mutation, and only within the Discover → Resolve → Plan → Validate →
 Apply → Verify → Record lifecycle defined in
-`docs/architecture/installer-contract.md`.
+`docs/architecture/installer-contract.md`. See `docs/installer/` for
+the full design (target-identity contract, protected-disk contract,
+destructive-operation model, production-vs-QA install modes, VM
+validation topology) and `docs/installer/known-limitations.md` for
+exactly what real (Layer B) validation does and does not exist yet.
 
 ### S7.2 — First-Boot Provisioning *(future, not started)*
 
