@@ -151,9 +151,10 @@ jobs:
           echo "FREE_SPACE_AFTER_CLEANUP_KB=${FREE_AFTER_KB}"
           echo "SPACE_RECLAIMED_KB=$((FREE_AFTER_KB - FREE_BEFORE_KB))"
 
-      # S7.0RM2 Corrective D: the preflight requirement is derived from
-      # the ACTUAL maximum simultaneously-live large-object set in the
-      # real S7.0RM pipeline order, not an arbitrary rounded number.
+      # S7.0RM2 Corrective D, revised by S7.0RM4 Corrective B: the
+      # preflight requirement is derived from the ACTUAL maximum
+      # simultaneously-live large-object set in the real pipeline
+      # order, not an arbitrary rounded number.
       #
       # `xorriso -osirrox` extracts the ISO9660 tree's files exactly as
       # stored - the live SquashFS payload inside is copied out as one
@@ -161,38 +162,44 @@ jobs:
       # tree's apparent size is close to the base ISO's own size, not
       # several times larger.
       #
-      # With EPHEMERAL_STORAGE=1 (used below), the base ISO is released
-      # immediately after extraction + the El Torito report are
-      # captured - so it never coexists with either rebuilt ISO. But
-      # the production ISO is deliberately RETAINED on disk while the
-      # QA ISO is rebuilt (production must already be finalized and
-      # unaffected before the QA transition begins - see
-      # docs/distribution/iso-build.md) - so the true peak is the QA
-      # rebuild step, where the extracted tree, the finished production
-      # ISO, and the QA ISO being written all exist at once:
+      # A real Layer-B run proved the S7.0RM assumption below FALSE:
       #
-      #   EXTRACTED_TREE_GIB (6) + PRODUCTION_ISO_GIB (6) + QA_ISO_GIB (6)
-      #   = PEAK_GIB (18)
+      #   "the base ISO is never needed again after extraction + the
+      #    El Torito report"
+      #
+      # A real report's own boot/system-area flags can themselves still
+      # reference the base image directly by path for a boot-critical
+      # byte range (e.g. `--interval:local_fs:...:<base.iso>`), so BOTH
+      # rebuild commands (production and QA) must be able to resolve
+      # that path - `serein.distribution.build.run_build` now only
+      # releases the base ISO (in ephemeral_storage mode) after the
+      # QA rebuild has actually completed (or QA was cleanly blocked
+      # before any QA rebuild command was even constructed). That means
+      # the true peak is the QA rebuild step, where the base ISO, the
+      # extracted tree, the finished production ISO, and the QA ISO
+      # being written can ALL exist at once:
+      #
+      #   BASE_ISO_GIB (7) + EXTRACTED_TREE_GIB (7) + PRODUCTION_ISO_GIB (7)
+      #   + QA_ISO_GIB (7)
+      #   = PEAK_GIB (28)
       #   + SAFETY_MARGIN_GIB (4, since these are rough size estimates,
-      #     not measured)
-      #   = REQUIRED_GIB (22)
-      #
-      # (A second, lower candidate peak - base ISO 6 GiB + extracted
-      # tree growing to 6 GiB during extraction, before
-      # ephemeral_storage releases the base ISO - is ~12 GiB, below the
-      # QA-rebuild peak above, so it does not drive the requirement.)
+      #     not measured - the real pinned Desktop ISO is ~6.0 GB per
+      #     docs/distribution/base-image.md, rounded up here for
+      #     filesystem/build overhead)
+      #   = REQUIRED_GIB (32)
       - name: Disk space preflight
         run: |
           df -h .
-          EXTRACTED_TREE_GIB=6
-          PRODUCTION_ISO_GIB=6
-          QA_ISO_GIB=6
+          BASE_ISO_GIB=7
+          EXTRACTED_TREE_GIB=7
+          PRODUCTION_ISO_GIB=7
+          QA_ISO_GIB=7
           SAFETY_MARGIN_GIB=4
-          PEAK_GIB=$((EXTRACTED_TREE_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB))
+          PEAK_GIB=$((BASE_ISO_GIB + EXTRACTED_TREE_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB))
           REQUIRED_GIB=$((PEAK_GIB + SAFETY_MARGIN_GIB))
           REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))
           AVAILABLE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
-          echo "PEAK_GIB=${PEAK_GIB} (extracted tree + production ISO + QA ISO being written)"
+          echo "PEAK_GIB=${PEAK_GIB} (base ISO + extracted tree + production ISO + QA ISO being written)"
           echo "REQUIRED_GIB=${REQUIRED_GIB} (peak + ${SAFETY_MARGIN_GIB} GiB safety margin)"
           echo "AVAILABLE_KB=${AVAILABLE_KB}"
           echo "REQUIRED_KB=${REQUIRED_KB}"

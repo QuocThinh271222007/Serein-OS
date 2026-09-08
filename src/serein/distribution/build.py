@@ -11,14 +11,13 @@ downloads anything (the base image must already be fetched and
 verified - see ``serein.distribution.base``), and fails closed at the
 first unverified/unsafe step rather than continuing best-effort.
 
-Pipeline (storage-aware ordering - Section 48 of the S7.0RM corrective):
+Pipeline (storage-aware ordering - Section 48 of the S7.0RM corrective;
+base-ISO lifetime corrected by S7.0RM4 Corrective A):
 
     verify base checksum
     -> reset extraction workspace (guaranteed empty - Corrective D)
     -> extract base ISO (rootless, read-only source)
     -> capture the base image's own El Torito report (needs base_iso)
-    -> [ephemeral_storage only] release the cached base ISO - it is
-       never needed again after extraction + the report above
     -> apply static overlay (allowlisted destinations only)
     -> build + content-verify the Serein wheel (Corrective C)
     -> assemble resource payload + wheel artifact, copy into the tree
@@ -32,6 +31,19 @@ Pipeline (storage-aware ordering - Section 48 of the S7.0RM corrective):
     -> rebuild QA ISO reusing the same boot flags
     -> record QA build manifest + sha256 (best-effort - QA_BUILD may be
        BLOCKED without failing the already-finalized production build)
+    -> [ephemeral_storage only] release the cached base ISO - only now,
+       after every xorriso command that could still contain a direct
+       byte-range reference into it (e.g. a real report's own
+       ``--interval:local_fs:...:<base.iso>`` token) has actually run
+
+    A real Layer-B run proved the earlier assumption - "the base ISO is
+    never needed again after extraction + the report" - false: the
+    parsed boot flags can themselves still reference the base image by
+    path for a boot-critical byte range, so BOTH rebuild commands
+    (production and QA) must be able to resolve that path, not merely
+    the report-capture step. See ``docs/distribution/iso-build.md``'s
+    "Storage model" for the corrected peak-storage accounting this
+    implies.
 """
 
 from __future__ import annotations
@@ -176,15 +188,22 @@ def run_build(
     external tool invocation this pipeline makes (extraction, wheel
     build, El Torito report, both ISO rebuilds).
 
-    ``ephemeral_storage=True`` (Section 8-9 of the S7.0RM corrective)
-    deletes the cached base ISO from ``cache/upstream/`` immediately
-    after it is no longer needed (extraction + the El Torito report
-    both already captured) - intended **only** for an ephemeral CI
-    runner's Layer-B job, never for a normal developer build, which
-    must keep its verified cache. The canonical distribution builder
-    stays the single shared pipeline either way (Section 9 - "do not
-    create two competing build pipelines"); this is one explicit
-    keyword argument, not a parallel script.
+    ``ephemeral_storage=True`` (Section 8-9 of the S7.0RM corrective;
+    lifetime corrected by S7.0RM4 Corrective A) deletes the cached base
+    ISO from ``cache/upstream/`` once - and only once - every xorriso
+    command that could still reference it directly has actually run:
+    after the production rebuild, after the QA rebuild (or after QA is
+    cleanly blocked before any QA rebuild command is even constructed,
+    which also guarantees no further command will touch it). It is
+    never released on an exception path (a genuine build/QA-safety
+    failure keeps the base ISO on disk for forensic inspection -
+    correctness and evidence fidelity outrank maximizing disk
+    reclamation). Intended **only** for an ephemeral CI runner's Layer-B
+    job, never for a normal developer build, which must keep its
+    verified cache. The canonical distribution builder stays the single
+    shared pipeline either way (Section 9 - "do not create two
+    competing build pipelines"); this is one explicit keyword argument,
+    not a parallel script.
     """
     if not source_commit:
         raise BuildError("source_commit is required - a build must record real provenance")
@@ -211,15 +230,9 @@ def run_build(
     _run(subprocess_runner, build_extract_command(base_iso, paths.extracted_dir))
 
     # El Torito report captured right after extraction, while base_iso
-    # still exists - this is the last pipeline step that needs it, so
-    # ephemeral_storage can release the ~6 GB file immediately after,
-    # before the two ISO rebuilds (the phase with the highest disk
-    # pressure) ever begin.
+    # still exists.
     report_result = _run(subprocess_runner, build_report_command(base_iso), capture=True)
     boot_flags = parse_el_torito_report(report_result)
-
-    if ephemeral_storage:
-        release_base_iso(base_iso, paths.cache_dir)
 
     overlay_source = repo_root / "distribution" / "overlay"
     apply_overlay(overlay_source, paths.extracted_dir)
@@ -247,6 +260,11 @@ def run_build(
     write_build_manifest(production_manifest, paths.output_iso)
 
     if not build_qa_variant:
+        # No further xorriso command will ever run against this base
+        # image in this invocation - safe to release now (S7.0RM4
+        # Corrective A).
+        if ephemeral_storage:
+            release_base_iso(base_iso, paths.cache_dir)
         return BuildResult(production=production_manifest, qa=None)
 
     # Production ISO bytes are already finalized on disk above - only
@@ -258,9 +276,17 @@ def run_build(
         # config/checksum catalog changed) - never silently degrade to
         # "QA blocked, production still fine"; the production ISO is
         # already finalized and unaffected, but this signals the QA
-        # transition logic itself is unsafe and must fail loudly.
+        # transition logic itself is unsafe and must fail loudly. Never
+        # release the base ISO here (S7.0RM4 Corrective A/Section 5) -
+        # a genuine failure keeps it on disk for forensic inspection,
+        # correctness/evidence fidelity outrank disk reclamation.
         raise BuildError(f"QA transition safety check failed: {exc}") from exc
     except QaBootError as exc:
+        # QA was cleanly blocked before any QA rebuild command was even
+        # constructed - no further xorriso command will run, so this is
+        # also a safe release point.
+        if ephemeral_storage:
+            release_base_iso(base_iso, paths.cache_dir)
         return BuildResult(production=production_manifest, qa=None, qa_blocked_reason=str(exc))
 
     qa_rebuild_cmd = build_rebuild_command(
@@ -276,6 +302,13 @@ def run_build(
         volume_id=VOLUME_ID,
     )
     write_build_manifest(qa_manifest, paths.qa_output_iso)
+
+    # Both rebuild commands (production and QA) have now actually run -
+    # this is the final consumer that could reference the base image
+    # directly, so this is the only point ephemeral mode may release it
+    # (S7.0RM4 Corrective A).
+    if ephemeral_storage:
+        release_base_iso(base_iso, paths.cache_dir)
 
     return BuildResult(production=production_manifest, qa=qa_manifest)
 

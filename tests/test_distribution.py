@@ -48,6 +48,7 @@ from serein.distribution.iso import (
     build_extract_command,
     build_rebuild_command,
     build_report_command,
+    filter_builder_owned_boot_flags,
     parse_el_torito_report,
 )
 from serein.distribution.manifest import assemble_build_manifest, write_build_manifest
@@ -465,6 +466,74 @@ class TestIsoCommand:
     def test_build_rebuild_command_rejects_empty_flags(self, tmp_path):
         with pytest.raises(IsoCommandError):
             build_rebuild_command(tmp_path / "extracted", [], tmp_path / "out.iso", VOLUME_ID)
+
+    # -- S7.0RM4 Corrective C: upstream volume-ID replay filtering --
+
+    def test_filter_removes_dash_v_and_its_value(self):
+        flags = [
+            "-c", "/boot.catalog",
+            "-V", "Ubuntu 26.04.1 LTS amd64",
+            "-b", "/boot/grub/i386-pc/eltorito.img",
+        ]
+        filtered = filter_builder_owned_boot_flags(flags)
+        assert filtered == ["-c", "/boot.catalog", "-b", "/boot/grub/i386-pc/eltorito.img"]
+
+    def test_filter_removes_volid_alias(self):
+        flags = [
+            "-c", "/boot.catalog", "-volid", "Ubuntu 26.04.1 LTS amd64", "-appended_part_as_gpt",
+        ]
+        filtered = filter_builder_owned_boot_flags(flags)
+        assert filtered == ["-c", "/boot.catalog", "-appended_part_as_gpt"]
+
+    def test_filter_preserves_neighboring_flag_order(self):
+        flags = ["-a", "-V", "Upstream Label", "-b", "-c"]
+        filtered = filter_builder_owned_boot_flags(flags)
+        assert filtered == ["-a", "-b", "-c"]
+
+    def test_filter_preserves_unknown_boot_options_untouched(self):
+        flags = [
+            "--grub2-mbr", str(REPO_ROOT / "base.iso"),
+            "--interval:local_fs:0s-15s:zero_mbrpt,zero_gpt:", str(REPO_ROOT / "base.iso"),
+            "-append_partition", "2", "0xef",
+            "--interval:local_fs:12649996d-12660291d::", str(REPO_ROOT / "base.iso"),
+            "-appended_part_as_gpt",
+            "-iso_mbr_part_type", "a2a0d0eb-e5b9-3344-87c0-68b6b72699c7",
+            "-c", "/boot.catalog",
+            "-b", "/boot/grub/i386-pc/eltorito.img",
+            "-no-emul-boot", "-boot-load-size", "4", "-boot-info-table",
+            "-eltorito-alt-boot",
+            "-e", "--interval:appended_partition_2:all::",
+        ]
+        filtered = filter_builder_owned_boot_flags(flags)
+        assert filtered == flags  # nothing removed - no -V/-volid present
+
+    def test_filter_malformed_dash_v_with_no_value_fails_closed(self):
+        with pytest.raises(IsoCommandError, match="no following value"):
+            filter_builder_owned_boot_flags(["-c", "/boot.catalog", "-V"])
+
+    def test_filter_all_owned_metadata_leaves_nothing_rejected_by_rebuild(self, tmp_path):
+        with pytest.raises(IsoCommandError, match="no real boot flags remained"):
+            build_rebuild_command(
+                tmp_path / "extracted", ["-V", "Ubuntu"], tmp_path / "out.iso", VOLUME_ID
+            )
+
+    def test_rebuild_command_contains_exactly_one_effective_volume_id(self):
+        boot_flags = [
+            "-c", "/boot.catalog",
+            "-V", "Ubuntu 26.04.1 LTS amd64",
+            "-b", "/boot/grub/i386-pc/eltorito.img",
+            "--interval:local_fs:12649996d-12660291d::", "cache/upstream/ubuntu.iso",
+        ]
+        command = build_rebuild_command(
+            Path("extracted"), boot_flags, Path("out.iso"), VOLUME_ID
+        )
+        assert command.count("-V") == 1
+        assert VOLUME_ID in command
+        assert "Ubuntu 26.04.1 LTS amd64" not in command
+        # real boot-architecture data (including the base-image interval
+        # reference) must survive untouched
+        assert "--interval:local_fs:12649996d-12660291d::" in command
+        assert "cache/upstream/ubuntu.iso" in command
 
     def test_build_extract_command_is_rootless_osirrox(self, tmp_path):
         command = build_extract_command(tmp_path / "base.iso", tmp_path / "dest")
@@ -1612,18 +1681,25 @@ class TestLayerBWorkflow:
             assert match, f"{varname} not found as a literal integer assignment"
             return int(match.group(1))
 
+        base_iso = _extract("BASE_ISO_GIB")
         extracted_tree = _extract("EXTRACTED_TREE_GIB")
         production_iso = _extract("PRODUCTION_ISO_GIB")
         qa_iso = _extract("QA_ISO_GIB")
         margin = _extract("SAFETY_MARGIN_GIB")
 
         # the derivation must be expressed in terms of the named
-        # components, never a disconnected magic number
-        assert "PEAK_GIB=$((EXTRACTED_TREE_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB))" in script
+        # components, never a disconnected magic number - S7.0RM4
+        # Corrective B: the base ISO must now be counted too, since it
+        # survives through both rebuild commands (a real report can
+        # reference it directly via --interval:local_fs:...).
+        assert (
+            "PEAK_GIB=$((BASE_ISO_GIB + EXTRACTED_TREE_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB))"
+            in script
+        )
         assert "REQUIRED_GIB=$((PEAK_GIB + SAFETY_MARGIN_GIB))" in script
         assert "REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))" in script
 
-        computed_peak = extracted_tree + production_iso + qa_iso
+        computed_peak = base_iso + extracted_tree + production_iso + qa_iso
         computed_required = computed_peak + margin
         assert computed_peak > 0
         assert computed_required > computed_peak
@@ -1635,12 +1711,24 @@ class TestLayerBWorkflow:
         required_kb_literal_present = "REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))" in script
         assert required_kb_literal_present
 
-    def test_disk_preflight_no_longer_uses_old_disconnected_constant(self, workflow):
+    def test_disk_preflight_accounts_for_base_iso_surviving_both_rebuilds(self, workflow):
+        # S7.0RM4 Corrective B: the S7.0RM2 model assumed the base ISO
+        # could be released before either rebuild - proven false by a
+        # real run. The preflight must now include a BASE_ISO_GIB term.
         steps = workflow["jobs"]["iso-smoke"]["steps"]
         preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
-        # the old S7.0RM literal (12 GiB, unrelated to its own stated
-        # 6+8..10+6+6+2 components) must be gone
+        assert "BASE_ISO_GIB" in preflight["run"]
+
+    def test_disk_preflight_no_longer_uses_old_disconnected_constants(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        # the S7.0RM literal (12 GiB) and the S7.0RM2 literal (22 GiB,
+        # which itself omitted the base ISO) must both be gone
         assert "REQUIRED_KB=$((12 * 1024 * 1024))" not in preflight["run"]
+        assert (
+            "PEAK_GIB=$((EXTRACTED_TREE_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB))"
+            not in preflight["run"]
+        )
 
     def test_disk_preflight_reports_available_and_required(self, workflow):
         steps = workflow["jobs"]["iso-smoke"]["steps"]
@@ -2560,3 +2648,114 @@ class TestEphemeralStorageBuild:
 
         assert result.qa is not None
         assert not (work_dir / "extracted-qa").exists()
+
+    # -- S7.0RM4 Corrective A: base ISO must outlive both rebuild commands --
+
+    def test_base_iso_present_during_production_rebuild(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        base_runner = _fake_build_runner(grub_text)
+        presence_at_rebuild: list[bool] = []
+
+        def recording_runner(argv, **kwargs):
+            if "-as" in argv and "mkisofs" in argv and "-qa.iso" not in " ".join(argv):
+                presence_at_rebuild.append(base_iso.exists())
+            return base_runner(argv, **kwargs)
+
+        run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=recording_runner,
+            ephemeral_storage=True,
+        )
+
+        assert presence_at_rebuild == [True]
+
+    def test_base_iso_present_during_qa_rebuild(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        base_runner = _fake_build_runner(grub_text)
+        presence_at_qa_rebuild: list[bool] = []
+
+        def recording_runner(argv, **kwargs):
+            if "-as" in argv and "mkisofs" in argv and "-qa.iso" in " ".join(argv):
+                presence_at_qa_rebuild.append(base_iso.exists())
+            return base_runner(argv, **kwargs)
+
+        result = run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=recording_runner,
+            ephemeral_storage=True,
+        )
+
+        assert result.qa is not None
+        assert presence_at_qa_rebuild == [True]
+
+    def test_base_iso_released_only_after_qa_rebuild_completes(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        base_runner = _fake_build_runner(grub_text)
+        seen_qa_rebuild_before_release = {"value": False}
+
+        def recording_runner(argv, **kwargs):
+            if "-as" in argv and "mkisofs" in argv and "-qa.iso" in " ".join(argv):
+                seen_qa_rebuild_before_release["value"] = base_iso.exists()
+            return base_runner(argv, **kwargs)
+
+        result = run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=recording_runner,
+            ephemeral_storage=True,
+        )
+
+        assert result.qa is not None
+        assert seen_qa_rebuild_before_release["value"] is True  # present during QA rebuild
+        assert not base_iso.exists()  # released only after QA rebuild completed
+
+    def test_base_iso_released_after_qa_blocked_cleanly(self, tmp_path):
+        # QA never reaches a rebuild command at all (no GRUB candidate)
+        # - this is still a safe release point since no further xorriso
+        # command will run.
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+        runner = _fake_build_runner_without_grub()
+
+        result = run_build(
+            repo_root=repo_root, work_dir=tmp_path / "work",
+            output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+            source_commit="a" * 40, subprocess_runner=runner,
+            ephemeral_storage=True,
+        )
+
+        assert result.qa is None
+        assert result.qa_blocked_reason is not None
+        assert not base_iso.exists()
+
+    def test_base_iso_preserved_when_production_rebuild_fails(self, tmp_path):
+        repo_root = _fake_repo_root(tmp_path)
+        base_iso = repo_root / "cache" / "upstream" / "fake-base.iso"
+        grub_text = (FIXTURES_DIR / "grub-cfg-safe.cfg").read_text()
+        base_runner = _fake_build_runner(grub_text)
+
+        def failing_runner(argv, **kwargs):
+            if "-as" in argv and "mkisofs" in argv:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="xorriso: FAILURE")
+            return base_runner(argv, **kwargs)
+
+        with pytest.raises(BuildError):
+            run_build(
+                repo_root=repo_root, work_dir=tmp_path / "work",
+                output_iso=tmp_path / "dist" / "serein-alpha-26.04-amd64.iso",
+                source_commit="a" * 40, subprocess_runner=failing_runner,
+                ephemeral_storage=True,
+            )
+
+        # failure must propagate (raised, not swallowed) and the base
+        # image must never be deleted on a failure path - it stays
+        # available for forensic inspection.
+        assert base_iso.is_file()
