@@ -252,6 +252,7 @@ def _cmd_evidence(args: argparse.Namespace) -> int:
         serein_core_present=args.serein_core_present,
         firstboot_provisioning=args.firstboot_provisioning,
         autoinstall_mode=args.autoinstall_mode,
+        target_disk_attached=args.target_disk_attached,
     )
     out_path = write_installer_layer_b_evidence(evidence, Path(args.out))
     print(f"PASS: wrote {out_path}")
@@ -350,6 +351,11 @@ def main(argv: list[str] | None = None) -> int:
     evidence_parser.add_argument("--target-serial", default="")
     evidence_parser.add_argument("--target-device-path", default="")
     evidence_parser.add_argument("--target-identity-revalidated", action="store_true")
+    evidence_parser.add_argument(
+        "--target-disk-attached", action="store_true",
+        help="Only set once the real fixture-disk topology was observed to exist "
+             "(S7.1R Corrective B) - never a structural default",
+    )
     evidence_parser.add_argument(
         "--protected-disk", action="append", type=_parse_protected_disk, default=[]
     )

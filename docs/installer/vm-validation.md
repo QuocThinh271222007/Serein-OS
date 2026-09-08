@@ -54,6 +54,14 @@ any other physical device path (`tests/test_installer.py::TestInstallerSmokeWork
 and `TestInstallerScriptsStatic` statically prove this for the
 committed workflow/scripts).
 
+## Storage lifecycle
+
+See `docs/installer/storage-lifecycle.md` for the real per-asset
+lifecycle analysis (created-at/last-consumer/safe-release-point) behind
+the disk-space preflight requirement, and why it is a real
+simultaneous-residency model rather than a sum of every artifact this
+job ever creates.
+
 ## Fixture disks (Sections 31-32)
 
 **`disk-protected.qcow2`** (`installer/scripts/create-fixture-disks.sh`) -

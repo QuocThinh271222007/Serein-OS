@@ -75,12 +75,22 @@ def assemble_installer_layer_b_evidence(
     serein_core_present: bool = False,
     firstboot_provisioning: str = "unknown",
     autoinstall_mode: str = "qa_only",
+    target_disk_attached: bool = False,
 ) -> InstallerLayerBEvidence:
     """Pure assembly - takes already-computed values, never re-runs
     anything and never assumes any file/disk exists. Every stage
     argument defaults to "never happened" so a caller can build valid
     evidence after a failure at any point in the pipeline, including
-    before a target was ever selected."""
+    before a target was ever selected.
+
+    ``target_disk_attached`` is a RUNTIME fact (S7.1R Corrective B/
+    Section 17), never a structural invariant like
+    ``physical_disk_passthrough`` - a real run recorded it as
+    unconditionally ``True`` even when the pipeline failed at disk
+    preflight, before any fixture disk was ever created. It defaults to
+    ``False`` and must only ever be set ``True`` by a caller that has
+    observed the real fixture-disk topology actually exists (never
+    merely that the workflow source code declares a target serial)."""
     return InstallerLayerBEvidence(
         source_commit=source_commit,
         failure_stage=failure_stage,
@@ -119,12 +129,14 @@ def assemble_installer_layer_b_evidence(
         serein_core_present=serein_core_present,
         firstboot_provisioning=firstboot_provisioning,
         autoinstall_mode=autoinstall_mode,
+        target_disk_attached=target_disk_attached,
         # Structural invariants - never caller-supplied, always the
         # safe constant (Section 49-50: no physical disk passthrough,
         # ever, in Layer-B CI; production media never defaults to
-        # autoinstall).
+        # autoinstall). Unlike target_disk_attached above, these two
+        # really are true unconditionally by construction - the code
+        # path that could set them otherwise does not exist.
         autoinstall_production_default=False,
-        target_disk_attached=True,
         physical_disk_passthrough=False,
     )
 
@@ -190,7 +202,7 @@ def load_installer_layer_b_evidence(path: Path) -> InstallerLayerBEvidence:
         firstboot_provisioning=data.get("firstboot_provisioning", "unknown"),
         autoinstall_mode=data.get("autoinstall_mode", "qa_only"),
         autoinstall_production_default=bool(data.get("autoinstall_production_default", False)),
-        target_disk_attached=bool(data.get("target_disk_attached", True)),
+        target_disk_attached=bool(data.get("target_disk_attached", False)),
         physical_disk_passthrough=bool(data.get("physical_disk_passthrough", False)),
         schema_version=int(
             data.get("schema_version", INSTALLER_LAYER_B_EVIDENCE_SCHEMA_VERSION)

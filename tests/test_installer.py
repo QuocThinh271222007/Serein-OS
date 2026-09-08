@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -808,6 +809,7 @@ def _passing_evidence(**overrides):
         installed_boot_marker="Reached target basic.target - Basic System.",
         install_media_attached_during_installed_boot=False,
         serein_core_present=True, firstboot_provisioning="pending",
+        target_disk_attached=True,
     )
     kwargs.update(overrides)
     return assemble_installer_layer_b_evidence(**kwargs)
@@ -850,9 +852,29 @@ class TestEvidence:
         assert evidence.protected_disk_hash_unchanged is False
 
     def test_structural_invariants_never_caller_overridable(self):
-        evidence = assemble_installer_layer_b_evidence(source_commit="a" * 40)
+        # physical_disk_passthrough/autoinstall_production_default are
+        # true structural invariants - the code path to set them
+        # otherwise does not exist, so assemble_* never accepts them as
+        # parameters at all.
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, target_disk_attached=True
+        )
         assert evidence.physical_disk_passthrough is False
         assert evidence.autoinstall_production_default is False
+
+    def test_target_disk_attached_defaults_false_not_a_structural_invariant(self):
+        # S7.1R Corrective B/Section 17 - the exact real defect: a real
+        # run recorded target_disk_attached=true unconditionally, even
+        # though disk_preflight failed before any fixture disk existed.
+        # It is a RUNTIME fact and must default to the fail-closed
+        # false, never be hardcoded true.
+        evidence = assemble_installer_layer_b_evidence(source_commit="a" * 40)
+        assert evidence.target_disk_attached is False
+
+    def test_target_disk_attached_settable_only_by_explicit_caller(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, target_disk_attached=True
+        )
         assert evidence.target_disk_attached is True
 
     def test_round_trip_through_write_and_load(self, tmp_path):
@@ -877,6 +899,96 @@ class TestEvidence:
     def test_invalid_installation_status_rejected(self):
         with pytest.raises(ValueError, match="installation_status"):
             assemble_installer_layer_b_evidence(source_commit="a" * 40, installation_status="maybe")  # type: ignore[arg-type]
+
+
+class TestEvidenceStageGating:
+    """S7.1R Corrective B (Tests B1-B6): 'evidence records observed
+    stage completion, not intended topology'. Real run #1 recorded
+    target_explicit/target_identity_revalidated/target_disk_attached as
+    true unconditionally, even though disk_preflight failed before any
+    of those stages ever ran."""
+
+    def test_b1_early_disk_preflight_failure_evidence(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, failure_stage="disk_preflight",
+            failure_reason="insufficient disk space",
+        )
+        assert evidence.target_explicit is False
+        assert evidence.target_identity_revalidated is False
+        assert evidence.target_disk_attached is False
+        assert evidence.installation_status == "not_performed"
+        assert evidence.installed_boot_status == "not_performed"
+        assert evidence.installed_boot_mode is None
+        assert evidence.installed_boot_marker is None
+        assert evidence.plan_valid is False
+        assert evidence.all_destructive_ops_on_target is False
+        assert evidence.target_disk_before_sha256 is None
+        assert evidence.target_disk_after_sha256 is None
+        assert evidence.target_disk_changed is False
+        assert evidence.protected_disk_before_sha256 == ()
+        assert evidence.protected_disk_hash_unchanged is False
+        assert evidence.target_esp_present is False
+        assert evidence.target_root_present is False
+        assert evidence.protected_esp_unchanged is False
+        assert evidence.serein_core_present is False
+        assert evidence.firstboot_provisioning == "unknown"
+
+    def test_b2_target_declared_but_fixture_not_created(self):
+        # target_explicit may be true (render-autoinstall ran), but
+        # target_disk_attached must NOT be marked true merely because a
+        # target was declared - the fixture disks were never created.
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, target_explicit=True,
+            failure_stage="installer_unavailable",
+            failure_reason="create-fixture-disks.sh failed",
+        )
+        assert evidence.target_explicit is True
+        assert evidence.target_disk_attached is False
+
+    def test_b3_fixture_created_but_revalidation_not_run(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, target_explicit=True, target_disk_attached=True,
+            failure_stage="target_changed",
+            failure_reason="fixture topology re-verification failed",
+        )
+        assert evidence.target_disk_attached is True
+        assert evidence.target_identity_revalidated is False
+
+    def test_b4_successful_revalidation(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, target_explicit=True, target_disk_attached=True,
+            target_identity_revalidated=True,
+        )
+        assert evidence.target_identity_revalidated is True
+        assert evidence.target_disk_attached is True
+
+    def test_b5_empty_hash_arrays_never_imply_protection_pass(self):
+        evidence = assemble_installer_layer_b_evidence(source_commit="a" * 40)
+        assert evidence.protected_disk_before_sha256 == ()
+        assert evidence.protected_disk_after_sha256 == ()
+        assert evidence.protected_disk_hash_unchanged is False
+
+    def test_b6_target_change_requires_two_real_hashes(self):
+        only_before = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, target_disk_before_sha256="a" * 64,
+        )
+        assert only_before.target_disk_changed is False
+        only_after = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40, target_disk_after_sha256="b" * 64,
+        )
+        assert only_after.target_disk_changed is False
+        neither = assemble_installer_layer_b_evidence(source_commit="a" * 40)
+        assert neither.target_disk_changed is False
+        both_same = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            target_disk_before_sha256="a" * 64, target_disk_after_sha256="a" * 64,
+        )
+        assert both_same.target_disk_changed is False
+        both_different = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            target_disk_before_sha256="a" * 64, target_disk_after_sha256="b" * 64,
+        )
+        assert both_different.target_disk_changed is True
 
 
 class TestClosureGate:
@@ -1262,6 +1374,189 @@ class TestInstallerSmokeWorkflow:
         steps = workflow["jobs"]["installer-smoke"]["steps"]
         preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
         assert "REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))" in preflight["run"]
+
+    # -- S7.1R Corrective A: storage-lifetime model (Tests A1-A3) --
+
+    def test_a1_lifecycle_budget_excludes_released_artifacts(self, workflow):
+        # Section 3-4: the preflight arithmetic must not sum artifacts
+        # that are actually released before the real peak moment -
+        # base ISO, S7.0 extracted tree, and production ISO must never
+        # appear as summed components of the peak.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        script = preflight["run"]
+        # Exact-variable-name checks (never a bare substring match -
+        # QA_INSTALL_EXTRACTED_TREE_GIB legitimately contains
+        # "EXTRACTED_TREE_GIB" as a substring and must NOT trip this).
+        for excluded_var in ("BASE_ISO_GIB", "EXTRACTED_TREE_GIB", "PRODUCTION_ISO_GIB"):
+            assert re.search(rf"(?<![A-Z_]){excluded_var}=", script) is None, (
+                f"{excluded_var} must not be budgeted - it is released before the real peak"
+            )
+
+        # Each released artifact must have a real "Release ..." step
+        # that runs before the "Prepare QA-install ISO" step (the real
+        # peak moment).
+        names = [s.get("name") for s in steps]
+        peak_index = names.index("Prepare QA-install ISO")
+        for release_step_name in (
+            "Release S7.0 build work tree", "Release production ISO",
+        ):
+            assert release_step_name in names
+            assert names.index(release_step_name) < peak_index
+
+    def test_a2_safety_margin_remains_non_zero(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        match = re.search(r"SAFETY_MARGIN_GIB=(\d+)", preflight["run"])
+        assert match is not None
+        assert int(match.group(1)) >= 4
+
+    def test_a3_sparse_qcow2_modeled_separately_from_virtual_capacity(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        preflight = next(s for s in steps if s.get("name") == "Disk space preflight")
+        script = preflight["run"]
+        assert "FIXTURE_QCOW2_VIRTUAL_GIB" in script
+        assert "FIXTURE_QCOW2_ALLOCATED_GIB" in script
+        # The virtual-capacity variable must never be summed into
+        # either candidate peak's arithmetic expression - only ever
+        # echoed for contrast.
+        assert "PEAK_GIB=$((FIXTURE_QCOW2_VIRTUAL_GIB" not in script
+        assert "+ FIXTURE_QCOW2_VIRTUAL_GIB" not in script
+        # The allocated (real, smaller) estimate IS used in the actual
+        # arithmetic.
+        assert "FIXTURE_QCOW2_ALLOCATED_GIB))" in script
+
+    def test_release_artifact_helper_is_root_confined_and_never_sudo(self):
+        text = (REPO_ROOT / "installer" / "scripts" / "release-artifact.sh").read_text(
+            encoding="utf-8"
+        )
+        for line in text.splitlines():
+            if "sudo" in line:
+                assert line.strip().startswith("#"), line
+        assert "REPO_ROOT" in text
+        assert "realpath" in text
+
+
+# ---------------------------------------------------------------------------
+# S7.1R: real disk-preflight script execution (Tests A4-A5)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_df(bin_dir: Path, available_kb: int) -> None:
+    """A stub `df` on PATH mimicking `df -Pk .`'s real column layout
+    (Filesystem/1024-blocks/Used/Available/Capacity/Mounted) closely
+    enough for `awk '{print $4}'` to extract the intended Available
+    figure - proves the real preflight script's own arithmetic and
+    comparison, not a hand-copied re-implementation."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "df"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        "echo 'Filesystem     1024-blocks      Used Available Capacity Mounted on'\n"
+        f"echo '/dev/fake        999999999   1000000 {available_kb}      1% /'\n"
+    )
+    script.chmod(0o755)
+
+
+class TestDiskPreflightScript:
+    """Extracts the REAL `run:` script for the "Disk space preflight"
+    step straight from the committed workflow YAML and executes it via
+    `bash -c` with a stub `df` on PATH - proves the real fix
+    behaviorally, not merely that certain strings appear in the file."""
+
+    @pytest.fixture()
+    def step_script(self):
+        import yaml
+
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        with (WORKFLOWS_DIR / "installer-smoke.yml").open(encoding="utf-8") as fh:
+            workflow = yaml.safe_load(fh)
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        step = next(s for s in steps if s.get("name") == "Disk space preflight")
+        return step["run"]
+
+    def _run(self, script: str, work_dir: Path, bin_dir: Path) -> subprocess.CompletedProcess:
+        real_helper = REPO_ROOT / "distribution" / "scripts" / "record-failure.sh"
+        sandboxed_helper = work_dir / "distribution" / "scripts" / "record-failure.sh"
+        sandboxed_helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(real_helper, sandboxed_helper)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        return subprocess.run(
+            ["bash", "-c", script], cwd=work_dir, env=env, capture_output=True, text=True,
+        )
+
+    def test_a4_preflight_fails_when_genuinely_insufficient(self, step_script, tmp_path):
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        _make_fake_df(tmp_path / "bin", available_kb=1_000_000)  # ~1 GiB - genuinely too small
+
+        result = self._run(step_script, work_dir, tmp_path / "bin")
+
+        assert result.returncode != 0
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "disk_preflight"
+        reason = (work_dir / "dist" / ".failure_reason").read_text().strip()
+        assert "insufficient disk space" in reason
+
+    def test_a5_preflight_passes_for_run_1_real_available_capacity(self, step_script, tmp_path):
+        # Section 23 Test A5: use Run #1's own real observed available
+        # capacity (38180956 KiB) - deterministic, never "assume the
+        # runner always has 36 GiB"; the corrected model must fit
+        # THIS exact real number with real margin.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        _make_fake_df(tmp_path / "bin", available_kb=38180956)
+
+        result = self._run(step_script, work_dir, tmp_path / "bin")
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not (work_dir / "dist" / ".failure_stage").exists()
+        assert "REQUIRED_GIB=" in result.stdout
+
+    def test_preflight_still_fails_closed_never_a_no_op(self, step_script, tmp_path):
+        # Preflight must remain a real gate - it is not acceptable for
+        # it to have become unconditionally-passing.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        _make_fake_df(tmp_path / "bin", available_kb=0)
+
+        result = self._run(step_script, work_dir, tmp_path / "bin")
+        assert result.returncode != 0
+
+
+class TestInstallerFirstFailureWins:
+    """Test B7 (Section 24, 21): executes the REAL, committed
+    ``distribution/scripts/record-failure.sh`` - the same canonical
+    helper ``installer-smoke.yml`` calls at every one of its own
+    failure sites - proving disk_preflight (the real run #1 blocker)
+    is never overwritten by a later, independent installer-stage
+    failure."""
+
+    SCRIPT_PATH = REPO_ROOT / "distribution" / "scripts" / "record-failure.sh"
+
+    def _run(self, work_dir: Path, stage: str, reason: str) -> subprocess.CompletedProcess:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        return subprocess.run(
+            ["bash", str(self.SCRIPT_PATH), stage, reason],
+            cwd=work_dir, capture_output=True, text=True,
+        )
+
+    def test_b7_disk_preflight_not_overwritten_by_later_installer_failure(self, tmp_path):
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        self._run(work_dir, "disk_preflight", "insufficient disk space")
+        self._run(work_dir, "installer_config_invalid", "render-autoinstall failed")
+        self._run(work_dir, "install_failed", "real QA autoinstall run failed")
+        self._run(work_dir, "installed_boot_failed", "installed target failed to boot")
+
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "disk_preflight"
+        assert (
+            work_dir / "dist" / ".failure_reason"
+        ).read_text().strip() == "insufficient disk space"
 
 
 # ---------------------------------------------------------------------------

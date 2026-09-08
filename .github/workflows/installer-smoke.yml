@@ -1,9 +1,10 @@
 name: Installer Smoke (real target-disk installation)
 
-# Layer B for S7.1 (Sections 42-52) - the real, multi-GB installer
-# execution path: builds the S7.0 production/QA media, embeds a real
-# QA-only autoinstall config, boots a real installer under real QEMU
-# against two real virtual disks (a protected fixture that MUST remain
+# Layer B for S7.1 (Sections 42-52; storage-lifetime + evidence-fidelity
+# corrective added by S7.1R) - the real, multi-GB installer execution
+# path: builds the S7.0 production/QA media, embeds a real QA-only
+# autoinstall config, boots a real installer under real QEMU against
+# two real virtual disks (a protected fixture that MUST remain
 # byte-identical, and a target the install is explicitly allowed to
 # destroy), and then boots the INSTALLED target on its own to prove it
 # is genuinely self-contained. Mirrors iso-smoke.yml's conventions
@@ -36,6 +37,24 @@ name: Installer Smoke (real target-disk installation)
 # run with a PRESENT evidence artifact, never a green run and never a
 # crash that loses the evidence. The final "Enforce Installer Layer-B
 # closure" step is the one explicit fail-closed gate.
+#
+# S7.1R storage-lifetime model (Section 3-13 of the S7.1R corrective):
+# Run #1 (RUN_ID=34216492634) failed at disk_preflight because the
+# original model summed EVERY large artifact this job ever creates as
+# though they all coexisted simultaneously (55 GiB required against a
+# real ~36.4 GiB available). They do not - S7.0's own extracted work
+# tree, the production ISO, the QA ISO, and the QA-install extraction
+# tree are each only needed up through their own real final consumer,
+# never after. `installer/scripts/release-artifact.sh` (a single,
+# root-confined, exact-path, never-sudo helper - mirrors
+# distribution/scripts/record-failure.sh's "one canonical helper"
+# discipline) frees each one immediately after that consumer succeeds,
+# so later stages' preflight-relevant peak is genuinely smaller.
+# `installer/scripts/log-disk-usage.sh` records real available/used
+# space plus `du -sh` of whatever large artifacts currently exist after
+# every major stage, so a real run produces real telemetry this
+# estimate can be corrected against - exactly like S7.0's own preflight
+# arithmetic was revised more than once after real evidence.
 
 on:
   workflow_dispatch:
@@ -137,50 +156,102 @@ jobs:
           echo "FREE_SPACE_AFTER_CLEANUP_KB=${FREE_AFTER_KB}"
           echo "SPACE_RECLAIMED_KB=$((FREE_AFTER_KB - FREE_BEFORE_KB))"
 
-      # Disk-space preflight (Section 50) - a genuinely LARGER peak
-      # than S7.0's own 32 GiB requirement, since this job additionally
-      # extracts+rebuilds a THIRD ISO variant (QA-install, with
-      # autoinstall.yaml embedded) and creates two real virtual disks.
-      # Real observed simultaneous-peak moment: right after the
-      # QA-install ISO is rebuilt, before S7.0's own production/QA
-      # extraction tree or ISOs have been cleaned up, and before the
-      # fixture disks are created:
+      - name: "Disk usage: after_cleanup"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_cleanup
+
+      # Disk-space preflight (S7.1R Corrective A) - a REAL simultaneous-
+      # residency model, not a sum of every artifact this job ever
+      # creates. Named components, each tied to a real lifecycle point
+      # documented in docs/installer/storage-lifecycle.md:
       #
-      #   BASE_ISO_GIB (7, released by S7.0's own ephemeral_storage
-      #     mode immediately after its build, but budgeted here too
-      #     since it overlaps with the QA-install extraction/rebuild
-      #     that begins right after)
-      #   + PRODUCTION_ISO_GIB (7) + QA_ISO_GIB (7)   [from S7.0's build]
-      #   + QA_INSTALL_EXTRACTED_TREE_GIB (7)          [isoprep's own
-      #                                                  independent
-      #                                                  re-extraction]
-      #   + QA_INSTALL_ISO_GIB (7)
-      #   + PROTECTED_DISK_GIB (4) + TARGET_DISK_GIB (8)  [fixture qcow2s]
-      #   = PEAK_GIB (47)
-      #   + SAFETY_MARGIN_GIB (8, generous - these are rough size
-      #     estimates, not measured; this number is expected to be
-      #     revised after a real run, exactly like S7.0's own
-      #     preflight arithmetic was revised across S7.0RM/RM2/RM4)
-      #   = REQUIRED_GIB (55)
+      #   S7.0's OWN internal peak (base ISO + extracted tree +
+      #   production ISO + QA ISO, all alive briefly while the QA
+      #   rebuild is in progress, before EPHEMERAL_STORAGE=1 releases
+      #   the base ISO) is already 28 GiB - see iso-smoke.yml's own
+      #   preflight, unchanged, since this job reuses build-iso.sh
+      #   as-is. This job's build step can never need less than that.
+      #
+      #   The real peak AFTER that step returns is reached inside
+      #   "Prepare QA-install ISO", which needs the QA ISO (7, still the
+      #   source), a full second extraction of it (7,
+      #   qa-install-extracted), and the QA-install ISO being written
+      #   (7) all at once = 21 GiB - by this point S7.0's own base ISO
+      #   and extracted tree, and the production ISO, have ALL already
+      #   been released by their own real final consumers (see the
+      #   "Release ..." steps below), so they do not add to this peak.
+      #
+      #   PROTECTED+TARGET qcow2 fixtures are SPARSE - their combined
+      #   4+8=12 GiB figure is VIRTUAL capacity, never budgeted directly
+      #   as guaranteed host allocation (S7.1R Section 9). A
+      #   freshly-created, lightly populated pair (GPT + FAT32 ESP +
+      #   ext4 data/root with a few sentinel files, no OS content yet)
+      #   allocates well under 1 GiB combined - real allocated size is
+      #   measured directly via `du -sh`/`qemu-img info` in the disk-
+      #   usage telemetry steps below, never assumed. A REAL install
+      #   DOES grow the target's actual allocated bytes as curtin
+      #   copies real content into it though - the live QA-install
+      #   medium's own squashfs is the practical upper bound on how
+      #   much a base install can populate, budgeted below as
+      #   FIXTURE_QCOW2_ALLOCATED_GIB, distinct from and much smaller
+      #   than FIXTURE_QCOW2_VIRTUAL_GIB (documented for contrast only,
+      #   never summed into the required total).
+      #
+      #   Two candidate peak moments, the real maximum of which is used:
+      #     ISOPREP_PEAK_GIB = QA_ISO_GIB(7, isoprep's own source) +
+      #       QA_INSTALL_EXTRACTED_TREE_GIB(7, isoprep's own independent
+      #       re-extraction) + QA_INSTALL_ISO_GIB(7, being rebuilt) = 21
+      #     INSTALL_PEAK_GIB = QA_INSTALL_ISO_GIB(7, still present until
+      #       released right after the real install completes -
+      #       Section 47) + FIXTURE_QCOW2_ALLOCATED_GIB(6, generous
+      #       real-allocation estimate, mostly target-disk growth - the
+      #       protected disk's real allocated size never meaningfully
+      #       changes, which is the entire point of the safety proof) = 13
+      #   By this point S7.0's own base ISO, extracted tree, and
+      #   production ISO have ALL already been released by their own
+      #   real final consumers (see the "Release ..." steps below), so
+      #   none of them add to either candidate peak.
+      #
+      #   PEAK_GIB = max(ISOPREP_PEAK_GIB, INSTALL_PEAK_GIB) = 21
+      #   + SAFETY_MARGIN_GIB (6 - non-zero, generous given these are
+      #     still estimates, not measured; this number is expected to
+      #     be revised after real disk-usage telemetry from a real run,
+      #     exactly like S7.0's own preflight arithmetic was revised
+      #     more than once)
+      #   = REQUIRED_GIB (27)
       - name: Disk space preflight
         run: |
           df -h .
-          BASE_ISO_GIB=7
-          PRODUCTION_ISO_GIB=7
           QA_ISO_GIB=7
           QA_INSTALL_EXTRACTED_TREE_GIB=7
           QA_INSTALL_ISO_GIB=7
-          PROTECTED_DISK_GIB=4
-          TARGET_DISK_GIB=8
-          SAFETY_MARGIN_GIB=8
-          PEAK_GIB=$((BASE_ISO_GIB + PRODUCTION_ISO_GIB + QA_ISO_GIB + \
-            QA_INSTALL_EXTRACTED_TREE_GIB + QA_INSTALL_ISO_GIB + \
-            PROTECTED_DISK_GIB + TARGET_DISK_GIB))
+          FIXTURE_QCOW2_VIRTUAL_GIB=12
+          FIXTURE_QCOW2_ALLOCATED_GIB=6
+          SAFETY_MARGIN_GIB=6
+
+          ISOPREP_PEAK_GIB=$((QA_ISO_GIB + QA_INSTALL_EXTRACTED_TREE_GIB + QA_INSTALL_ISO_GIB))
+          INSTALL_PEAK_GIB=$((QA_INSTALL_ISO_GIB + FIXTURE_QCOW2_ALLOCATED_GIB))
+          if [ "${ISOPREP_PEAK_GIB}" -ge "${INSTALL_PEAK_GIB}" ]; then
+            PEAK_GIB=${ISOPREP_PEAK_GIB}
+          else
+            PEAK_GIB=${INSTALL_PEAK_GIB}
+          fi
           REQUIRED_GIB=$((PEAK_GIB + SAFETY_MARGIN_GIB))
           REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))
           AVAILABLE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
-          echo "PEAK_GIB=${PEAK_GIB}"
-          echo "REQUIRED_GIB=${REQUIRED_GIB} (peak + ${SAFETY_MARGIN_GIB} GiB safety margin)"
+          echo "BUDGET_COMPONENTS:"
+          echo "  QA_ISO_GIB=${QA_ISO_GIB} (isoprep's own source, still present)"
+          echo "  QA_INSTALL_EXTRACTED_TREE_GIB=${QA_INSTALL_EXTRACTED_TREE_GIB} (isoprep's own independent re-extraction)"
+          echo "  QA_INSTALL_ISO_GIB=${QA_INSTALL_ISO_GIB} (being rebuilt)"
+          echo "  FIXTURE_QCOW2_VIRTUAL_GIB=${FIXTURE_QCOW2_VIRTUAL_GIB} (documented for contrast only - NEVER budgeted directly)"
+          echo "  FIXTURE_QCOW2_ALLOCATED_GIB=${FIXTURE_QCOW2_ALLOCATED_GIB} (real-allocation estimate, distinct from virtual capacity)"
+          echo "  (S7.0's own base ISO/extracted tree/production ISO are excluded -"
+          echo "   each is released by its own real final consumer before either peak moment)"
+          echo "ISOPREP_PEAK_GIB=${ISOPREP_PEAK_GIB}"
+          echo "INSTALL_PEAK_GIB=${INSTALL_PEAK_GIB}"
+          echo "ESTIMATED_MAX_CONCURRENT_GIB=${PEAK_GIB}"
+          echo "SAFETY_MARGIN_GIB=${SAFETY_MARGIN_GIB}"
+          echo "REQUIRED_GIB=${REQUIRED_GIB}"
           echo "AVAILABLE_KB=${AVAILABLE_KB}"
           echo "REQUIRED_KB=${REQUIRED_KB}"
           if [ "${AVAILABLE_KB}" -lt "${REQUIRED_KB}" ]; then
@@ -210,6 +281,10 @@ jobs:
             exit 1
           }
 
+      - name: "Disk usage: after_base_fetch"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_base_fetch
+
       - name: Build Serein Alpha ISO (production + QA variant)
         id: build
         run: |
@@ -217,6 +292,23 @@ jobs:
             ./distribution/scripts/record-failure.sh "production_or_qa_build" "build-iso.sh failed"
             exit 1
           }
+
+      # S7.1R Section 8: EPHEMERAL_STORAGE=1 already makes run_build()
+      # release the cached base ISO itself (verified directly against
+      # src/serein/distribution/build.py, not assumed) - but it never
+      # deletes build/work/extracted, the (~7 GiB) tree the base ISO was
+      # extracted into. Nothing in this workflow ever reads that tree
+      # again after this step - strict inspection re-extracts its own
+      # copy straight from the ISO FILES, never from build/work - so it
+      # is released here, right after its one and only real consumer
+      # (this build step) finishes.
+      - name: Release S7.0 build work tree
+        if: always()
+        run: ./installer/scripts/release-artifact.sh build/work/extracted
+
+      - name: "Disk usage: after_s7_0_build"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_s7_0_build
 
       - name: Strict-inspect production ISO
         id: inspect-prod
@@ -238,6 +330,21 @@ jobs:
             exit 1
           fi
 
+      # S7.1R Section 5: the production ISO has no consumer anywhere in
+      # this workflow after its own strict inspection - never read again
+      # by render-autoinstall/prepare-qa-install-iso/fixture creation/
+      # install, all of which only ever touch the QA ISO. Its manifest/
+      # sha256 sidecars are deliberately NOT deleted (tiny, and closure
+      # evidence never needs to be reconstructed from them, but keeping
+      # them costs nothing and preserves forensic value).
+      - name: Release production ISO
+        if: always()
+        run: ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64.iso
+
+      - name: "Disk usage: after_prod_inspection"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_prod_inspection
+
       - name: Strict-inspect QA ISO
         id: inspect-qa
         if: always()
@@ -257,6 +364,10 @@ jobs:
               "strict QA ISO inspection failed"
             exit 1
           fi
+
+      - name: "Disk usage: after_qa_inspection"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_qa_inspection
 
       # S7.1 begins here - everything above is unmodified S7.0.
       #
@@ -304,6 +415,23 @@ jobs:
             exit 1
           fi
 
+      # S7.1R Section 6-7: the QA ISO's last consumer is this exact
+      # step (isoprep's own source) - never read again afterward. The
+      # QA-install extraction tree is temporary derived data whose only
+      # consumer was the rebuild that already happened inside this same
+      # step - releasing both together, right here, closes the single
+      # largest avoidable overlap this job had.
+      - name: Release QA ISO and QA-install extraction tree
+        if: always()
+        run: |
+          ./installer/scripts/release-artifact.sh \
+            dist/serein-alpha-26.04-amd64-qa.iso \
+            build/installer-work/qa-install-extracted
+
+      - name: "Disk usage: after_qa_install_iso"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_qa_install_iso
+
       - name: Create fixture disks (protected + target)
         id: create-fixtures
         if: always() && steps.prepare-qa-install-iso.outputs.status == 'pass'
@@ -317,12 +445,32 @@ jobs:
             exit 1
           fi
 
+      - name: "Disk usage: after_fixture_creation"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_fixture_creation
+
+      # S7.1R Section 16: the closest honest, real, host-side analog of
+      # a TOCTOU re-match, immediately before the real destructive
+      # install begins - see installer/scripts/verify-fixture-topology.sh
+      # for exactly what this does and does not prove.
+      - name: Re-verify fixture topology
+        id: verify-topology
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/verify-fixture-topology.sh \
+            dist/installer-fixtures/disk-protected.qcow2 \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "target_changed" \
+              "fixture topology re-verification failed"
+            exit 1
+          }
+
       # The real installer execution (Section 42-43). QA-only autoinstall
       # (Section 7) - never production media, never a physical disk
       # (Section 49-50).
       - name: Run real QA autoinstall
         id: run-install
-        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        if: always() && steps.verify-topology.outcome == 'success'
         run: |
           if ./installer/scripts/run-qa-install.sh \
               dist/serein-alpha-26.04-amd64-qa-install.iso \
@@ -336,6 +484,15 @@ jobs:
               "real QA autoinstall run failed - see qa-install-serial.log"
             exit 1
           fi
+
+      # S7.1 Section 47: remove the install ISO once the real install
+      # has actually finished with it - never attached to any later
+      # boot-check QEMU command anyway, but genuinely releasing the
+      # bytes now (rather than only "never referencing" them) also
+      # closes out the last of the job's large avoidable overlaps.
+      - name: Release QA-install ISO
+        if: always()
+        run: ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64-qa-install.iso
 
       # The central S7.1 proof (Section 44-46) - hash BOTH disk images
       # after the install, regardless of whether the install step
@@ -353,6 +510,10 @@ jobs:
           echo "REAL_PROTECTED_DISK_SHA256_AFTER=${PROTECTED_AFTER}"
           echo "REAL_TARGET_DISK_SHA256_AFTER=${TARGET_AFTER}"
 
+      - name: "Disk usage: after_install"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_install
+
       - name: Inspect target disk layout
         id: inspect-target-layout
         if: always() && steps.run-install.outputs.status == 'pass'
@@ -363,6 +524,10 @@ jobs:
               "target disk layout inspection failed"
             exit 1
           }
+
+      - name: "Disk usage: after_target_inspection"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_target_inspection
 
       # Section 47: the target must boot ON ITS OWN, no install medium
       # attached - the primary evidence this closure gate consumes.
@@ -394,6 +559,13 @@ jobs:
             --protected-disk dist/installer-fixtures/disk-protected.qcow2 \
             --result-json dist/installed-boot-with-protected-result.json
 
+      # S7.1R Corrective B (Section 14-21): every evidence field below
+      # is derived from a REAL stage's own observed outcome - never
+      # unconditional. A real run (#1) incorrectly recorded
+      # target_explicit/target_identity_revalidated/target_disk_attached
+      # as true even though disk_preflight failed before any of those
+      # stages ever ran. "Evidence records observed stage completion,
+      # not intended topology."
       - name: Assemble Installer Layer-B evidence
         if: always()
         run: |
@@ -409,7 +581,27 @@ jobs:
           ARGS+=(--installer-backend curtin)
           ARGS+=(--target-serial SEREIN-TARGET-DISK --target-device-path /dev/vdb)
           ARGS+=(--protected-disk SEREIN-PROTECTED-DISK:/dev/vda)
-          ARGS+=(--target-explicit --target-identity-revalidated)
+
+          # target_explicit: only once the target was actually declared
+          # AND validated against a plan (render-autoinstall's own job).
+          if [ "${{ steps.render-autoinstall.outputs.status }}" = "pass" ]; then
+            ARGS+=(--target-explicit)
+          fi
+
+          # target_disk_attached: only once the real fixture-disk
+          # topology was observed to exist (create-fixtures succeeded) -
+          # never merely because the workflow source code names a
+          # target serial (Section 17 - this is the exact real defect).
+          if [ "${{ steps.create-fixtures.outputs.status }}" = "pass" ]; then
+            ARGS+=(--target-disk-attached)
+          fi
+
+          # target_identity_revalidated: only once the real re-
+          # verification stage actually ran and passed (Section 16).
+          if [ "${{ steps.verify-topology.outcome }}" = "success" ] && \
+             [ "${{ steps.verify-topology.outputs.target_identity_revalidated }}" = "true" ]; then
+            ARGS+=(--target-identity-revalidated)
+          fi
 
           if [ "${{ steps.render-autoinstall.outputs.status }}" = "pass" ] && \
              [ -f dist/installer-plan.json ] && \

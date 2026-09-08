@@ -1,18 +1,58 @@
 # Known Limitations (S7.1)
 
-## Real Layer-B validation status
+## Real Layer-B validation status (S7.1R)
 
-**No real Installer Layer-B run has occurred yet.** This development
-environment has no `qemu-img`/`qemu-nbd`/`curtin`/Subiquity installed
-(consistent with every S7.0 round of this repository's history - see
+**One real Installer Layer-B run has occurred**, and it failed at the
+first possible stage:
+
+```text
+Run 1 (after S7.1 initial integration):
+  RUN_ID=34216492634, RUN_NUMBER=1
+  HEAD=27f144f47667c0efe493fe2212437af4ab742dad
+  RESULT=FAILURE - failure_stage=disk_preflight. The original preflight
+  model summed every large artifact this job ever creates as though
+  they all coexisted simultaneously (55 GiB required) against a real
+  ~36.4 GiB available (FREE_SPACE_AFTER_CLEANUP_KB=38180984,
+  AVAILABLE_KB=38180956). Fixed by S7.1R - see
+  docs/installer/storage-lifecycle.md for the real per-asset lifecycle
+  analysis and the corrected, real-simultaneous-residency preflight
+  model (REQUIRED_GIB=27).
+```
+
+Because disk preflight failed first, nothing past it was exercised:
+`REAL_BASE_FETCH`, `REAL_BASE_VERIFY`, `REAL_PRODUCTION_ISO_BUILD`,
+`REAL_QA_ISO_BUILD`, `REAL_AUTOINSTALL_RENDER`,
+`REAL_QA_INSTALL_ISO_BUILD`, `REAL_PROTECTED_DISK_CREATED`,
+`REAL_TARGET_DISK_CREATED`, `REAL_INSTALLER_EXECUTION`,
+`REAL_PROTECTED_DISK_HASH_PROOF`, `REAL_TARGET_LAYOUT_INSPECTION`, and
+`REAL_INSTALLED_BOOT` are all still `NOT_OBSERVED` - Run 1 is evidence
+of the storage-preflight defect, never evidence that the installer
+chain itself works.
+
+Run 1 also exposed an evidence-fidelity defect, fixed in the same
+pass: `target_explicit`/`target_identity_revalidated`/
+`target_disk_attached` were recorded as `true` unconditionally, even
+though the pipeline stopped at disk preflight before any of those
+stages could possibly have run. `target_disk_attached` is no longer a
+hardcoded structural constant - see `serein.installer.evidence`'s
+`target_disk_attached` parameter (defaults `False`), and every one of
+these three fields in `installer-smoke.yml`'s evidence-assembly step
+is now gated on the real stage that would have proven it.
+
+A second real Installer Layer-B run against the S7.1R commit is
+required before any `REAL_*` field below can honestly move past
+`NOT_OBSERVED`. This development environment has no `qemu-img`/
+`qemu-nbd`/`curtin`/Subiquity installed (consistent with every S7.0
+round of this repository's history - see
 `docs/distribution/known-limitations.md`), so `installer-smoke.yml`
-has only been validated structurally:
+itself has only ever been validated structurally from here:
 
 | Field | Status | Why |
 |---|---|---|
 | `LAYER_A` | **PASS** | Full `pytest`/`ruff`/`mypy`/`verify.sh` against `src/serein/installer/`, `tests/test_installer.py`, and every `installer/scripts/*.sh` file (real `bash -n` syntax check). |
+| `REAL_DISK_PREFLIGHT` | **FAIL** (Run 1) | The exact real defect this S7.1R pass fixes. Not yet re-run for real. |
 | `INSTALLER_BACKEND_AVAILABLE` | **NOT_OBSERVED** | `curtin`/Subiquity not installed in this environment; `serein.installer.doctor` correctly reports `SKIP`, never a fabricated pass. |
-| `REAL_INSTALLER_EXECUTION` | **NOT_OBSERVED** | Requires a real GitHub Actions run of `installer-smoke.yml`. |
+| `REAL_INSTALLER_EXECUTION` | **NOT_OBSERVED** | Requires a real GitHub Actions run of `installer-smoke.yml` that gets past disk preflight. |
 | `REAL_TARGET_DISK_INSTALL` | **NOT_OBSERVED** | Same. |
 | `REAL_INSTALLED_SYSTEM_BOOT` | **NOT_OBSERVED** | Same. |
 | `PROTECTED_DISK_MODIFICATION_COUNT` | **NOT_OBSERVED** | The hashing/comparison logic itself is unit-tested (`tests/test_installer.py::TestEvidence`), but has never hashed a real qcow2 image before/after a real install. |

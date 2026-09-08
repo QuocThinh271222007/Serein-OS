@@ -327,7 +327,13 @@ class InstallerLayerBEvidence:
     autoinstall_mode: str = "qa_only"
     autoinstall_production_default: bool = False
 
-    target_disk_attached: bool = True
+    #: A RUNTIME fact (S7.1R Corrective B) - never a structural
+    #: invariant. A real run recorded this as unconditionally ``True``
+    #: even when the pipeline failed at disk preflight, before any
+    #: fixture disk was ever created. Defaults to the fail-closed
+    #: ``False``; only a caller that observed the real fixture-disk
+    #: topology actually exists may set it ``True``.
+    target_disk_attached: bool = False
     physical_disk_passthrough: bool = False
 
     schema_version: int = INSTALLER_LAYER_B_EVIDENCE_SCHEMA_VERSION
