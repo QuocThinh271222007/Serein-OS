@@ -53,3 +53,10 @@ python_version = "3.12"
 files = ["src/serein"]
 ignore_missing_imports = true
 disallow_untyped_defs = true
+# Serein's real deployment/CI target is Ubuntu (see .github/workflows/*.yml's
+# `runs-on: ubuntu-latest`) - pinned explicitly so platform-conditional stdlib
+# usage (e.g. serein.firstboot.lock's POSIX `fcntl` path) type-checks against
+# the real target rather than whatever OS a contributor's dev machine happens
+# to run (this repository's own dev/CI discipline is Windows-hosted; without
+# this pin, mypy would otherwise silently type-check against win32 stubs).
+platform = "linux"

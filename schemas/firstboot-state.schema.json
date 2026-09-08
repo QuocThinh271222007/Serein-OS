@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/firstboot-state.schema.json",
+  "title": "Serein First-Boot State",
+  "description": "S7.2's own transactional step-by-step state machine, persisted at /var/lib/serein/firstboot/state.json. Independent of /etc/serein/install-state.json (S7.1's installation-provenance marker) - this is the authoritative source for 'has firstboot already run' from S7.2's own perspective.",
+  "type": "object",
+  "required": [
+    "schema_version", "state", "started_at", "completed_at", "updated_at",
+    "steps", "first_failure_stage", "first_failure_reason", "source_commit"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "state": { "type": "string", "enum": ["pending", "running", "failed", "complete"] },
+    "started_at": { "type": ["string", "null"] },
+    "completed_at": { "type": ["string", "null"] },
+    "updated_at": { "type": ["string", "null"] },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "started_at", "completed_at", "failure_reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "running", "passed", "failed", "skipped"]
+          },
+          "started_at": { "type": ["string", "null"] },
+          "completed_at": { "type": ["string", "null"] },
+          "failure_reason": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "first_failure_stage": { "type": ["string", "null"] },
+    "first_failure_reason": { "type": ["string", "null"] },
+    "source_commit": { "type": ["string", "null"] }
+  }
+}

@@ -1,0 +1,57 @@
+# Serein OS S7.2 - first-boot provisioning unit.
+#
+# See docs/firstboot/architecture.md for the full contract. This unit
+# is deliberately narrow:
+#
+#   - ConditionPathExists gates on the S7.1 handoff marker existing at
+#     all (a coarse, cheap pre-filter) - it is NOT the source of truth
+#     for whether provisioning should run. Real eligibility (handoff
+#     validity, installation_complete, firstboot_provisioning, live-media
+#     detection, already-complete state) is always re-checked in Python
+#     by `serein.firstboot.engine.run_firstboot` itself (Section 11:
+#     "state validation must still happen in Serein code" - mere file
+#     existence is never trusted as full correctness).
+#   - Type=oneshot + RemainAfterExit=yes: the unit runs once per boot,
+#     to completion, and is then considered "active" without a
+#     persistent process - never a background daemon, never a boot loop.
+#     On a boot where provisioning is already complete, the Python
+#     engine itself observes state=complete and exits 0 almost
+#     immediately having mutated nothing (FIRSTBOOT_SECOND_EXECUTION
+#     stays a no-op) - the unit does not need to disable/mask itself to
+#     satisfy "stops running automatically once provisioning is
+#     complete."
+#   - Ordered after local filesystems and basic system targets so
+#     /etc, /var/lib, /var/log are actually writable and core system
+#     services exist before provisioning starts; ordered before
+#     multi-user/graphical targets so a session never starts against a
+#     half-provisioned system, without blocking earlier boot stages.
+#   - ExecStart invokes the explicit, tripwire-gated
+#     `python -m serein.firstboot run --allow-run` entrypoint (see
+#     src/serein/firstboot/__main__.py) - never the interactive `serein`
+#     CLI, which only ever exposes read-only firstboot status/doctor/plan.
+#
+# Known limitation (see docs/firstboot/known-limitations.md): this file
+# is not yet copied into a built Serein ISO/target by
+# `serein.installer.payload`/distribution packaging - that wiring is a
+# follow-up integration task, deliberately out of scope for this S7.2
+# parallel workstream (S7.1's payload assembly is owned by the S7.1R2
+# corrective effort and must not be touched from here).
+
+[Unit]
+Description=Serein OS first-boot provisioning
+Documentation=https://github.com/QuocThinh271222007/Serein-OS/blob/main/docs/firstboot/architecture.md
+ConditionPathExists=/etc/serein/install-state.json
+After=local-fs.target sysinit.target
+Wants=local-fs.target
+Before=multi-user.target graphical.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -m serein.firstboot run --allow-run
+TimeoutStartSec=600
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
