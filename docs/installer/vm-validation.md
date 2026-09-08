@@ -46,6 +46,48 @@ deterministically - the in-guest analog of the target-identity
 contract's "prefer stable evidence" for a virtual disk that has no
 real hardware serial of its own.
 
+**S7.1R2**: each disk is attached via the modern split backend/device
+QEMU form (`-drive if=none,id=serein_{protected,target}_backend,...`
++ `-device virtio-blk-pci,id=serein_{protected,target}_device,
+drive=serein_{protected,target}_backend,serial=SEREIN-{PROTECTED,TARGET}-DISK`)
+- never the legacy `-drive if=virtio,...,serial=...` convenience
+shorthand, which real Layer-B run #2 (`RUN_ID=34219273003`) exposed as
+a QEMU compatibility hazard. Each backend/device pair has an explicit,
+deterministic id, so the two serials can never be silently swapped.
+See `docs/installer/known-limitations.md`'s Run #2 entry and
+`installer/scripts/run-qa-install.sh`'s own header comment for the
+full rationale, and "QEMU startup evidence" below for the bounded
+startup probe and diagnostic capture this corrective added.
+
+## QEMU startup evidence (S7.1R2)
+
+`installer/scripts/run-qa-install.sh` runs a bounded, non-destructive
+startup probe (`-S`, frozen CPU, killed after a short window) using
+the EXACT real command line before ever starting the real, timed
+install - proving the command line/device model is valid without
+waiting up to the full install timeout. QEMU's own stdout/stderr are
+always captured to a dedicated diagnostic log
+(`qa-install-qemu-stderr.log`/`qa-install-qemu-stdout.log`) -
+independent of the guest `-serial` log
+(`qa-install-serial.log`), which may not even exist if QEMU dies
+during command-line parsing before the guest ever opens its console.
+
+Every invocation - probe failure, real-run failure, or success -
+writes `qa-install-qemu-result.env` (`qemu_exit_status`,
+`qemu_accelerator`, `qemu_firmware`, `qemu_timeout_seconds`,
+`qemu_serial_log_path`, `qemu_diagnostic_log_path`, `qemu_started`,
+`qemu_elapsed_seconds`, `failure_stage`, `installer_userspace_reached`,
+`serial_log_present`) - `installer-smoke.yml`'s "Run real QA
+autoinstall" step folds this straight into its own step outputs and
+uses the real, precise `failure_stage` the script computed
+(`qemu_startup`/`installer_timeout`/`installer_execution` - never the
+old, undifferentiated generic `install_failed`) as the recorded causal
+blocker. `installer_userspace_reached` is a WEAK, diagnostic-only
+heuristic (serial log contains any of a small set of early kernel/
+init/Subiquity markers) - never used for real closure evidence, unlike
+the installed-system boot check's own strong-marker requirement
+(Section 20 of the S7.1R2 corrective).
+
 `REAL_PHYSICAL_DISK_PASSTHROUGH=false` is enforced by construction:
 every `-drive`/`-cdrom` argument anywhere in the workflow and in every
 `installer/scripts/*.sh` script names a path the job itself just

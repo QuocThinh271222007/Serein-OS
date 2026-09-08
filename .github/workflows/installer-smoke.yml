@@ -302,9 +302,27 @@ jobs:
       # copy straight from the ISO FILES, never from build/work - so it
       # is released here, right after its one and only real consumer
       # (this build step) finishes.
+      #
+      # S7.1R2 Corrective D: Run #2 showed two release/cleanup step
+      # failures (not the causal blocker - execution continued into the
+      # real install attempt regardless). release-artifact.sh itself
+      # already treats "already absent" as a documented no-op, never a
+      # fatal error (Section 14 requirement 6); what was missing was
+      # that a GENUINE release failure (e.g. a real permission/path
+      # problem) had no recorded evidence trail at all. Every release
+      # step now records a real, first-failure-wins-safe
+      # `artifact_release_failed` stage on failure (visible in evidence
+      # - Section 14 requirement 7) without ever aborting the job over
+      # a best-effort cleanup step or masking the real causal blocker
+      # (record-failure.sh's own first-failure-wins semantics guarantee
+      # this can never overwrite an earlier real defect).
       - name: Release S7.0 build work tree
         if: always()
-        run: ./installer/scripts/release-artifact.sh build/work/extracted
+        run: |
+          ./installer/scripts/release-artifact.sh build/work/extracted || {
+            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for build/work/extracted (secondary, non-blocking)"
+          }
 
       - name: "Disk usage: after_s7_0_build"
         if: always()
@@ -339,7 +357,11 @@ jobs:
       # them costs nothing and preserves forensic value).
       - name: Release production ISO
         if: always()
-        run: ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64.iso
+        run: |
+          ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64.iso || {
+            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the production ISO (secondary, non-blocking)"
+          }
 
       - name: "Disk usage: after_prod_inspection"
         if: always()
@@ -426,7 +448,10 @@ jobs:
         run: |
           ./installer/scripts/release-artifact.sh \
             dist/serein-alpha-26.04-amd64-qa.iso \
-            build/installer-work/qa-install-extracted
+            build/installer-work/qa-install-extracted || {
+            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the QA ISO/extraction tree (secondary, non-blocking)"
+          }
 
       - name: "Disk usage: after_qa_install_iso"
         if: always()
@@ -468,20 +493,45 @@ jobs:
       # The real installer execution (Section 42-43). QA-only autoinstall
       # (Section 7) - never production media, never a physical disk
       # (Section 49-50).
+      #
+      # S7.1R2 Corrective B (Run #2, RUN_ID=34219273003, failed here):
+      # run-qa-install.sh now always writes qa-install-qemu-result.env
+      # (Section 7's required QEMU startup evidence fields) whether it
+      # passes or fails - cat it straight into this step's own outputs
+      # so downstream steps can see qemu_exit_status/qemu_started/
+      # failure_stage/installer_userspace_reached without ever
+      # re-deriving them. The precise failure_stage the script computed
+      # (qemu_startup/installer_timeout/installer_execution - Section 9)
+      # is what actually gets recorded as the causal blocker now,
+      # replacing the old generic, undifferentiated "install_failed".
       - name: Run real QA autoinstall
         id: run-install
         if: always() && steps.verify-topology.outcome == 'success'
         run: |
-          if ./installer/scripts/run-qa-install.sh \
+          set +e
+          ./installer/scripts/run-qa-install.sh \
               dist/serein-alpha-26.04-amd64-qa-install.iso \
               dist/installer-fixtures/disk-protected.qcow2 \
               dist/installer-fixtures/disk-target.qcow2 \
-              --timeout 1800; then
+              --timeout 1800
+          RUN_STATUS=$?
+          set -e
+
+          if [ -f dist/installer-fixtures/qa-install-qemu-result.env ]; then
+            cat dist/installer-fixtures/qa-install-qemu-result.env >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "${RUN_STATUS}" -eq 0 ]; then
             echo "status=pass" >> "$GITHUB_OUTPUT"
           else
             echo "status=fail" >> "$GITHUB_OUTPUT"
-            ./distribution/scripts/record-failure.sh "install_failed" \
-              "real QA autoinstall run failed - see qa-install-serial.log"
+            FAILURE_STAGE="$(
+              grep -m1 '^failure_stage=' dist/installer-fixtures/qa-install-qemu-result.env \
+                2>/dev/null | cut -d= -f2
+            )"
+            FAILURE_STAGE="${FAILURE_STAGE:-install_failed}"
+            ./distribution/scripts/record-failure.sh "${FAILURE_STAGE}" \
+              "real QA autoinstall run failed - see qa-install-serial.log and qa-install-qemu-stderr.log"
             exit 1
           fi
 
@@ -492,7 +542,11 @@ jobs:
       # closes out the last of the job's large avoidable overlaps.
       - name: Release QA-install ISO
         if: always()
-        run: ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64-qa-install.iso
+        run: |
+          ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64-qa-install.iso || {
+            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the QA-install ISO (secondary, non-blocking)"
+          }
 
       # The central S7.1 proof (Section 44-46) - hash BOTH disk images
       # after the install, regardless of whether the install step
@@ -652,6 +706,15 @@ jobs:
           python -m serein.installer evidence "${ARGS[@]}"
           cat dist/s7-1-installer-layer-b-evidence.json
 
+      # S7.1R2 Corrective C: every path here is the EXACT path the
+      # named producer writes (installer/scripts/run-qa-install.sh
+      # derives all three qa-install-qemu-* paths from
+      # `dirname "${TARGET_DISK}"`, i.e. dist/installer-fixtures - the
+      # same directory the fixture creation/hash steps already use) -
+      # never invented, never guessed. `if-no-files-found: warn` (not
+      # `error`) because a run that never even reaches fixture creation
+      # legitimately produces none of these, which must not itself fail
+      # the upload step.
       - name: Upload compact Installer Layer-B evidence (never disk images/ISOs)
         if: always()
         uses: actions/upload-artifact@v4
@@ -664,6 +727,9 @@ jobs:
             dist/installed-boot-result.json
             dist/installed-boot-with-protected-result.json
             dist/installer-fixtures/qa-install-serial.log
+            dist/installer-fixtures/qa-install-qemu-stdout.log
+            dist/installer-fixtures/qa-install-qemu-stderr.log
+            dist/installer-fixtures/qa-install-qemu-result.env
             dist/installer-fixtures/installed-boot/installed-boot-serial.log
           if-no-files-found: warn
           retention-days: 14

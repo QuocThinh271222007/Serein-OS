@@ -1436,6 +1436,51 @@ class TestInstallerSmokeWorkflow:
         assert "REPO_ROOT" in text
         assert "realpath" in text
 
+    # -- S7.1R2 Corrective C: artifact paths (Tests D1-D4) --
+
+    def test_d1_serial_producer_path_matches_upload_path(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        paths = upload["with"]["path"]
+        assert "dist/installer-fixtures/qa-install-serial.log" in paths
+
+    def test_d2_qemu_diagnostic_producer_paths_match_upload_paths(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        paths = upload["with"]["path"]
+        script_text = (REPO_ROOT / "installer" / "scripts" / "run-qa-install.sh").read_text(
+            encoding="utf-8"
+        )
+        # The exact producer expressions, straight from the real script -
+        # never guessed independently of what run-qa-install.sh actually
+        # derives.
+        assert 'QEMU_STDOUT_LOG="${WORK_DIR}/qa-install-qemu-stdout.log"' in script_text
+        assert 'QEMU_STDERR_LOG="${WORK_DIR}/qa-install-qemu-stderr.log"' in script_text
+        assert 'RESULT_ENV="${WORK_DIR}/qa-install-qemu-result.env"' in script_text
+        assert "dist/installer-fixtures/qa-install-qemu-stdout.log" in paths
+        assert "dist/installer-fixtures/qa-install-qemu-stderr.log" in paths
+        assert "dist/installer-fixtures/qa-install-qemu-result.env" in paths
+
+    def test_d3_evidence_upload_runs_on_failure(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        assert upload.get("if") == "always()"
+
+    def test_d4_release_steps_record_failure_visibly_but_never_abort_the_job(self, workflow):
+        # S7.1R2 Corrective D: a release/cleanup failure must remain
+        # visible (a real recorded stage) but must never itself exit 1
+        # and mask the real causal blocker or stop always()-gated
+        # evidence/closure steps from still running.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        for name in (
+            "Release S7.0 build work tree", "Release production ISO",
+            "Release QA ISO and QA-install extraction tree", "Release QA-install ISO",
+        ):
+            step = next(s for s in steps if s.get("name") == name)
+            assert step.get("if") == "always()"
+            assert "artifact_release_failed" in step["run"]
+            assert "exit 1" not in step["run"]
+
 
 # ---------------------------------------------------------------------------
 # S7.1R: real disk-preflight script execution (Tests A4-A5)
@@ -1557,6 +1602,312 @@ class TestInstallerFirstFailureWins:
         assert (
             work_dir / "dist" / ".failure_reason"
         ).read_text().strip() == "insufficient disk space"
+
+    # -- S7.1R2 Section 24 (Tests C1-C2): the NEW precise stage names --
+
+    def test_c1_qemu_startup_not_overwritten_by_later_release_failure(self, tmp_path):
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        self._run(work_dir, "qemu_startup", "invalid command line or device model")
+        self._run(work_dir, "artifact_release_failed", "release-artifact.sh failed for X")
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "qemu_startup"
+
+    def test_c2_installer_execution_recorded_as_first_failure(self, tmp_path):
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        self._run(work_dir, "installer_execution", "real QA autoinstall run failed")
+        self._run(work_dir, "artifact_release_failed", "release-artifact.sh failed for Y")
+        assert (
+            work_dir / "dist" / ".failure_stage"
+        ).read_text().strip() == "installer_execution"
+
+
+# ---------------------------------------------------------------------------
+# S7.1R2: real QEMU drive identity + bounded startup probe + startup
+# evidence (installer/scripts/run-qa-install.sh)
+# ---------------------------------------------------------------------------
+
+
+def _make_fake_qemu(bin_dir: Path) -> None:
+    """A stub `qemu-system-x86_64` on PATH - never a real VM. Entirely
+    controlled via env vars the test sets, so the REAL, committed
+    run-qa-install.sh's own bounded-probe / real-run / evidence-writing
+    logic executes for real and is proven behaviorally, never
+    re-implemented in Python. `FAKE_QEMU_BEHAVIOR`:
+
+      probe_fail          - exits non-zero immediately on ANY
+                             invocation (simulates an invalid command
+                             line/device model - Run #2's hypothesized
+                             defect).
+      pass                - accepts the probe (stays alive, frozen,
+                             the whole probe window); the real run
+                             stays alive past the grace window, then
+                             exits 0.
+      run_fail            - same probe behavior as `pass`; the real
+                             run stays alive past the grace window,
+                             then exits non-zero.
+      run_dies_before_grace - probe passes; the real run exits
+                             non-zero immediately, before the wrapper's
+                             own liveness grace check.
+      run_hangs           - probe passes; the real run never exits on
+                             its own (proves the outer `timeout`
+                             backstop).
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / "qemu-system-x86_64"
+    script.write_text(
+        "#!/usr/bin/env bash\n"
+        'echo "$@" >> "${FAKE_QEMU_ARGV_FILE:?}"\n'
+        "IS_PROBE=false\n"
+        'for a in "$@"; do [ "$a" = "-S" ] && IS_PROBE=true; done\n'
+        'case "${FAKE_QEMU_BEHAVIOR:-pass}" in\n'
+        "  probe_fail)\n"
+        '    echo "fake: invalid command line or device model" >&2\n'
+        "    exit 1 ;;\n"
+        "  pass)\n"
+        '    if [ "${IS_PROBE}" = "true" ]; then exec sleep 1000; fi\n'
+        '    sleep "${FAKE_QEMU_RUN_SLEEP:-2}"; exit 0 ;;\n'
+        "  run_fail)\n"
+        '    if [ "${IS_PROBE}" = "true" ]; then exec sleep 1000; fi\n'
+        '    sleep "${FAKE_QEMU_RUN_SLEEP:-2}"; exit 1 ;;\n'
+        "  run_dies_before_grace)\n"
+        '    if [ "${IS_PROBE}" = "true" ]; then exec sleep 1000; fi\n'
+        "    exit 1 ;;\n"
+        "  run_hangs)\n"
+        '    if [ "${IS_PROBE}" = "true" ]; then exec sleep 1000; fi\n'
+        "    exec sleep 1000 ;;\n"
+        "esac\n"
+    )
+    script.chmod(0o755)
+
+
+class TestRunQaInstallScript:
+    """Real bash execution of the committed, REAL
+    installer/scripts/run-qa-install.sh against a stub
+    qemu-system-x86_64 on PATH."""
+
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "run-qa-install.sh"
+
+    def _run(
+        self, tmp_path: Path, behavior: str, timeout_seconds: int = 30,
+        run_sleep: int | None = None,
+    ) -> tuple[subprocess.CompletedProcess, Path]:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        bin_dir = tmp_path / "bin"
+        _make_fake_qemu(bin_dir)
+        fixtures = tmp_path / "fixtures"
+        fixtures.mkdir()
+        iso = tmp_path / "qa-install.iso"
+        iso.write_bytes(b"fake iso")
+        protected = fixtures / "disk-protected.qcow2"
+        protected.write_bytes(b"fake protected")
+        target = fixtures / "disk-target.qcow2"
+        target.write_bytes(b"fake target")
+        ovmf = tmp_path / "OVMF_CODE.fd"
+        ovmf.write_bytes(b"fake ovmf")
+        argv_file = tmp_path / "qemu-argv.log"
+
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        env["FAKE_QEMU_BEHAVIOR"] = behavior
+        env["FAKE_QEMU_ARGV_FILE"] = str(argv_file)
+        if run_sleep is not None:
+            env["FAKE_QEMU_RUN_SLEEP"] = str(run_sleep)
+        # Fast, real, sub-second-scale probe/grace windows - never the
+        # real 8s/2s production defaults (would make this test suite
+        # slow for no benefit; the SCRIPT's own logic is unchanged).
+        env["SEREIN_TEST_PROBE_TIMEOUT_SECONDS"] = "1"
+        env["SEREIN_TEST_RUN_STARTED_GRACE_SECONDS"] = "1"
+
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT), str(iso), str(protected), str(target),
+             "--ovmf-code", str(ovmf), "--timeout", str(timeout_seconds)],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60,
+        )
+        return result, fixtures
+
+    def _result_env(self, fixtures: Path) -> dict[str, str]:
+        text = (fixtures / "qa-install-qemu-result.env").read_text(encoding="utf-8")
+        return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+    # -- Corrective A (Tests A1-A7): modern backend/device split --
+
+    def test_a1_legacy_drive_serial_syntax_removed(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        assert 'if=virtio,format=qcow2,file="${PROTECTED_DISK}",serial=' not in text
+        assert 'if=virtio,format=qcow2,file="${TARGET_DISK}",serial=' not in text
+
+    def test_a2_protected_backend_exists(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        assert (
+            '-drive if=none,id=serein_protected_backend,format=qcow2,file="${PROTECTED_DISK}"'
+            in text
+        )
+
+    def test_a3_target_backend_exists(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        assert (
+            '-drive if=none,id=serein_target_backend,format=qcow2,file="${TARGET_DISK}"' in text
+        )
+
+    def test_a4_protected_serial_only_on_protected_device(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        line = next(li for li in text.splitlines() if "id=serein_protected_device" in li)
+        assert "drive=serein_protected_backend" in line
+        assert "serial=SEREIN-PROTECTED-DISK" in line
+        assert "target" not in line.lower()
+
+    def test_a5_target_serial_only_on_target_device(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        line = next(li for li in text.splitlines() if "id=serein_target_device" in li)
+        assert "drive=serein_target_backend" in line
+        assert "serial=SEREIN-TARGET-DISK" in line
+        assert "protected" not in line.lower()
+
+    def test_a6_backends_never_swapped_in_real_argv(self, tmp_path):
+        # Real execution - proves the ACTUAL argv QEMU receives, not
+        # merely the script text.
+        self._run(tmp_path, "probe_fail")
+        argv_text = (tmp_path / "qemu-argv.log").read_text(encoding="utf-8")
+        parts = argv_text.split()
+        protected_device = next(
+            p for p in parts if p.startswith("virtio-blk-pci,id=serein_protected_device")
+        )
+        target_device = next(
+            p for p in parts if p.startswith("virtio-blk-pci,id=serein_target_device")
+        )
+        assert "drive=serein_protected_backend" in protected_device
+        assert "serial=SEREIN-PROTECTED-DISK" in protected_device
+        assert "drive=serein_target_backend" in target_device
+        assert "serial=SEREIN-TARGET-DISK" in target_device
+
+    def test_a7_no_dev_vdx_hardcoded_in_orchestration(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "/dev/vd" in line:
+                assert line.strip().startswith("#"), line
+
+    # -- Corrective B (Tests B1-B5): startup evidence --
+
+    def test_b1_qemu_parser_failure_retains_diagnostics(self, tmp_path):
+        result, fixtures = self._run(tmp_path, "probe_fail")
+        assert result.returncode != 0
+        env = self._result_env(fixtures)
+        assert env["qemu_exit_status"] != "0"
+        assert env["failure_stage"] == "qemu_startup"
+        assert (fixtures / "qa-install-qemu-stderr.log").read_text().strip() != ""
+        assert "fake: invalid command line" in result.stderr
+
+    def test_b2_missing_serial_does_not_destroy_evidence(self, tmp_path):
+        # QEMU died during command-line parsing (the fake never touches
+        # -serial's target at all) - the guest console log genuinely
+        # does not exist, and that must be reported truthfully rather
+        # than silently omitted or fabricated.
+        result, fixtures = self._run(tmp_path, "probe_fail")
+        env = self._result_env(fixtures)
+        assert env["serial_log_present"] == "false"
+        assert (fixtures / "qa-install-qemu-stderr.log").exists()
+        assert env["qemu_diagnostic_log_path"].endswith("qa-install-qemu-stderr.log")
+
+    def test_b3_startup_failure_never_claims_userspace_reached(self, tmp_path):
+        result, fixtures = self._run(tmp_path, "probe_fail")
+        env = self._result_env(fixtures)
+        assert env["installer_userspace_reached"] == "false"
+
+    def test_b4_real_run_failure_is_fail_closed_never_becomes_pass(self, tmp_path):
+        result, fixtures = self._run(tmp_path, "run_fail", run_sleep=2)
+        assert result.returncode != 0
+        env = self._result_env(fixtures)
+        assert env["failure_stage"] == "installer_execution"
+        assert env["qemu_started"] == "true"
+
+    def test_b5_timeout_is_fail_never_pass(self, tmp_path):
+        result, fixtures = self._run(tmp_path, "run_hangs", timeout_seconds=2)
+        assert result.returncode != 0
+        env = self._result_env(fixtures)
+        assert env["failure_stage"] == "installer_timeout"
+
+    def test_real_pass_records_no_failure_stage(self, tmp_path):
+        result, fixtures = self._run(tmp_path, "pass", run_sleep=2)
+        assert result.returncode == 0
+        env = self._result_env(fixtures)
+        assert env["failure_stage"] == ""
+        assert env["qemu_started"] == "true"
+        assert env["qemu_exit_status"] == "0"
+
+    def test_qemu_started_false_when_real_run_dies_before_grace_window(self, tmp_path):
+        # An edge case that should not normally occur once the probe
+        # above already passed - still classified honestly as
+        # qemu_startup rather than silently folded into
+        # installer_execution.
+        result, fixtures = self._run(tmp_path, "run_dies_before_grace")
+        assert result.returncode != 0
+        env = self._result_env(fixtures)
+        assert env["qemu_started"] == "false"
+        assert env["failure_stage"] == "qemu_startup"
+
+
+# ---------------------------------------------------------------------------
+# S7.1R2 Corrective D: installer/scripts/release-artifact.sh - real
+# release-cleanup safety (Tests E1, E3, E4)
+# ---------------------------------------------------------------------------
+
+
+class TestReleaseArtifactScript:
+    """Real bash execution of the committed
+    installer/scripts/release-artifact.sh, sandboxed into a fake repo
+    root (mirrors TestDiskPreflightScript's established pattern) -
+    release-artifact.sh computes its own REPO_ROOT from
+    ${BASH_SOURCE[0]}'s location and `cd`s there, so it must be copied
+    into a temp tree rather than merely invoked with a different `cwd`."""
+
+    REAL_SCRIPT = REPO_ROOT / "installer" / "scripts" / "release-artifact.sh"
+
+    def _run(self, tmp_path: Path, *args: str) -> subprocess.CompletedProcess:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        script = tmp_path / "installer" / "scripts" / "release-artifact.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(self.REAL_SCRIPT, script)
+        script.chmod(0o755)
+        return subprocess.run(
+            ["bash", str(script), *args], cwd=tmp_path, capture_output=True, text=True,
+        )
+
+    def test_e1_already_absent_artifact_is_a_safe_no_op(self, tmp_path):
+        result = self._run(tmp_path, "dist/does-not-exist.iso")
+        assert result.returncode == 0
+        assert "already absent" in result.stdout
+
+    def test_releasing_a_real_existing_path_removes_it(self, tmp_path):
+        target = tmp_path / "dist" / "thing.iso"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"x" * 1024)
+        result = self._run(tmp_path, "dist/thing.iso")
+        assert result.returncode == 0
+        assert not target.exists()
+
+    def test_e3_symlink_escape_fails_closed(self, tmp_path):
+        outside = tmp_path.parent / f"outside-{tmp_path.name}.txt"
+        outside.write_text("must survive")
+        link = tmp_path / "dist" / "escape.iso"
+        link.parent.mkdir(parents=True)
+        try:
+            link.symlink_to(outside)
+        except OSError:
+            pytest.skip("symlink creation not permitted in this environment")
+        result = self._run(tmp_path, "dist/escape.iso")
+        assert result.returncode != 0
+        assert outside.read_text() == "must survive"
+
+    def test_e4_absolute_path_refused(self, tmp_path):
+        result = self._run(tmp_path, "/etc/passwd")
+        assert result.returncode != 0
+
+    def test_e4_traversal_path_refused(self, tmp_path):
+        result = self._run(tmp_path, "../outside.txt")
+        assert result.returncode != 0
 
 
 # ---------------------------------------------------------------------------

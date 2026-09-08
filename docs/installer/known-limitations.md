@@ -1,9 +1,9 @@
 # Known Limitations (S7.1)
 
-## Real Layer-B validation status (S7.1R)
+## Real Layer-B validation status (S7.1R2)
 
-**One real Installer Layer-B run has occurred**, and it failed at the
-first possible stage:
+**Two real Installer Layer-B runs have occurred**, each exposing and
+fixing a real defect:
 
 ```text
 Run 1 (after S7.1 initial integration):
@@ -17,45 +17,80 @@ Run 1 (after S7.1 initial integration):
   docs/installer/storage-lifecycle.md for the real per-asset lifecycle
   analysis and the corrected, real-simultaneous-residency preflight
   model (REQUIRED_GIB=27).
+
+Run 2 (after S7.1R):
+  RUN_ID=34219273003, RUN_NUMBER=2
+  HEAD=6b9b04155f060a135a7bab0a8a12b26cdd58644a
+  RESULT=FAILURE - failure_stage=install_failed. The corrected S7.1R
+  storage model is PROVEN: disk_preflight/base_fetch/base_verify/
+  production_iso_build/production_iso_inspection/qa_iso_build/
+  qa_iso_inspection/autoinstall_render/qa_install_iso_prepare/
+  protected_qcow2_created/target_qcow2_created/fixture_topology_verified
+  all PASSED for real. The real QA autoinstall QEMU run itself then
+  failed - protected/target disk hashes were unchanged before/after
+  (protected_disk_modification_count=0, target_disk_changed=false),
+  meaning no evidence exists that the installer ever reached
+  destructive target-disk work. `qa-install-serial.log` alone did not
+  carry enough diagnostic evidence to determine why. High-confidence
+  causal hypothesis (never confirmed against the real exact stderr,
+  which this run did not separately retain - RUN_2_EXACT_QEMU_STDERR=
+  NOT_RETAINED): `run-qa-install.sh`'s legacy
+  `-drive if=virtio,...,serial=...` convenience shorthand is a known
+  QEMU compatibility hazard - the shorthand does not reliably plumb
+  `serial=` through to the device model on every QEMU version. Fixed
+  by S7.1R2 - see docs/installer/vm-validation.md's "QEMU startup
+  evidence" section for the corrected modern split backend/device
+  topology, the new bounded startup probe, and the new precise
+  qemu_startup/installer_timeout/installer_execution failure
+  classification (replacing the old, undifferentiated
+  `install_failed`) that a third run will need to make full use of.
 ```
 
-Because disk preflight failed first, nothing past it was exercised:
-`REAL_BASE_FETCH`, `REAL_BASE_VERIFY`, `REAL_PRODUCTION_ISO_BUILD`,
-`REAL_QA_ISO_BUILD`, `REAL_AUTOINSTALL_RENDER`,
-`REAL_QA_INSTALL_ISO_BUILD`, `REAL_PROTECTED_DISK_CREATED`,
-`REAL_TARGET_DISK_CREATED`, `REAL_INSTALLER_EXECUTION`,
+Because Run 2 failed inside the real QEMU install step, nothing past
+it was exercised: `REAL_INSTALLER_EXECUTION`,
 `REAL_PROTECTED_DISK_HASH_PROOF`, `REAL_TARGET_LAYOUT_INSPECTION`, and
-`REAL_INSTALLED_BOOT` are all still `NOT_OBSERVED` - Run 1 is evidence
-of the storage-preflight defect, never evidence that the installer
-chain itself works.
+`REAL_INSTALLED_BOOT` are all still `NOT_OBSERVED` for a corrected
+run - Run 2 is evidence of the QEMU-drive-identity defect S7.1R2
+fixes, never evidence that the real destructive install itself works.
+Run 2 also exposed two secondary, non-causal release/cleanup step
+failures (execution continued into the real install attempt
+regardless) - their exact root cause is likewise `NOT_RETAINED`
+(no `gh` CLI access from this development environment to inspect the
+real job log); S7.1R2 hardened every `Release ...` step to record a
+real, first-failure-wins-safe `artifact_release_failed` stage on any
+future recurrence (visible in evidence, never silently swallowed)
+without ever masking the real causal blocker or aborting the job over
+a best-effort cleanup step.
 
-Run 1 also exposed an evidence-fidelity defect, fixed in the same
-pass: `target_explicit`/`target_identity_revalidated`/
-`target_disk_attached` were recorded as `true` unconditionally, even
-though the pipeline stopped at disk preflight before any of those
-stages could possibly have run. `target_disk_attached` is no longer a
-hardcoded structural constant - see `serein.installer.evidence`'s
-`target_disk_attached` parameter (defaults `False`), and every one of
-these three fields in `installer-smoke.yml`'s evidence-assembly step
-is now gated on the real stage that would have proven it.
+Run 1's evidence-fidelity defect (`target_explicit`/
+`target_identity_revalidated`/`target_disk_attached` recorded as
+`true` unconditionally even though disk_preflight failed before any of
+those stages could possibly have run) remains fixed as of S7.1R -
+`target_disk_attached` is no longer a hardcoded structural constant,
+and every one of these three fields in `installer-smoke.yml`'s
+evidence-assembly step is gated on the real stage that would have
+proven it.
 
-A second real Installer Layer-B run against the S7.1R commit is
+A third real Installer Layer-B run against the S7.1R2 commit is
 required before any `REAL_*` field below can honestly move past
 `NOT_OBSERVED`. This development environment has no `qemu-img`/
-`qemu-nbd`/`curtin`/Subiquity installed (consistent with every S7.0
-round of this repository's history - see
+`qemu-nbd`/`curtin`/Subiquity/`qemu-system-x86_64` installed
+(`REAL_LOCAL_QEMU=NOT_AVAILABLE` - consistent with every S7.0 round of
+this repository's history, see
 `docs/distribution/known-limitations.md`), so `installer-smoke.yml`
-itself has only ever been validated structurally from here:
+itself has only ever been validated structurally and via real `bash`
+execution against a stub `qemu-system-x86_64` from here:
 
 | Field | Status | Why |
 |---|---|---|
-| `LAYER_A` | **PASS** | Full `pytest`/`ruff`/`mypy`/`verify.sh` against `src/serein/installer/`, `tests/test_installer.py`, and every `installer/scripts/*.sh` file (real `bash -n` syntax check). |
-| `REAL_DISK_PREFLIGHT` | **FAIL** (Run 1) | The exact real defect this S7.1R pass fixes. Not yet re-run for real. |
+| `LAYER_A` | **PASS** | Full `pytest`/`ruff`/`mypy`/`verify.sh` against `src/serein/installer/`, `tests/test_installer.py`, and every `installer/scripts/*.sh` file (real `bash -n` syntax check, plus real `bash` execution of `run-qa-install.sh`/`release-artifact.sh` against stub tools on `PATH`). |
+| `REAL_DISK_PREFLIGHT` | **PASS** (Run 2) | Proven for real - the S7.1R storage model is closed pending new contrary evidence (Section 15 of the S7.1R2 corrective). |
+| `REAL_QEMU_STARTUP` | **FAIL** (Run 2, hypothesized cause) | The exact real defect this S7.1R2 pass targets. Not yet re-run for real against the corrected topology. |
 | `INSTALLER_BACKEND_AVAILABLE` | **NOT_OBSERVED** | `curtin`/Subiquity not installed in this environment; `serein.installer.doctor` correctly reports `SKIP`, never a fabricated pass. |
-| `REAL_INSTALLER_EXECUTION` | **NOT_OBSERVED** | Requires a real GitHub Actions run of `installer-smoke.yml` that gets past disk preflight. |
+| `REAL_INSTALLER_EXECUTION` | **NOT_OBSERVED** | Requires a real GitHub Actions run of `installer-smoke.yml` that gets past the corrected QEMU startup. |
 | `REAL_TARGET_DISK_INSTALL` | **NOT_OBSERVED** | Same. |
 | `REAL_INSTALLED_SYSTEM_BOOT` | **NOT_OBSERVED** | Same. |
-| `PROTECTED_DISK_MODIFICATION_COUNT` | **NOT_OBSERVED** | The hashing/comparison logic itself is unit-tested (`tests/test_installer.py::TestEvidence`), but has never hashed a real qcow2 image before/after a real install. |
+| `PROTECTED_DISK_MODIFICATION_COUNT` | **NOT_OBSERVED** (0 in Run 2, but vacuously - the install never reached destructive work) | The hashing/comparison logic itself is unit-tested (`tests/test_installer.py::TestEvidence`), and Run 2 did hash a real qcow2 pair before/after a real (failed) run - but a modification count of 0 here is not yet a positive proof of anything, since no destructive work was ever attempted. |
 
 Per this repository's own established closure discipline (see every
 S7.0 round's final report), this document states that gap honestly
