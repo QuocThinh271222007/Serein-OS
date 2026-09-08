@@ -33,9 +33,9 @@
 - **Physical hardware boot not verified.** `REAL_PHYSICAL_BOOT=NOT_PERFORMED`
   - out of scope without a disposable physical machine (Section 96).
 
-## Real Layer B validation status (S7.0RM2)
+## Real Layer B validation status (S7.0RM4)
 
-**Two real Layer-B runs have now occurred**, each on the exact
+**Three real Layer-B runs have now occurred**, each on the exact
 reviewed feature HEAD, each exposing a genuine defect this corrective
 history has fixed in turn:
 
@@ -67,13 +67,49 @@ Run 2 (after S7.0RM):
   This run also exposed two evidence-fidelity defects (Correctives
   B/C, below) and the disk-preflight arithmetic's own internal
   inconsistency (Corrective D), all fixed in the same pass.
+
+Run 3 (after S7.0RM3):
+  RUN_ID=34147196162
+  HEAD=37c463f1d8c2642547b6936873e48c67a447abfd
+  RESULT=FAILURE - real progress: base download, sha256 verification,
+  and signature verification all PASSED against the real
+  ubuntu-26.04.1-desktop-amd64.iso, and the S7.0RM3 El Torito evidence
+  fix worked (REAL_BASE_EL_TORITO_REPORT=PASS). The run then failed
+  during "Build Serein Alpha ISO": the real replayed boot flags
+  contained direct base-image byte-range references
+  (`--interval:local_fs:...:<base.iso>`), but ephemeral_storage had
+  already deleted the base ISO right after report capture, so xorriso
+  could not resolve them ("Cannot open local file for interval
+  reading"). The real command also showed the base image's own
+  `-V "Ubuntu 26.04.1 LTS amd64"` replayed after Serein's own
+  `-V SEREIN_ALPHA`, which would have silently won and retitled the
+  media. Both fixed by S7.0RM4 (Correctives A and C).
 ```
 
-The exact-head checkout has now worked correctly in both real runs,
-confirming Corrective A (S7.0R)'s PR-trigger and exact-head model
+The exact-head checkout has now worked correctly in all three real
+runs, confirming Corrective A (S7.0R)'s PR-trigger and exact-head model
 remain sound across this whole corrective history.
 
-**S7.0RM2 fixes all four defects Run 2 exposed:**
+**S7.0RM4 fixes the two defects Run 3 exposed:**
+
+- **Corrective A** - the base ISO is now released (in
+  `ephemeral_storage` mode) only after every xorriso command that could
+  still reference it directly has actually run: after the QA rebuild
+  completes, or after QA is cleanly blocked before any QA rebuild
+  command is even constructed. Never on an exception path. See
+  `docs/distribution/iso-build.md`'s "Base ISO lifetime".
+- **Corrective B** - the disk-preflight requirement now includes a
+  `BASE_ISO_GIB` term (peak: base + extracted tree + production ISO +
+  QA ISO = 28 GiB, +4 GiB margin = 32 GiB required), reflecting that
+  the base ISO now survives through both rebuild commands.
+- **Corrective C** - `serein.distribution.iso.filter_builder_owned_boot_flags`
+  removes only `-V`/`-volid` (and their one value each) from replayed
+  report flags before combining them with Serein's own `-V SEREIN_ALPHA`,
+  preserving every real boot-architecture flag (including base-image
+  interval references) untouched and in order. Fails closed on a
+  malformed option/value pair.
+
+**S7.0RM2 fixed all four defects Run 2 exposed:**
 
 - **Corrective A** - all six `distribution/scripts/*.sh` are now
   tracked as `100755` in the Git index (`git ls-files -s
@@ -101,18 +137,19 @@ remain sound across this whole corrective history.
 
 This development environment still has no `xorriso`/`qemu`/
 `squashfs-tools` installed (unchanged from every prior pass this
-session), so the corrective code itself has only been validated via
-the fully injectable fake-`xorriso`/fake-QEMU/fake-`Popen` Layer-A
-test suite (`tests/test_distribution.py`, 1215 tests passing) plus
-direct `git ls-files -s` verification of the executable-bit fix and
-CLI-level end-to-end reproduction of both real defects
-(`TestEvidenceCliEndToEnd`) - not against a third real Layer-B run,
-which has not yet been observed from this environment:
+session), so the S7.0RM4 corrective code itself has only been
+validated via the fully injectable fake-`xorriso` Layer-A test suite
+(`tests/test_distribution.py`, 1225+ tests passing, including
+behavioral tests that record whether the base ISO file actually exists
+on disk at the moment each rebuild command is invoked) - not against a
+fourth real Layer-B run, which has not yet been observed from this
+environment:
 
 | Field | Status | Why |
 |---|---|---|
-| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **NOT_PERFORMED** (this pass) | Run 2 reached (and passed) the disk preflight but failed at the very next step, `fetch-base-image.sh`, on the permission-denied defect Corrective A now fixes - so the download itself still never happened. The ~6.0 GB ISO has still never been downloaded from this development environment either. |
-| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **NOT_PERFORMED** | Same blocker. |
+| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **PASS** (Run 3) | Confirmed real: base download, sha256 verify, and signature verify all passed on Run 3 against the real `ubuntu-26.04.1-desktop-amd64.iso`. |
+| `REAL_BASE_EL_TORITO_REPORT` | **PASS** (Run 3) | The S7.0RM3 fix worked - `dist/` is now guaranteed to exist before the redirect. |
+| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **NOT_PERFORMED** (this pass) | Run 3 reached the production xorriso rebuild but failed - base ISO already deleted (Corrective A) and a volume-ID conflict (Corrective C), both fixed here. Not yet re-run for real. |
 | `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **NOT_PERFORMED** (real .iso, strict) / lenient structural inspection **DID** run against a fixture extracted tree, all checks pass | The strict inspector's logic is proven against a fully-faked `xorriso` (`tests/test_distribution.py::TestStrictInspector`), never real tool output. |
 | `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **NOT_PERFORMED** | The in-place QA transition (Corrective A/B) is proven against the real fixture tree's real `grub.cfg`, never a real base image's GRUB config. |
 | `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** | No ISO exists to boot yet. The marker-aware monitor (Corrective D) is proven with a fully faked `Popen`/clock (`tests/test_distribution.py::TestBootSmoke`), never a real QEMU process. |
@@ -132,18 +169,18 @@ and should not request interactively.
 **PR #9 retains the `run-iso-smoke` label.** `iso-smoke.yml` already
 supports `pull_request: synchronize` while the label remains attached -
 pushing this corrective's commits should automatically trigger a
-third real Layer-B run on the new exact HEAD, with no separate action
+fourth real Layer-B run on the new exact HEAD, with no separate action
 needed. This repository's `gh` CLI remains unavailable in this
 environment (consistent with every prior phase this session), so this
 pass could not itself observe that new run's outcome.
 
 ```text
-S7_0RM2_LAYER_B_TRIGGER_READY=true
-S7_0RM2_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
+S7_0RM4_LAYER_B_TRIGGER_READY=true
+S7_0RM4_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
 ```
 
-Per the S7.0RM2 corrective's own merge rule: **`S7_0_READY_FOR_MERGE=NO`**
-until a Layer-B run against the exact final S7.0RM2 commit turns every `REAL_*` field above
+Per the corrective's own merge rule: **`S7_0_READY_FOR_MERGE=NO`**
+until a Layer-B run against the exact final S7.0RM4 commit turns every `REAL_*` field above
 to a genuine PASS - this document states that blocker honestly rather
 than fabricating success. The independent reviewer should watch the
 automatically-triggered run (or re-apply/re-trigger it if needed) on
@@ -151,6 +188,16 @@ the new HEAD.
 
 ## Implementation-scope limitations (this alpha pass specifically)
 
+- **Resolved in S7.0RM4**: the base ISO is no longer released (in
+  `ephemeral_storage` mode) before both rebuild commands have actually
+  run - a real report's replayed boot flags can reference the base
+  image directly by path, so releasing it after only the report was
+  captured (the S7.0RM assumption) broke the real production rebuild.
+- **Resolved in S7.0RM4**: replayed upstream volume-ID metadata
+  (`-V`/`-volid`) is now filtered out of the report flags before the
+  rebuild command is assembled, so the final media's volume ID is
+  always exactly `SEREIN_ALPHA`, never silently overridden by the base
+  image's own product label.
 - **Resolved in S7.0RM2**: every direct shell entrypoint under
   `distribution/scripts/` is now tracked as `100755` in the Git index
   (`git ls-files -s distribution/scripts/` - verified directly, and

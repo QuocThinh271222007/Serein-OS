@@ -32,38 +32,38 @@ repository builds an ISO.
 4. derive real boot flags           xorriso -indev <base.iso> -report_el_torito as_mkisofs
    from the base image's own          -> serein.distribution.iso.parse_el_torito_report
    el-torito report (Section 38)       (never a hardcoded/tutorial flag set) - captured
-                                        here, right after extraction, because it is the
-                                        LAST step that still needs base_iso to exist
+                                        here, right after extraction
 
-5. [ephemeral_storage=True only]    serein.distribution.storage.release_base_iso -
-   release the cached base ISO        never for a normal developer build, only an
-   (S7.0RM Corrective A) - it is       explicit ephemeral-CI build; frees ~6 GB before
-   never needed again after step 4     the two ISO rebuilds (the highest disk-pressure
-                                        phase) even begin
-
-6. apply static overlay          serein.distribution.overlay.apply_overlay
+5. apply static overlay          serein.distribution.overlay.apply_overlay
    (allowlisted destinations)     (.disk/, serein/ only - Section 69)
 
-7. build + content-verify         serein.distribution.payload.build_wheel
+6. build + content-verify         serein.distribution.payload.build_wheel
    the Serein wheel (Corrective C)  + inspect_wheel_contents (fails closed if any
                                        expected serein.* module is missing)
 
-8. assemble resource + wheel       serein.distribution.payload.collect_resource_artifacts
+7. assemble resource + wheel       serein.distribution.payload.collect_resource_artifacts
    payload, copy into tree           + wheel_artifact -> serein.distribution.build.
                                         _copy_payload_into_tree
 
-9. write dynamic media marker      serein/manifest.json, serein/payload-manifest.json
+8. write dynamic media marker      serein/manifest.json, serein/payload-manifest.json
    + payload manifest                (Section 53-54) - the wheel appears at
                                        serein/payload/packages/<wheel filename>
 
-10. rebuild CANONICAL production     xorriso -as mkisofs -V SEREIN_ALPHA -r -J -joliet-long
-    ISO with xorriso (bytes            <derived boot flags> -o <output> <extracted tree>
-    finalized on disk here)            serein.distribution.iso.build_rebuild_command
+9. rebuild CANONICAL production      xorriso -as mkisofs -V SEREIN_ALPHA -r -J -joliet-long
+   ISO with xorriso (bytes             <filtered boot flags> -o <output> <extracted tree>
+   finalized on disk here)             serein.distribution.iso.build_rebuild_command -
+                                        any builder-owned metadata option the report
+                                        itself replayed (-V/-volid) is filtered out first
+                                        (S7.0RM4 Corrective C), so the real base-image
+                                        interval references this command may still
+                                        contain (e.g. --interval:local_fs:...:<base.iso>)
+                                        are preserved and resolved against the STILL-
+                                        PRESENT base ISO (S7.0RM4 Corrective A)
 
-11. record production manifest        dist/<iso>.manifest.json, dist/<iso>.sha256
+10. record production manifest        dist/<iso>.manifest.json, dist/<iso>.sha256
     + sha256                           serein.distribution.manifest
 
-12. transition the SAME extraction    serein.distribution.qa_boot.transition_to_qa_in_place
+11. transition the SAME extraction    serein.distribution.qa_boot.transition_to_qa_in_place
     in place into QA boot form          - S7.0RM Corrective A: no second multi-GB tree
     (Corrective B, storage-             copy. Fails closed (QA_BUILD=BLOCKED) if no known
     efficient as of S7.0RM)             GRUB config candidate exists, WITHOUT failing the
@@ -73,11 +73,23 @@ repository builds an ISO.
                                          QaProtectedFileMutationError aborts the whole
                                          build (never ships unverified QA media)
 
-13. rebuild QA ISO reusing the         same rebuild command as step 10, targeting the
-    SAME boot flags from step 4          now-QA-form extraction tree -> <name>-qa.iso
+12. rebuild QA ISO reusing the         same rebuild command (same filtered boot flags) as
+    SAME boot flags from step 4          step 9, targeting the now-QA-form extraction
+                                          tree -> <name>-qa.iso - the base ISO must still
+                                          be present here too, for the same reason as
+                                          step 9
 
-14. record QA manifest + sha256        same as step 11, for the QA output
+13. record QA manifest + sha256        same as step 10, for the QA output
     (skipped if QA_BUILD=BLOCKED)
+
+14. [ephemeral_storage=True only]    serein.distribution.storage.release_base_iso -
+    release the cached base ISO        never for a normal developer build. Only safe
+    (S7.0RM Corrective A; timing        now: every xorriso command that could still
+    corrected by S7.0RM4                reference the base ISO directly (steps 9 and 12)
+    Corrective A)                       has actually run, or QA was cleanly blocked
+                                         before step 12 was ever reached. Never released
+                                         on an exception path - a genuine failure keeps
+                                         the base ISO on disk for forensic inspection.
 ```
 
 ## Canonical production ISO vs. QA boot variant (Corrective B)
@@ -135,6 +147,31 @@ missing. The wheel is embedded at
 payload-integrity hashing as every other entry - never installed
 anywhere, only embedded (Section 55/26).
 
+## Volume-ID replay filtering (S7.0RM4 Corrective C)
+
+`build_rebuild_command` places `-V SEREIN_ALPHA` at the front of the
+rebuild argv, followed by the boot flags derived from the base image's
+own real `-report_el_torito as_mkisofs` output. A real Layer-B run
+exposed a real Ubuntu report also carrying the upstream product's own
+volume metadata - `-V "Ubuntu 26.04.1 LTS amd64"` (or the `-volid`
+alias) - and since xorriso resolves multiple `-V` options on one
+command line by taking the *last* one, replaying that token after
+Serein's own would have silently retitled the final media.
+
+`serein.distribution.iso.filter_builder_owned_boot_flags` removes only
+`-V`/`-volid` and their one value each from the replayed flags,
+preserving every other option - including the real base-image interval
+references (`--interval:local_fs:...`), `--grub2-mbr`,
+`-append_partition`, `-c`, `-b`, and everything else - in their
+original order and identity. It is deliberately conservative: any
+option it does not recognize as builder-owned is assumed to be real
+boot-architecture data and is never touched, and it fails closed
+(`IsoCommandError`) if an owned option appears with no following value
+rather than silently producing a corrupted argv. `build_rebuild_command`
+applies this filter automatically before combining the result with
+`-V <volume_id>`, so the final rebuild argv always carries exactly one
+effective volume-ID contract.
+
 ## Clean build workspace (Corrective D)
 
 `serein.distribution.workspace.reset_extracted_workspace` runs before
@@ -164,14 +201,22 @@ storage-efficient:
   patched in place for the QA rebuild. See "Canonical production ISO
   vs. QA boot variant" above for the safety net that makes this sound
   (every non-GRUB-config file is hash-verified unchanged).
-- **The cached base ISO is released early in ephemeral CI mode.**
-  `run_build(..., ephemeral_storage=True)` deletes
-  `cache/upstream/<base>.iso` immediately after extraction and the El
-  Torito report are both captured - the last two things the pipeline
-  ever needs it for - freeing ~6 GB before the two ISO rebuilds (the
-  highest disk-pressure phase) begin. This is opt-in and explicit
-  (`--ephemeral-storage` / `EPHEMERAL_STORAGE=1`); a normal developer
-  build never deletes its verified cache.
+- **The cached base ISO is released only after its last real consumer,
+  in ephemeral CI mode.** An earlier version of this pipeline released
+  it immediately after extraction and the El Torito report were
+  captured, on the assumption that neither rebuild command would ever
+  need it again. A real Layer-B run proved that assumption false: a
+  real report's own boot/system-area flags can reference the base
+  image directly by path for a boot-critical byte range (e.g.
+  `--interval:local_fs:...:<base.iso>`), and both rebuild commands
+  replay those flags. `run_build(..., ephemeral_storage=True)` now
+  deletes `cache/upstream/<base>.iso` only after the QA rebuild has
+  actually completed (or QA was cleanly blocked before any QA rebuild
+  command was ever constructed) - see "Base ISO lifetime" below. This
+  is opt-in and explicit (`--ephemeral-storage` / `EPHEMERAL_STORAGE=1`);
+  a normal developer build never deletes its verified cache, and a
+  genuine build/QA failure never triggers deletion either - the base
+  ISO stays available for forensic inspection.
 - **Ephemeral GitHub-hosted-runner SDK cleanup.** `iso-smoke.yml`
   additionally reclaims a small, exact allowlist of large preinstalled
   SDK trees (Android, .NET, GHC, Swift) it never uses, scoped to
@@ -183,42 +228,69 @@ storage-efficient:
   (`serein.distribution.storage.measure_disk_usage` is the equivalent
   Python-side helper, used by tests).
 
-### Disk-preflight requirement derivation (S7.0RM2 Corrective D)
+### Base ISO lifetime (S7.0RM4 Corrective A)
+
+The correct invariant is:
+
+```
+all xorriso commands containing base-image interval references completed
+=> base image may be released in ephemeral mode
+```
+
+never the earlier (disproven) claim "El Torito report captured => base
+image no longer needed". Concretely, `run_build` only calls
+`storage.release_base_iso` at three points, all after every possible
+consumer has run:
+
+- right before returning when `build_qa_variant=False` (production
+  rebuild was the only consumer),
+- right after `qa_boot.transition_to_qa_in_place` raises `QaBootError`
+  (QA was cleanly blocked - no QA rebuild command was ever
+  constructed, so nothing further will reference the base ISO),
+- right after the QA rebuild command has actually run and the QA
+  manifest is written.
+
+It is never called from an exception path (a `QaProtectedFileMutationError`
+or any rebuild-command failure propagates as `BuildError` with the base
+ISO left untouched) - correctness and forensic evidence outrank
+maximizing disk reclamation (Section 5 of the S7.0RM4 corrective).
+
+### Disk-preflight requirement derivation (S7.0RM2 Corrective D, revised by S7.0RM4 Corrective B)
 
 An earlier version of this threshold (12 GiB) was not actually derived
 from its own documented components - they summed to significantly
-more than the number enforced. The current requirement is computed in
+more than the number enforced. A later revision (22 GiB) was internally
+coherent but omitted the base ISO entirely, based on the
+now-corrected assumption above. The current requirement is computed in
 the workflow from named, internally-consistent components reflecting
-the *real* simultaneously-live large-object peak in the pipeline order
-above:
+the *real* simultaneously-live large-object peak - now including the
+base ISO, which survives through both rebuild commands:
 
 ```
-EXTRACTED_TREE_GIB (6)     xorriso -osirrox extracts the ISO9660 tree's
+BASE_ISO_GIB (7)           the real pinned Desktop ISO is ~6.0 GB
+                            (docs/distribution/base-image.md), rounded
+                            up for filesystem overhead - now retained
+                            through both rebuild commands (Corrective A)
++ EXTRACTED_TREE_GIB (7)    xorriso -osirrox extracts the ISO9660 tree's
                             files exactly as stored - the live SquashFS
                             payload is copied out as one still-
                             compressed blob, never re-expanded, so the
                             extracted tree's apparent size stays close
                             to the base ISO's own size
-+ PRODUCTION_ISO_GIB (6)    deliberately RETAINED on disk while the QA
++ PRODUCTION_ISO_GIB (7)    deliberately RETAINED on disk while the QA
                             ISO is rebuilt (the production ISO must
                             already be finalized and unaffected before
                             the QA transition begins)
-+ QA_ISO_GIB (6)            being written by the second xorriso rebuild
-= PEAK_GIB (18)              all three exist simultaneously during the
-                              QA rebuild step - the true peak, since
-                              ephemeral_storage already released the
-                              base ISO before the two rebuilds began
++ QA_ISO_GIB (7)            being written by the second xorriso rebuild
+= PEAK_GIB (28)              all four exist simultaneously during the
+                              QA rebuild step - the true peak
 + SAFETY_MARGIN_GIB (4)      rough size estimates, not measured
-= REQUIRED_GIB (22)
+= REQUIRED_GIB (32)
 ```
 
-A second, lower candidate peak - base ISO (6 GiB) + extracted tree
-growing to 6 GiB during extraction, before `ephemeral_storage` releases
-the base ISO - is ~12 GiB, below the QA-rebuild peak above, so it does
-not drive the requirement. `tests/test_distribution.py::TestLayerBWorkflow`'s
-Corrective D tests regress that these components' own literal values
-actually sum to the enforced requirement, not merely document an
-unrelated number.
+`tests/test_distribution.py::TestLayerBWorkflow`'s Corrective D/B tests
+regress that these components' own literal values actually sum to the
+enforced requirement, not merely document an unrelated number.
 
 ## Why extraction/rebuild instead of SquashFS/EFI-partition surgery (Sections 34-36)
 
