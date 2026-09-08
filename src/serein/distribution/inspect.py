@@ -23,12 +23,34 @@ Three inspection surfaces:
   from *those* extracted bytes, never from the source repository
   (Section 39) - this is the one honest way to prove the media that
   will actually ship contains what its own manifest claims.
+
+**Scratch workspace isolation and cleanup (S7.0RM6 Corrective A)**: a
+real Layer-B run inspected the production ISO, then the QA ISO, both
+via a caller-supplied ``work_dir`` - when both invocations resolve to
+the SAME scratch subtree (e.g. a caller that never varies ``work_dir``
+between calls), the second invocation's own cleanup of the first
+invocation's leftover ``/serein`` extraction can hit a real
+``PermissionError``: a real ``xorriso -osirrox`` extraction does not
+guarantee every extracted file/directory is owner-writable. Callers
+should give each invocation its own uniquely-owned ``work_dir`` (never
+two independent inspections sharing one mutable extraction directory);
+independently, :func:`inspect_iso_file_strict` also makes its own
+``iso-strict-extract`` scratch subtree self-cleaning: before deleting
+it, it repairs permissions ONLY inside that exact, already
+path-confined subtree (never elsewhere, never the source ISO, never
+``build/work/extracted``, never ``sudo``) so a prior extraction's
+restrictive mode never blocks its own next cleanup. A symlink found
+inside the scratch tree is always just unlinked, never chmod'd or
+traversed - chmod has no reliable "do not follow" mode on most POSIX
+platforms, so chmod'ing a symlink path risks silently mutating
+whatever it points to.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -124,6 +146,55 @@ def inspect_iso_file(iso_path: Path) -> InspectionReport:
     return InspectionReport(target="iso", findings=tuple(findings))
 
 
+def _make_scratch_tree_removable(root: Path) -> None:
+    """Best-effort: ensure every real (non-symlink) file/directory
+    under ``root`` is owner-readable/writable/executable, so a prior
+    ``xorriso -osirrox`` extraction's restrictive mode never blocks
+    deleting this exact scratch subtree (S7.0RM6 Corrective A/Section
+    4). The caller must have already confined ``root`` itself (e.g.
+    via :func:`~serein.distribution.pathsafety.resolve_within`) before
+    calling this - it only ever walks *underneath* the path it is
+    given, top-down, chmod'ing each directory before listing its
+    contents (a directory missing its own execute bit cannot otherwise
+    even be listed, so children must never be discovered before the
+    parent is repaired).
+
+    A symlink is never chmod'd and never traversed into - chmod has no
+    reliable "operate on the link itself, not its target" mode on most
+    POSIX platforms, so chmod'ing a symlink path risks silently
+    mutating whatever external file/directory it happens to point to
+    (Section 5). ``shutil.rmtree`` itself already removes a symlink
+    entry by unlinking it directly, never by entering it - this
+    function only ever needs to make real (non-symlink) content
+    removable.
+    """
+    if root.is_symlink() or not root.exists():
+        return
+
+    try:
+        mode = stat.S_IMODE(root.stat().st_mode)
+        root.chmod(mode | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRUSR)
+    except OSError:
+        pass
+
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return
+
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        if entry.is_dir():
+            _make_scratch_tree_removable(entry)
+        else:
+            try:
+                file_mode = stat.S_IMODE(entry.stat().st_mode)
+                entry.chmod(file_mode | stat.S_IWUSR)
+            except OSError:
+                pass
+
+
 def inspect_iso_file_strict(
     iso_path: Path,
     work_dir: Path,
@@ -193,6 +264,11 @@ def inspect_iso_file_strict(
 
     extract_root = resolve_within(work_dir, "iso-strict-extract")
     if extract_root.exists():
+        # S7.0RM6 Corrective A: repair permissions ONLY inside this
+        # exact, already-confined scratch subtree before deleting it -
+        # a prior real xorriso extraction here is not guaranteed to be
+        # owner-writable/-executable.
+        _make_scratch_tree_removable(extract_root)
         shutil.rmtree(extract_root)
     extract_root.mkdir(parents=True)
 

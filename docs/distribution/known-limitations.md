@@ -1,4 +1,4 @@
-# Known Limitations (S7.0; updated by the S7.0R Layer-B closure corrective; most recently S7.0RM5)
+# Known Limitations (S7.0; updated by the S7.0R Layer-B closure corrective; most recently S7.0RM6)
 
 ## Scope limitations (by design - Section 83)
 
@@ -33,9 +33,9 @@
 - **Physical hardware boot not verified.** `REAL_PHYSICAL_BOOT=NOT_PERFORMED`
   - out of scope without a disposable physical machine (Section 96).
 
-## Real Layer B validation status (S7.0RM5)
+## Real Layer B validation status (S7.0RM6)
 
-**Four real Layer-B runs have now occurred**, each on the exact
+**Five real Layer-B runs have now occurred**, each on the exact
 reviewed feature HEAD, each exposing a genuine defect this corrective
 history has fixed in turn:
 
@@ -108,13 +108,80 @@ Run 4 (after S7.0RM4):
   it (including after production was already done) looked identical to
   an outright production failure. Both fixed by S7.0RM5 (Correctives A
   and B).
+
+Run 5 (after S7.0RM5):
+  RUN_ID=34190149221, RUN_NUMBER=7
+  HEAD=55adf8031d65ef5507c3b194d56e24b24cb47b19
+  RESULT=FAILURE - RM5 itself proved out: base download/verify/report,
+  the production ISO build, AND the in-place QA transition all PASSED
+  for the first time (QA transition permissions fix worked). QA ISO
+  build also PASSED:
+    production ISO = serein-alpha-26.04-amd64.iso
+    sha256 = c0adb235bf352fc79efe65ba027a7b663fa30ac167bf3495ce6be7f649dab7c9
+    QA ISO = serein-alpha-26.04-amd64-qa.iso
+    sha256 = 423c84f8fc0e06c9acedcc54574ec02ba6074de5f13186beef264c945b3982fa
+    production_build=pass, qa_transition=pass, qa_build=pass (schema v3)
+  The run then failed twice more, independently:
+  (1) QA strict inspection crashed with
+    PermissionError: [Errno 13] Permission denied:
+    dist/inspect-strict-work/iso-strict-extract/serein
+  - production and QA strict inspection defaulted to the SAME mutable
+  scratch subtree, so the QA inspection's own cleanup of production
+  inspection's leftover /serein extraction hit a real permission error.
+  (2) QEMU boot smoke then also failed - the real serial log proved the
+  boot genuinely reached real systemd/apparmor/snapd userspace
+  activity, but no configured positive marker had been observed within
+  the fixed 300s TCG timeout, AND the workflow was uploading the WRONG
+  serial-log artifact path (build/work/boot-smoke/... instead of the
+  real dist/boot-smoke/... the CLI actually wrote to). The evidence
+  this run produced was ALSO imprecise: `failure_stage=qemu_boot` even
+  though QA strict inspection had failed FIRST - a later, independent
+  failure silently overwrote the first real closure blocker. All fixed
+  by S7.0RM6 (Correctives A, B, C, D).
 ```
 
-The exact-head checkout has now worked correctly in all four real
+The exact-head checkout has now worked correctly in all five real
 runs, confirming Corrective A (S7.0R)'s PR-trigger and exact-head model
 remain sound across this whole corrective history.
 
-**S7.0RM5 fixes the two defects Run 4 exposed:**
+**S7.0RM6 fixes the defects Run 5 exposed:**
+
+- **Corrective A** - production and QA strict inspection now use
+  distinct, uniquely-owned scratch work directories (the CLI's default
+  is scoped by the ISO's own filename stem, and the workflow also
+  passes explicit `--work-dir dist/inspect-strict-work/production` /
+  `.../qa`), so neither invocation ever needs to delete the other's
+  leftover extraction. Independently, `inspect_iso_file_strict` is now
+  self-cleaning for a stale/read-only scratch tree from a repeated
+  invocation: it repairs permissions ONLY inside its own already
+  path-confined `iso-strict-extract` subtree (never elsewhere, never
+  the source ISO, never `build/work/extracted`, never `sudo`) before
+  deleting it, and never chmod's or traverses a symlink found inside it
+  (only ever unlinks the link entry itself).
+- **Corrective B** - the QEMU boot-smoke step now passes an explicit,
+  canonical `--work-dir dist/boot-smoke`, matching what the uploaded
+  evidence artifact path actually references (`dist/boot-smoke/
+  boot-smoke-serial.log`) - the real serial log is no longer silently
+  lost from the evidence artifact. `BootSmokeResult` also gains bounded
+  diagnostic fields (`timeout_seconds`, `accelerator`, `serial_log_path`,
+  `elapsed_seconds`) for closure investigation, never the full log
+  itself.
+- **Corrective C** - every step that can produce a real Layer-B failure
+  now calls the one canonical `distribution/scripts/record-failure.sh`
+  helper instead of an ad-hoc `echo ... > dist/.failure_stage` -
+  first-failure-wins: a later, independent failure in the same job can
+  no longer overwrite the FIRST real closure blocker's evidence.
+- **Corrective D** - TCG (software emulation, e.g. a stock
+  GitHub-hosted runner with no `/dev/kvm`) now gets a longer, still
+  finite default boot-smoke timeout (600s, up from the prior fixed
+  300s) than KVM (unchanged at 300s) - `default_timeout_seconds_for_accel`.
+  The positive-marker requirement itself is unchanged and unweakened:
+  a running process, reaching UEFI/kernel, or an early/ambiguous
+  service line (`snapd.apparmor.service`, `Started arbitrary.service`,
+  etc.) still never constitutes a PASS - only a genuine target-level
+  marker (`DEFAULT_SUCCESS_MARKERS`) does.
+
+**S7.0RM5 fixed the two defects Run 4 exposed:**
 
 - **Corrective A** - `serein.distribution.qa_boot` now inspects a
   target file's real mode before writing it, temporarily sets the
@@ -194,25 +261,28 @@ remain sound across this whole corrective history.
 
 This development environment still has no `xorriso`/`qemu`/
 `squashfs-tools` installed (unchanged from every prior pass this
-session), so the S7.0RM5 corrective code itself has only been
-validated via the fully injectable fake-`xorriso` Layer-A test suite
-(`tests/test_distribution.py`, 1257+ tests passing, including real
-filesystem-mode-bit regressions that chmod a fixture file read-only
-before exercising the fix, and fake-runner regressions that fail the
-production vs. QA rebuild independently) - not against a fifth real
-Layer-B run, which has not yet been observed from this environment:
+session), so the S7.0RM6 corrective code itself has only been
+validated via the fully injectable fake-`xorriso`/fake-`Popen` Layer-A
+test suite (`tests/test_distribution.py`, 1276+ tests passing,
+including real filesystem-mode-bit regressions against stale/read-only
+scratch directories, a real `bash`-executed `record-failure.sh`
+first-failure-wins proof, and fake-clock accelerator-timeout
+regressions) - not against a sixth real Layer-B run, which has not yet
+been observed from this environment:
 
 | Field | Status | Why |
 |---|---|---|
-| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **PASS** (Run 4) | Confirmed real: base download, sha256 verify, and signature verify all passed on Run 4 against the real `ubuntu-26.04.1-desktop-amd64.iso`. |
-| `REAL_BASE_EL_TORITO_REPORT` | **PASS** (Run 4) | The S7.0RM3 fix continues to hold. |
-| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **PASS** (Run 4) | The production ISO fully built for the first time - `serein-alpha-26.04-amd64.iso`, sha256 `6263ec532213958ddd0f0e7d24ffb6e229a2a1e5b4a3e94a03416c4ff6205add`. |
-| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **PASS** (Run 4) | Strict inspection of the real production ISO passed: volume-id=SEREIN_ALPHA, 33 boot flags, media-marker PASS, payload-manifest 41 entries hash-verified. |
-| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **NOT_PERFORMED** (this pass) | Run 4 failed the in-place QA transition itself (`PermissionError` on a real read-only `boot/grub/grub.cfg`) before any QA rebuild command was even constructed. Fixed by S7.0RM5 Corrective A; not yet re-run for real. |
-| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** | No QA ISO has been produced by a real run yet. The marker-aware monitor (Corrective D) is proven with a fully faked `Popen`/clock (`tests/test_distribution.py::TestBootSmoke`), never a real QEMU process. |
+| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **PASS** (Run 5) | Confirmed real: base download, sha256 verify, and signature verify all passed on Run 5 against the real `ubuntu-26.04.1-desktop-amd64.iso`. |
+| `REAL_BASE_EL_TORITO_REPORT` | **PASS** (Run 5) | The S7.0RM3 fix continues to hold. |
+| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **PASS** (Run 5) | `serein-alpha-26.04-amd64.iso`, sha256 `c0adb235bf352fc79efe65ba027a7b663fa30ac167bf3495ce6be7f649dab7c9`. |
+| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **PASS** (Run 5) | Strict inspection of the real production ISO passed. |
+| `REAL_SEREIN_QA_TRANSITION` | **PASS** (Run 5) | The S7.0RM5 permissions fix worked for real - the in-place QA transition completed against the real extracted GRUB config. |
+| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **PASS** (Run 5) | `serein-alpha-26.04-amd64-qa.iso`, sha256 `423c84f8fc0e06c9acedcc54574ec02ba6074de5f13186beef264c945b3982fa`. |
+| `REAL_SEREIN_QA_ISO_INSPECTION` | **NOT_PERFORMED** (this pass) | Run 5 crashed with `PermissionError` deleting production strict inspection's own leftover scratch extraction before QA inspection could even begin. Fixed by S7.0RM6 Corrective A; not yet re-run for real. |
+| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** (this pass) | Run 5's real serial log proved genuine progress into systemd/apparmor/snapd userspace, but no configured positive marker was observed within the (then-300s TCG) timeout. Fixed by S7.0RM6 Corrective D (600s TCG bound); not yet re-run for real. The positive-marker requirement itself is unchanged - a longer timeout alone can never itself cause a PASS. |
 | `REAL_INSTALLER_REACHABILITY` | **NOT_PERFORMED** | Depends on the above. |
-| `REAL_UEFI_BOOT` | **NOT_PERFORMED** | No OVMF firmware image available locally; `--require-uefi` fail-closed logic is unit-tested, never exercised against real OVMF. |
-| `REAL_BIOS_BOOT` | **NOT_PERFORMED** | No QEMU available. |
+| `REAL_UEFI_BOOT` | **NOT_PERFORMED** | Real OVMF was observed launching in Run 5, but closure requires a real matched positive marker, not yet achieved. |
+| `REAL_BIOS_BOOT` | **NOT_PERFORMED** | Not exercised - UEFI is the required path. |
 | `REAL_SECURE_BOOT` | **NOT_PERFORMED** | No Secure-Boot-capable test environment. |
 | `REAL_PHYSICAL_BOOT` | **NOT_PERFORMED** | No disposable physical machine. |
 
@@ -226,25 +296,50 @@ and should not request interactively.
 **PR #9 retains the `run-iso-smoke` label.** `iso-smoke.yml` already
 supports `pull_request: synchronize` while the label remains attached -
 pushing this corrective's commits should automatically trigger a
-fifth real Layer-B run on the new exact HEAD, with no separate action
+sixth real Layer-B run on the new exact HEAD, with no separate action
 needed. This repository's `gh` CLI remains unavailable in this
 environment (consistent with every prior phase this session), so this
 pass could not itself observe that new run's outcome.
 
 ```text
-S7_0RM5_LAYER_B_TRIGGER_READY=true
-S7_0RM5_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
+S7_0RM6_LAYER_B_TRIGGER_READY=true
+S7_0RM6_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
 ```
 
 Per the corrective's own merge rule: **`S7_0_READY_FOR_MERGE=NO`**
-until a Layer-B run against the exact final S7.0RM5 commit turns every `REAL_*` field above
+until a Layer-B run against the exact final S7.0RM6 commit turns every `REAL_*` field above
 to a genuine PASS - this document states that blocker honestly rather
 than fabricating success. The independent reviewer should watch the
 automatically-triggered run (or re-apply/re-trigger it if needed) on
-the new HEAD.
+the new HEAD. If that run still times out with `QA strict
+inspection=PASS, QEMU=FAIL`, the next pass must inspect the newly
+preserved full serial log (now retained at the correct artifact path)
+rather than blindly increasing the timeout again (Section 27 of the
+S7.0RM6 corrective).
 
 ## Implementation-scope limitations (this alpha pass specifically)
 
+- **Resolved in S7.0RM6**: production and QA strict ISO inspection no
+  longer default to the same mutable scratch subtree - each gets its
+  own uniquely-owned work directory, and the inspector is now
+  self-cleaning for stale/read-only scratch content from a repeated
+  invocation (scoped strictly to its own already path-confined
+  extraction subtree; never the source ISO, never
+  `build/work/extracted`, never a symlink's external target, never
+  `sudo`).
+- **Resolved in S7.0RM6**: the QEMU boot-smoke step now uses an
+  explicit, canonical `--work-dir` that matches the uploaded evidence
+  artifact's serial-log path exactly - the real serial log is no
+  longer silently dropped from Layer-B evidence on a timeout.
+- **Resolved in S7.0RM6**: every real Layer-B failure site now records
+  through one canonical `record-failure.sh` helper with first-failure-
+  wins semantics - a later, independent failure in the same job can no
+  longer overwrite the evidence for the actual first closure blocker.
+- **Resolved in S7.0RM6**: TCG (software emulation) boot-smoke runs get
+  a longer, still-finite default timeout (600s vs. KVM's unchanged
+  300s) - a real run's serial log proved genuine boot progress was
+  simply slower under software emulation, not defective. The positive-
+  marker requirement itself remains unweakened.
 - **Resolved in S7.0RM5**: writing the discovered GRUB config (and the
   internal `md5sum.txt` checksum catalog, if present) during the
   in-place QA transition no longer assumes the file is owner-writable -

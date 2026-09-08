@@ -88,6 +88,16 @@ wraps `python -m serein.distribution boot-smoke`, which calls
   and returns `status="fail"`; it never hangs indefinitely, and never
   leaks a QEMU process on any exit path (success, failure, or an
   unexpected exception - a `finally` block guarantees termination).
+  **Accelerator-aware default (S7.0RM6 Corrective D)**: a real run's
+  serial log proved TCG (software emulation - no `/dev/kvm`, e.g. a
+  stock GitHub-hosted runner) genuinely needs more wall-clock time than
+  KVM to reach the same real userspace milestone - it had reached real
+  systemd/apparmor/snapd activity without yet matching a marker within
+  the prior fixed 300s bound. `default_timeout_seconds_for_accel`
+  returns 600s for `"tcg"`, unchanged 300s for everything else (in
+  practice `"kvm"`) - still always finite, and a longer bound alone can
+  never itself cause a `PASS` (only a real positive marker can). An
+  explicit `--timeout`/`timeout_seconds` always overrides this.
 - **Positive evidence only** (Section 46) - `evaluate_boot_log` requires
   one of `DEFAULT_SUCCESS_MARKERS` (systemd "Reached target ..." lines)
   to literally appear in the captured serial log. "The QEMU process
@@ -107,12 +117,24 @@ wraps `python -m serein.distribution boot-smoke`, which calls
 - **KVM when available, TCG fallback otherwise** (Section 49) -
   `boot-smoke.sh` probes `/dev/kvm` and only passes `--accel kvm` if it
   is readable/writable; normal unit-test CI never requires KVM.
-- **Machine-readable result** (S7.0RM Corrective E) - `--result-json
-  PATH` writes `BootSmokeResult.to_dict()` (`status`, `boot_mode`,
-  `firmware`, `matched_marker`, `target_disk_count`) so the workflow
-  never has to fragile-parse human-readable prose to populate Layer-B
-  evidence; `serein.distribution.evidence`'s CLI wiring reads this file
-  directly when present.
+- **Machine-readable result** (S7.0RM Corrective E; diagnostic fields
+  added by S7.0RM6 Corrective B) - `--result-json PATH` writes
+  `BootSmokeResult.to_dict()` (`status`, `boot_mode`, `firmware`,
+  `matched_marker`, `target_disk_count`, plus the bounded diagnostic
+  fields `timeout_seconds`, `accelerator`, `serial_log_path`,
+  `elapsed_seconds` - never the full serial log itself, which stays a
+  separate uploaded artifact) so the workflow never has to
+  fragile-parse human-readable prose to populate Layer-B evidence;
+  `serein.distribution.evidence`'s CLI wiring reads this file directly
+  when present.
+- **Canonical, explicit work directory (S7.0RM6 Corrective B)** - a
+  real Layer-B run uploaded the wrong serial-log artifact path
+  (`build/work/boot-smoke/...`, a stale assumption) while the harness
+  actually wrote to its true default, `<iso>.parent/boot-smoke/...`.
+  The workflow now passes `--work-dir dist/boot-smoke` explicitly and
+  uploads `dist/boot-smoke/boot-smoke-serial.log` - the exact same
+  path - so the real serial log is never silently lost from the
+  evidence artifact, including on a timeout.
 
 ## QA-only serial boot entry actually built into a QA ISO (Section 47; S7.0R Corrective B)
 
@@ -215,7 +237,37 @@ against - the *logic* is proven; validation against real Ubuntu
 26.04.1 `xorriso` output remains outstanding Layer-B work (see
 `docs/distribution/known-limitations.md`).
 
-## Failure evidence must survive an early failure (S7.0RM Corrective B)
+### Scratch workspace isolation and cleanup (S7.0RM6 Corrective A)
+
+The extraction step above needs a scratch directory
+(`<work_dir>/iso-strict-extract`) to extract `/serein` into. A real
+Layer-B run inspected the production ISO, then the QA ISO, and both
+invocations defaulted to the SAME `work_dir` - the QA inspection's own
+cleanup of production's leftover extraction crashed with a real
+`PermissionError`, since a real `xorriso -osirrox` extraction does not
+guarantee every extracted file/directory is owner-writable. Fixed two
+ways:
+
+- **Isolated by default** - `python -m serein.distribution inspect
+  <iso> --strict` now derives its default `work_dir` from the ISO's own
+  filename stem (`<iso>.parent/inspect-strict-work/<iso stem>`), so
+  production and QA inspection never collide even without an explicit
+  `--work-dir`. `iso-smoke.yml` also passes explicit
+  `--work-dir dist/inspect-strict-work/production` /
+  `.../qa` for clarity.
+- **Self-cleaning scratch** - before deleting a pre-existing
+  `iso-strict-extract`, `inspect_iso_file_strict` repairs permissions
+  ONLY inside that exact, already path-confined subtree (top-down,
+  chmod'ing each real directory before listing its contents, since a
+  directory missing its own execute bit cannot otherwise even be
+  listed) - never elsewhere, never the source ISO, never
+  `build/work/extracted`, never `sudo`. A symlink found inside the
+  scratch tree is always just unlinked, never chmod'd or traversed -
+  chmod has no reliable "operate on the link, not its target" mode on
+  most POSIX platforms, so chmod'ing a symlink path risks silently
+  mutating whatever it points to.
+
+## Failure evidence must survive an early failure (S7.0RM Corrective B; first-failure-wins fixed by S7.0RM6 Corrective C)
 
 A real Layer-B run failed at the disk-space preflight - before any
 base image was downloaded - and the workflow's own evidence-assembly
@@ -225,10 +277,16 @@ v2) fixes this at the model level: every field except `source_commit`
 defaults to `None`/`"not_performed"`, so `assemble_layer_b_evidence`
 never assumes any manifest/result file exists - it is always
 constructible, no matter how early the pipeline stopped.
-`failure_stage`/`failure_reason` record *where* and *why*. The workflow
-writes `dist/.failure_stage`/`dist/.failure_reason` at each critical
-`|| { ...; exit 1; }` gate and the `if: always()` "Assemble Layer-B
-evidence" step reads whichever ones exist - a failed run always
+`failure_stage`/`failure_reason` record *where* and *why*. Every step
+that can fail calls the one canonical
+`distribution/scripts/record-failure.sh <stage> <reason>` helper - it
+writes `dist/.failure_stage`/`dist/.failure_reason` only if neither
+already exists, so the FIRST real failure in a job is always what
+closure evidence records, never a later, independent failure that
+happens to run afterward (a real run recorded `failure_stage=qemu_boot`
+even though strict QA inspection had already failed first, losing the
+real first causal blocker). The `if: always()` "Assemble Layer-B
+evidence" step reads whichever files exist - a failed run always
 produces a valid, informative evidence artifact; it is never lost.
 
 ## Explicit fail-closed closure gate (S7.0RM Corrective G)

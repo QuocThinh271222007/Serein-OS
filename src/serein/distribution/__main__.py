@@ -72,7 +72,7 @@ def _cmd_build(args: argparse.Namespace) -> int:
 def _cmd_boot_smoke(args: argparse.Namespace) -> int:
     import json
 
-    from serein.distribution.bootsmoke import DEFAULT_TIMEOUT_SECONDS, run_boot_smoke
+    from serein.distribution.bootsmoke import default_timeout_seconds_for_accel, run_boot_smoke
 
     iso_path = Path(args.iso)
     work_dir = Path(args.work_dir) if args.work_dir else iso_path.parent / "boot-smoke"
@@ -89,10 +89,13 @@ def _cmd_boot_smoke(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # S7.0RM6 Corrective D/Section 11: TCG (software emulation) gets a
+    # longer, still-bounded default timeout than KVM - an explicit
+    # --timeout always overrides this.
     result = run_boot_smoke(
         iso_path=iso_path,
         work_dir=work_dir,
-        timeout_seconds=args.timeout or DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds=args.timeout or default_timeout_seconds_for_accel(args.accel),
         accel=args.accel,
         ovmf_code=ovmf_code,
     )
@@ -125,7 +128,17 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         if not args.expected_source_commit:
             print("FAIL: --strict requires --expected-source-commit", file=sys.stderr)
             return 1
-        work_dir = Path(args.work_dir) if args.work_dir else target.parent / "inspect-strict-work"
+        # S7.0RM6 Corrective A: scoped by the ISO's own filename stem
+        # so two independent strict inspections (e.g. production then
+        # QA) never default to sharing one mutable scratch subtree - a
+        # real run crashed with PermissionError when the QA inspection
+        # tried to delete the production inspection's own leftover
+        # extraction. A caller may still pass --work-dir explicitly for
+        # its own isolation scheme.
+        work_dir = (
+            Path(args.work_dir) if args.work_dir
+            else target.parent / "inspect-strict-work" / target.stem
+        )
         report = inspect_iso_file_strict(
             target, work_dir, expected_source_commit=args.expected_source_commit
         )

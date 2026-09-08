@@ -2,8 +2,11 @@ name: ISO Smoke (real build + boot validation)
 
 # Layer B (S7.0 Section 50-51; PR trigger added by S7.0R Corrective A;
 # storage/failure-evidence/QEMU-monitor/UEFI-fidelity/closure-gate
-# hardening added by S7.0RM Correctives A-G): the real, multi-GB
-# download / build / boot validation path.
+# hardening added by S7.0RM Correctives A-G; QA transition permissions
+# + build-stage evidence added by S7.0RM5; strict-inspection scratch
+# isolation, canonical boot-smoke evidence paths, accelerator-aware
+# timeout, and first-failure-wins evidence fidelity added by S7.0RM6):
+# the real, multi-GB download / build / boot validation path.
 #
 # Two ways to run it:
 #   - workflow_dispatch: manual, any time, optionally pinned to an exact
@@ -204,9 +207,8 @@ jobs:
           echo "AVAILABLE_KB=${AVAILABLE_KB}"
           echo "REQUIRED_KB=${REQUIRED_KB}"
           if [ "${AVAILABLE_KB}" -lt "${REQUIRED_KB}" ]; then
-            mkdir -p dist
-            echo "disk_preflight" > dist/.failure_stage
-            echo "insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "disk_preflight" \
+              "insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required"
             echo "::error::insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required"
             exit 1
           fi
@@ -214,18 +216,15 @@ jobs:
       - name: Fetch pinned base image (explicit, this job only)
         run: |
           ./distribution/scripts/fetch-base-image.sh || {
-            mkdir -p dist
-            echo "base_fetch" > dist/.failure_stage
-            echo "fetch-base-image.sh failed" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "base_fetch" "fetch-base-image.sh failed"
             exit 1
           }
 
       - name: Verify base image (fail-closed, checksum + signature)
         run: |
           ./distribution/scripts/verify-base-image.sh || {
-            mkdir -p dist
-            echo "base_verification" > dist/.failure_stage
-            echo "verify-base-image.sh failed - checksum or signature mismatch" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "base_verification" \
+              "verify-base-image.sh failed - checksum or signature mismatch"
             exit 1
           }
 
@@ -260,15 +259,15 @@ jobs:
 
           if ! xorriso -indev "cache/upstream/${BASE_FILENAME}" -report_el_torito as_mkisofs \
               > "${REPORT_PATH}"; then
-            echo "base_el_torito_report" > dist/.failure_stage
-            echo "xorriso failed to extract the base ISO El Torito report" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "base_el_torito_report" \
+              "xorriso failed to extract the base ISO El Torito report"
             echo "::error::xorriso failed to extract the base ISO El Torito report"
             exit 1
           fi
 
           if [ ! -s "${REPORT_PATH}" ]; then
-            echo "base_el_torito_report" > dist/.failure_stage
-            echo "base ISO El Torito report is empty" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "base_el_torito_report" \
+              "base ISO El Torito report is empty"
             echo "::error::base ISO El Torito report is empty"
             exit 1
           fi
@@ -298,9 +297,7 @@ jobs:
         id: build
         run: |
           EPHEMERAL_STORAGE=1 ./distribution/scripts/build-iso.sh || {
-            mkdir -p dist
-            echo "production_or_qa_build" > dist/.failure_stage
-            echo "build-iso.sh failed" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "production_or_qa_build" "build-iso.sh failed"
             exit 1
           }
 
@@ -312,6 +309,13 @@ jobs:
           du -sh dist 2>/dev/null || true
           df -h .
 
+      # S7.0RM6 Corrective A: production and QA strict inspection each
+      # get their own uniquely-owned --work-dir - a real run crashed
+      # with PermissionError when the QA inspection (implicitly reusing
+      # the same default scratch subtree as the just-completed
+      # production inspection) tried to delete production's own
+      # leftover /serein extraction. The inspector itself is also now
+      # self-cleaning for a stale scratch tree either way (Section 4).
       - name: Strict-inspect production ISO
         id: inspect-prod
         if: always()
@@ -322,12 +326,13 @@ jobs:
             exit 0
           fi
           if python -m serein.distribution inspect "${PROD_ISO}" --strict \
+              --work-dir dist/inspect-strict-work/production \
               --expected-source-commit "${SOURCE_COMMIT}"; then
             echo "status=pass" >> "$GITHUB_OUTPUT"
           else
             echo "status=fail" >> "$GITHUB_OUTPUT"
-            echo "production_inspection" > dist/.failure_stage
-            echo "strict production ISO inspection failed" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "production_inspection" \
+              "strict production ISO inspection failed"
             exit 1
           fi
 
@@ -341,12 +346,13 @@ jobs:
             exit 0
           fi
           if python -m serein.distribution inspect "${QA_ISO}" --strict \
+              --work-dir dist/inspect-strict-work/qa \
               --expected-source-commit "${SOURCE_COMMIT}"; then
             echo "status=pass" >> "$GITHUB_OUTPUT"
           else
             echo "status=fail" >> "$GITHUB_OUTPUT"
-            echo "qa_inspection" > dist/.failure_stage
-            echo "strict QA ISO inspection failed" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "qa_inspection" \
+              "strict QA ISO inspection failed"
             exit 1
           fi
 
@@ -361,13 +367,17 @@ jobs:
           fi
           # S7.0RM Corrective C: a QEMU failure must fail this step (and
           # therefore the job) - never swallowed merely to keep going.
+          # S7.0RM6 Corrective B/Section 9: --work-dir is now explicit
+          # and canonical (dist/boot-smoke) - the uploaded serial-log
+          # artifact path below must match this exactly.
           if ./distribution/scripts/boot-smoke.sh "${QA_ISO}" \
-              --require-uefi --result-json dist/boot-smoke-result.json; then
+              --require-uefi --work-dir dist/boot-smoke \
+              --result-json dist/boot-smoke-result.json; then
             echo "status=pass" >> "$GITHUB_OUTPUT"
           else
             echo "status=fail" >> "$GITHUB_OUTPUT"
-            echo "qemu_boot" > dist/.failure_stage
-            echo "QEMU boot smoke failed - see boot-smoke-serial.log / boot-smoke-result.json" > dist/.failure_reason
+            ./distribution/scripts/record-failure.sh "qemu_boot" \
+              "QEMU boot smoke failed - see boot-smoke-serial.log / boot-smoke-result.json"
             exit 1
           fi
 
@@ -481,7 +491,7 @@ jobs:
             dist/build-stage-status.json
             dist/s7-0-layer-b-evidence.json
             dist/boot-smoke-result.json
-            build/work/boot-smoke/boot-smoke-serial.log
+            dist/boot-smoke/boot-smoke-serial.log
           if-no-files-found: warn
           retention-days: 14
 

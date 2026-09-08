@@ -48,9 +48,31 @@ DEFAULT_SUCCESS_MARKERS: tuple[str, ...] = (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 300
+
+#: TCG (software emulation - no hardware virtualization, e.g. a stock
+#: GitHub-hosted runner with no ``/dev/kvm``) genuinely needs more
+#: wall-clock time than KVM to reach the same real userspace milestone
+#: (S7.0RM6 Corrective D/Section 11). A real Layer-B run's serial log
+#: proved the boot had genuinely progressed into real systemd/apparmor/
+#: snapd userspace activity - it simply had not yet matched a closure
+#: marker within the prior fixed 300s bound. Still finite either way -
+#: never unbounded, and a longer bound alone can never itself cause a
+#: PASS (only a real positive marker can).
+DEFAULT_TIMEOUT_SECONDS_TCG = 600
+
 DEFAULT_MEMORY_MB = 2048
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_TERMINATE_GRACE_SECONDS = 10.0
+
+
+def default_timeout_seconds_for_accel(accel: str) -> int:
+    """The one place an accelerator-specific default timeout is
+    decided (mirrors :func:`derive_boot_mode`'s "one place" discipline)
+    - ``"tcg"`` gets the longer, still-bounded allowance; every other
+    value (in practice only ``"kvm"``) keeps the original
+    :data:`DEFAULT_TIMEOUT_SECONDS`. A caller-supplied explicit
+    ``--timeout``/``timeout_seconds`` always overrides this."""
+    return DEFAULT_TIMEOUT_SECONDS_TCG if accel == "tcg" else DEFAULT_TIMEOUT_SECONDS
 
 #: Bounded tail read per poll (Section 26 - "do not repeatedly read
 #: unbounded multi-MB logs") - generous enough to always contain a
@@ -135,6 +157,16 @@ class BootSmokeResult:
     log_excerpt: str
     boot_mode: str = "bios"
     firmware: str | None = None
+    # S7.0RM6 Corrective B/Section 10: narrow, bounded diagnostic
+    # fields for closure investigation (e.g. deciding whether a real
+    # timeout needs a longer bound or reveals a genuine blocker) -
+    # deliberately never the full serial log itself, which stays a
+    # separate uploaded artifact (log_excerpt above is already bounded
+    # to the last 4000 chars).
+    timeout_seconds: int = 0
+    accelerator: str = "tcg"
+    serial_log_path: str | None = None
+    elapsed_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         # Required invariant (Section 29): status == pass implies a
@@ -150,6 +182,10 @@ class BootSmokeResult:
             "firmware": self.firmware,
             "matched_marker": self.matched_marker,
             "target_disk_count": 0,
+            "timeout_seconds": self.timeout_seconds,
+            "accelerator": self.accelerator,
+            "serial_log_path": self.serial_log_path,
+            "elapsed_seconds": round(self.elapsed_seconds, 3),
         }
 
 
@@ -220,7 +256,12 @@ def run_boot_smoke(
         command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
-    deadline = time_source() + timeout_seconds  # type: ignore[operator]
+    start_time = time_source()  # type: ignore[operator]
+    deadline = start_time + timeout_seconds  # type: ignore[operator]
+
+    def _elapsed() -> float:
+        return time_source() - start_time  # type: ignore[operator]
+
     try:
         while True:
             log_text = _read_tail(serial_log_path)
@@ -231,6 +272,8 @@ def run_boot_smoke(
                     status="pass", matched_marker=marker, reason=f"matched marker: {marker!r}",
                     log_excerpt=log_text[-4000:], boot_mode=boot_mode,
                     firmware=str(ovmf_code) if ovmf_code else None,
+                    timeout_seconds=timeout_seconds, accelerator=accel,
+                    serial_log_path=str(serial_log_path), elapsed_seconds=_elapsed(),
                 )
 
             if process.poll() is not None:  # type: ignore[attr-defined]
@@ -243,6 +286,8 @@ def run_boot_smoke(
                     ),
                     log_excerpt=log_text[-4000:], boot_mode=boot_mode,
                     firmware=str(ovmf_code) if ovmf_code else None,
+                    timeout_seconds=timeout_seconds, accelerator=accel,
+                    serial_log_path=str(serial_log_path), elapsed_seconds=_elapsed(),
                 )
 
             if time_source() >= deadline:  # type: ignore[operator]
@@ -252,6 +297,8 @@ def run_boot_smoke(
                     reason=f"boot smoke timed out after {timeout_seconds}s with no success marker",
                     log_excerpt=log_text[-4000:], boot_mode=boot_mode,
                     firmware=str(ovmf_code) if ovmf_code else None,
+                    timeout_seconds=timeout_seconds, accelerator=accel,
+                    serial_log_path=str(serial_log_path), elapsed_seconds=_elapsed(),
                 )
 
             sleep_fn(poll_interval_seconds)  # type: ignore[operator]

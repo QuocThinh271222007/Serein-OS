@@ -31,7 +31,10 @@ from serein.distribution.base import (
 )
 from serein.distribution.bootsmoke import (
     DEFAULT_SUCCESS_MARKERS,
+    DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_TIMEOUT_SECONDS_TCG,
     build_qemu_boot_command,
+    default_timeout_seconds_for_accel,
     derive_boot_mode,
     evaluate_boot_log,
     run_boot_smoke,
@@ -835,6 +838,115 @@ class TestBootSmoke:
             BootSmokeResult(status="pass", matched_marker=None, reason="", log_excerpt="")
 
 
+# ---------------------------------------------------------------------------
+# S7.0RM6 Corrective B/D: boot-smoke evidence fidelity (Tests B2-B6;
+# B1 - canonical serial-log path - lives in TestLayerBWorkflow below)
+# ---------------------------------------------------------------------------
+
+
+class TestBootSmokeEvidenceFidelity:
+    """A real Layer-B run's serial log proved the boot genuinely
+    reached real systemd/apparmor/snapd userspace activity - but no
+    configured positive marker had been observed within the prior
+    fixed 300s TCG bound, and the workflow was uploading the WRONG
+    serial-log artifact path. These prove: the positive-marker
+    requirement is never weakened by early/ambiguous service lines,
+    real serial evidence survives a timeout, and TCG gets a longer but
+    still-bounded, finite default timeout."""
+
+    def test_b2_full_serial_evidence_retained_on_timeout(self, tmp_path):
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
+
+        result = run_boot_smoke(
+            iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
+            timeout_seconds=3, poll_interval_seconds=1.0,
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"],
+            sleep_fn=lambda s: (
+                fake_time.__setitem__("t", fake_time["t"] + s),
+                (tmp_path / "work" / "boot-smoke-serial.log").write_text(
+                    "booting...\nsnapd.apparmor.service\nldconfig.service\n"
+                ),
+            ),
+        )
+        assert result.status == "fail"
+        assert result.matched_marker is None
+        # the real serial log file itself must still be on disk after a
+        # timeout - never deleted, always available as evidence
+        serial_log = tmp_path / "work" / "boot-smoke-serial.log"
+        assert serial_log.is_file()
+        assert "snapd" in serial_log.read_text()
+        assert result.serial_log_path == str(serial_log)
+
+    def test_b3_weak_service_lines_never_pass(self):
+        # S7.0RM6 Section 8/12: real diagnostic lines observed in a
+        # real run - genuine boot progress, but NOT yet the required
+        # positive target-level milestone.
+        log_text = (
+            "Linux version 6.x\n"
+            "systemd[1]: starting\n"
+            "Starting snapd.apparmor.service\n"
+            "apparmor profile loading\n"
+            "Started arbitrary.service\n"
+        )
+        success, marker = evaluate_boot_log(log_text)
+        assert success is False
+        assert marker is None
+
+    def test_b4_canonical_target_marker_passes(self):
+        for canonical_marker in DEFAULT_SUCCESS_MARKERS:
+            log_text = f"...\nsnapd.apparmor.service\n{canonical_marker}\nmore\n"
+            success, marker = evaluate_boot_log(log_text)
+            assert success is True
+            assert marker == canonical_marker
+
+    def test_b5_tcg_timeout_bounded_and_larger_than_prior_300s(self):
+        tcg_timeout = default_timeout_seconds_for_accel("tcg")
+        kvm_timeout = default_timeout_seconds_for_accel("kvm")
+
+        assert tcg_timeout > 300  # strictly larger than the prior fixed bound
+        assert tcg_timeout == DEFAULT_TIMEOUT_SECONDS_TCG
+        assert isinstance(tcg_timeout, int) and tcg_timeout > 0  # finite, never unbounded
+        assert kvm_timeout == DEFAULT_TIMEOUT_SECONDS  # unchanged, still bounded
+        assert kvm_timeout <= tcg_timeout  # KVM path must not become needlessly slower
+
+    def test_b5_explicit_timeout_still_overrides_accel_default(self, tmp_path):
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
+
+        result = run_boot_smoke(
+            iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
+            timeout_seconds=7, accel="tcg",
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"],
+            sleep_fn=lambda s: fake_time.__setitem__("t", fake_time["t"] + s),
+        )
+        assert result.status == "fail"
+        assert result.timeout_seconds == 7
+        assert "7s" in result.reason
+
+    def test_b6_process_alive_alone_is_still_never_pass(self, tmp_path):
+        # Keep existing invariant explicit under its RM6 test id too.
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
+
+        result = run_boot_smoke(
+            iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
+            timeout_seconds=2, poll_interval_seconds=1.0,
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"],
+            sleep_fn=lambda s: (
+                fake_time.__setitem__("t", fake_time["t"] + s),
+                (tmp_path / "work" / "boot-smoke-serial.log").write_text(
+                    "qemu started and is running\n" * 20
+                ),
+            ),
+        )
+        assert result.status == "fail"
+        assert result.matched_marker is None
+
+
 class TestBuildPipeline:
     def test_run_build_requires_source_commit(self, tmp_path):
         with pytest.raises(BuildError, match="source_commit"):
@@ -1451,6 +1563,196 @@ class TestStrictInspector:
 
 
 # ---------------------------------------------------------------------------
+# S7.0RM6 Corrective A: strict-inspection scratch isolation/cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestStrictInspectorScratchIsolation:
+    """A real Layer-B run's QA strict inspection crashed with
+    ``PermissionError`` trying to delete production strict inspection's
+    own leftover ``/serein`` extraction, because both invocations
+    defaulted to the SAME mutable scratch subtree. These prove
+    isolated, uniquely-owned scratch directories never collide, and
+    that the inspector's own cleanup is robust to stale/read-only
+    content left over from a repeated invocation - without ever
+    touching anything outside its own confined scratch root."""
+
+    REQUIRED_STRICT_CHECKS = (
+        "iso-readable", "iso-sha256-computed", "sidecar-sha256", "sidecar-manifest",
+        "xorriso-available", "volume-id", "el-torito-report", "uefi-boot-evidence",
+        "extract-serein-tree", "media-marker", "payload-manifest",
+    )
+
+    def test_a1_production_then_qa_strict_inspection_isolated_workdirs(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        prod_iso, fake_runner = _fake_iso_environment(tmp_path)
+        actual_sha = sha256_file(prod_iso)
+        prod_iso.with_suffix(prod_iso.suffix + ".sha256").write_text(
+            f"{actual_sha}  {prod_iso.name}\n"
+        )
+        prod_iso.with_suffix(prod_iso.suffix + ".manifest.json").write_text(json.dumps({
+            "source_commit": "a" * 40,
+            "output": {"sha256": actual_sha},
+        }))
+        qa_iso = tmp_path / "serein-alpha-26.04-amd64-qa.iso"
+        qa_iso.write_bytes(b"pretend qa iso bytes")
+        qa_sha = sha256_file(qa_iso)
+        qa_iso.with_suffix(qa_iso.suffix + ".sha256").write_text(f"{qa_sha}  {qa_iso.name}\n")
+        qa_iso.with_suffix(qa_iso.suffix + ".manifest.json").write_text(json.dumps({
+            "source_commit": "a" * 40,
+            "output": {"sha256": qa_sha},
+        }))
+
+        prod_work_dir = tmp_path / "inspect-strict-work" / "production"
+        qa_work_dir = tmp_path / "inspect-strict-work" / "qa"
+        assert prod_work_dir != qa_work_dir
+
+        prod_report = inspect_iso_file_strict(
+            prod_iso, prod_work_dir, expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert prod_report.strict_passed is True
+        prod_marker_path = prod_work_dir / "iso-strict-extract" / "serein" / "manifest.json"
+        prod_marker_before = prod_marker_path.read_bytes()
+
+        qa_report = inspect_iso_file_strict(
+            qa_iso, qa_work_dir, expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert qa_report.strict_passed is True
+
+        # QA's inspection never needed to (and never did) delete or
+        # modify production's own scratch extraction.
+        assert prod_marker_path.read_bytes() == prod_marker_before
+
+    def test_a2_stale_readonly_scratch_is_cleaned_and_inspection_proceeds(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        actual_sha = sha256_file(iso_path)
+        iso_path.with_suffix(iso_path.suffix + ".sha256").write_text(
+            f"{actual_sha}  {iso_path.name}\n"
+        )
+        iso_path.with_suffix(iso_path.suffix + ".manifest.json").write_text(json.dumps({
+            "source_commit": "a" * 40,
+            "output": {"sha256": actual_sha},
+        }))
+        work_dir = tmp_path / "work"
+
+        first = inspect_iso_file_strict(
+            iso_path, work_dir, expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert first.strict_passed is True
+
+        # Simulate a real xorriso extraction leaving non-writable
+        # directory modes behind (the exact real defect - Section 2):
+        # a subsequent invocation reusing the same work_dir must not
+        # crash trying to delete this stale extraction.
+        extract_root = work_dir / "iso-strict-extract"
+        for path in sorted(extract_root.rglob("*"), reverse=True):
+            if path.is_dir():
+                path.chmod(stat.S_IREAD | stat.S_IEXEC)
+        extract_root.chmod(stat.S_IREAD | stat.S_IEXEC)
+
+        second = inspect_iso_file_strict(
+            iso_path, work_dir, expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert second.strict_passed is True
+
+    def test_a3_scratch_symlink_escape_never_touches_external_target(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        actual_sha = sha256_file(iso_path)
+        iso_path.with_suffix(iso_path.suffix + ".sha256").write_text(
+            f"{actual_sha}  {iso_path.name}\n"
+        )
+        iso_path.with_suffix(iso_path.suffix + ".manifest.json").write_text(json.dumps({
+            "source_commit": "a" * 40,
+            "output": {"sha256": actual_sha},
+        }))
+        work_dir = tmp_path / "work"
+
+        # a first (stale) extraction exists, containing a symlink that
+        # escapes the scratch root
+        extract_root = work_dir / "iso-strict-extract"
+        extract_root.mkdir(parents=True)
+        outside = tmp_path / "external.txt"
+        outside.write_text("do not touch")
+        outside_bytes_before = outside.read_bytes()
+        outside_mode_before = stat.S_IMODE(outside.stat().st_mode)
+        link = extract_root / "escape"
+        try:
+            os.symlink(outside, link)
+        except OSError:
+            pytest.skip("symlink creation not permitted in this environment")
+
+        report = inspect_iso_file_strict(
+            iso_path, work_dir, expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is True
+
+        # the cleanup that made room for this real inspection never
+        # touched the symlink's external target
+        assert outside.read_bytes() == outside_bytes_before
+        assert stat.S_IMODE(outside.stat().st_mode) == outside_mode_before
+
+    def test_a4_source_iso_untouched_by_scratch_cleanup(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        work_dir = tmp_path / "work"
+        iso_sha_before = sha256_file(iso_path)
+
+        # run twice - the second run's cleanup of the first run's own
+        # scratch must never touch the source ISO itself
+        inspect_iso_file_strict(
+            iso_path, work_dir, expected_source_commit="a" * 40, runner=fake_runner
+        )
+        extract_root = work_dir / "iso-strict-extract"
+        for path in sorted(extract_root.rglob("*"), reverse=True):
+            if path.is_dir():
+                path.chmod(stat.S_IREAD | stat.S_IEXEC)
+        inspect_iso_file_strict(
+            iso_path, work_dir, expected_source_commit="a" * 40, runner=fake_runner
+        )
+
+        assert sha256_file(iso_path) == iso_sha_before
+
+    def test_a5_strict_check_set_unweakened_after_scratch_fix(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "serein.distribution.inspect.shutil.which", lambda _name: "/usr/bin/xorriso"
+        )
+        iso_path, fake_runner = _fake_iso_environment(tmp_path)
+        actual_sha = sha256_file(iso_path)
+        iso_path.with_suffix(iso_path.suffix + ".sha256").write_text(
+            f"{actual_sha}  {iso_path.name}\n"
+        )
+        iso_path.with_suffix(iso_path.suffix + ".manifest.json").write_text(json.dumps({
+            "source_commit": "a" * 40,
+            "output": {"sha256": actual_sha},
+        }))
+
+        report = inspect_iso_file_strict(
+            iso_path, tmp_path / "work", expected_source_commit="a" * 40, runner=fake_runner
+        )
+        assert report.strict_passed is True
+        checks_seen = {f.check for f in report.findings}
+        for required in self.REQUIRED_STRICT_CHECKS:
+            assert required in checks_seen, f"{required!r} check silently removed"
+        assert all(f.status == "pass" for f in report.findings)
+
+
+# ---------------------------------------------------------------------------
 # S7.0R Corrective A: Layer-B workflow trigger model
 # ---------------------------------------------------------------------------
 
@@ -1591,13 +1893,16 @@ class TestLayerBWorkflow:
         assert "EPHEMERAL_STORAGE=1" in build["run"]
 
     def test_single_canonical_builder_no_competing_script(self):
-        # Section 9: no "ci-special-build.sh" or equivalent - only the
-        # scripts already covered by docs/distribution/.
+        # Section 9: no "ci-special-build.sh" or equivalent build
+        # pipeline - only the scripts already covered by
+        # docs/distribution/, plus record-failure.sh (S7.0RM6
+        # Corrective C), a narrow evidence-fidelity helper, never a
+        # second build/inspect/boot path.
         scripts_dir = REPO_ROOT / "distribution" / "scripts"
         names = {p.name for p in scripts_dir.glob("*.sh")}
         assert names == {
             "fetch-base-image.sh", "verify-base-image.sh", "build-iso.sh",
-            "inspect-iso.sh", "boot-smoke.sh", "clean.sh",
+            "inspect-iso.sh", "boot-smoke.sh", "clean.sh", "record-failure.sh",
         }
 
     # -- S7.0RM2 Corrective B: stage-state fidelity, not artifact inference --
@@ -1692,6 +1997,50 @@ class TestLayerBWorkflow:
         steps = workflow["jobs"]["iso-smoke"]["steps"]
         upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
         assert "dist/build-stage-status.json" in upload["with"]["path"]
+
+    # -- S7.0RM6 Corrective A: isolated strict-inspection scratch dirs --
+
+    def test_production_and_qa_strict_inspect_use_distinct_workdirs(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        prod = next(s for s in steps if s.get("name") == "Strict-inspect production ISO")
+        qa = next(s for s in steps if s.get("name") == "Strict-inspect QA ISO")
+        assert "--work-dir" in prod["run"]
+        assert "--work-dir" in qa["run"]
+
+        prod_workdir = re.search(r"--work-dir\s+(\S+)", prod["run"]).group(1)
+        qa_workdir = re.search(r"--work-dir\s+(\S+)", qa["run"]).group(1)
+        assert prod_workdir != qa_workdir
+
+    # -- S7.0RM6 Corrective B/Section 9: canonical boot-smoke serial-log path --
+
+    def test_b1_boot_smoke_serial_log_path_matches_uploaded_artifact(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        boot = next(s for s in steps if s.get("name", "").startswith("QEMU boot smoke"))
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+
+        assert "--work-dir dist/boot-smoke" in boot["run"]
+        # the real defect: the workflow was uploading a path the
+        # boot-smoke CLI never actually wrote to
+        assert "build/work/boot-smoke/boot-smoke-serial.log" not in upload["with"]["path"]
+        assert "dist/boot-smoke/boot-smoke-serial.log" in upload["with"]["path"]
+
+    # -- S7.0RM6 Corrective C/Section 17: first-failure-wins evidence --
+
+    def test_no_step_still_overwrites_failure_stage_directly(self, workflow):
+        steps = workflow["jobs"]["iso-smoke"]["steps"]
+        # the real defect: `> dist/.failure_stage` overwrite semantics
+        # scattered across many steps let a LATER, independent failure
+        # silently clobber the FIRST real closure blocker's evidence.
+        # The one legitimate remaining reference is the evidence-
+        # assembly step reading (never writing) it via `cat`/`-f` test.
+        for step in steps:
+            script = step.get("run", "")
+            assert "> dist/.failure_stage" not in script
+            assert "> dist/.failure_reason" not in script
+
+    def test_record_failure_script_is_the_single_mechanism(self):
+        text = (WORKFLOWS_DIR / "iso-smoke.yml").read_text(encoding="utf-8")
+        assert text.count("record-failure.sh") >= 7  # one call per real failure site
 
     # -- S7.0RM2 Corrective D: coherent disk-preflight arithmetic --
 
@@ -1819,6 +2168,16 @@ class TestElToritoReportStep:
         )
 
     def _run(self, script: str, work_dir: Path, bin_dir: Path) -> subprocess.CompletedProcess:
+        # The real step script now calls the real, committed
+        # record-failure.sh (S7.0RM6 Corrective C) at its real relative
+        # path - copy the REAL file (never a hand-copied
+        # re-implementation) into this sandboxed work_dir so it runs
+        # for real too, not just the extracted step script.
+        real_helper = REPO_ROOT / "distribution" / "scripts" / "record-failure.sh"
+        sandboxed_helper = work_dir / "distribution" / "scripts" / "record-failure.sh"
+        sandboxed_helper.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(real_helper, sandboxed_helper)
+
         env = dict(os.environ)
         env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
         return subprocess.run(
@@ -1896,10 +2255,92 @@ class TestElToritoReportStep:
     def test_script_uses_distinct_failure_reasons(self, step_script):
         assert "xorriso failed to extract the base ISO El Torito report" in step_script
         assert "base ISO El Torito report is empty" in step_script
-        assert step_script.count('echo "base_el_torito_report" > dist/.failure_stage') == 2
+        # S7.0RM6 Corrective C: both failure branches call the one
+        # canonical helper (never an ad-hoc `> dist/.failure_stage`)
+        assert step_script.count('record-failure.sh "base_el_torito_report"') == 2
 
     def test_script_checks_report_non_empty(self, step_script):
         assert '[ ! -s "${REPORT_PATH}"' in step_script
+
+
+# ---------------------------------------------------------------------------
+# S7.0RM6 Corrective C: first-failure-wins evidence (Tests C1-C3)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordFailureScript:
+    """Executes the REAL, committed ``distribution/scripts/
+    record-failure.sh`` via ``bash`` - never a hand-copied
+    re-implementation - proving genuine first-failure-wins semantics: a
+    real Layer-B run recorded ``failure_stage=qemu_boot`` even though
+    strict QA inspection had already failed FIRST, losing the real
+    first causal blocker."""
+
+    SCRIPT_PATH = REPO_ROOT / "distribution" / "scripts" / "record-failure.sh"
+
+    def _run(self, work_dir: Path, stage: str, reason: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(self.SCRIPT_PATH), stage, reason],
+            cwd=work_dir, capture_output=True, text=True,
+        )
+
+    def test_c1_first_failure_wins_second_call_never_overwrites(self, tmp_path):
+        _requires_bash()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        first = self._run(work_dir, "qa_inspection", "strict QA ISO inspection failed")
+        assert first.returncode == 0, first.stderr
+        second = self._run(work_dir, "qemu_boot", "QEMU boot smoke failed")
+        assert second.returncode == 0, second.stderr
+
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "qa_inspection"
+        assert (
+            work_dir / "dist" / ".failure_reason"
+        ).read_text().strip() == "strict QA ISO inspection failed"
+
+    def test_c1_qa_inspect_first_then_qemu_later_records_qa_inspection(self, tmp_path):
+        # The exact real run #7 scenario (Section 17/21): QA strict
+        # inspection failed first, QEMU boot failed afterward in the
+        # same job - the FIRST real blocker must be what closure
+        # evidence records.
+        _requires_bash()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        self._run(work_dir, "qa_inspection", "strict QA ISO inspection failed")
+        self._run(work_dir, "qemu_boot", "QEMU boot smoke failed - see boot-smoke-serial.log")
+
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "qa_inspection"
+
+    def test_c2_qa_inspect_passes_qemu_fails_records_qemu_boot(self, tmp_path):
+        # No earlier failure occurred - the single real blocker is
+        # correctly recorded.
+        _requires_bash()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        result = self._run(work_dir, "qemu_boot", "QEMU boot smoke failed")
+        assert result.returncode == 0, result.stderr
+
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "qemu_boot"
+
+    def test_c3_no_failure_files_when_never_invoked(self, tmp_path):
+        # Full closure (all stages pass): nothing ever calls
+        # record-failure.sh, so no failure files exist at all.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        assert not (work_dir / "dist" / ".failure_stage").exists()
+        assert not (work_dir / "dist" / ".failure_reason").exists()
+
+    def test_script_requires_both_arguments(self, tmp_path):
+        _requires_bash()
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT_PATH)], cwd=work_dir, capture_output=True, text=True,
+        )
+        assert result.returncode != 0
 
 
 # ---------------------------------------------------------------------------
