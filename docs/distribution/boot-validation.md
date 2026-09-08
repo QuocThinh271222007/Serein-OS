@@ -99,12 +99,37 @@ wraps `python -m serein.distribution boot-smoke`, which calls
   never itself cause a `PASS` (only a real positive marker can). An
   explicit `--timeout`/`timeout_seconds` always overrides this.
 - **Positive evidence only** (Section 46) - `evaluate_boot_log` requires
-  one of `DEFAULT_SUCCESS_MARKERS` (systemd "Reached target ..." lines)
-  to literally appear in the captured serial log. "The QEMU process
-  didn't crash" is never treated as success, and
+  one of `DEFAULT_SUCCESS_MARKERS` (legacy literal "Reached target ..."
+  lines) or one of the canonical modern systemd target-reached
+  patterns (below) to appear in the captured serial log. "The QEMU
+  process didn't crash" is never treated as success, and
   `BootSmokeResult.__post_init__` enforces the invariant directly:
   `status="pass"` without a non-empty `matched_marker` raises
   `BootSmokeError` rather than silently allowing it.
+  **Canonical systemd target-marker fidelity (S7.0RM7)**: real Layer-B
+  Run #8 genuinely reached `basic.target` - its serial log contained
+  `Reached target basic.target - Basic System.` verbatim, sometimes
+  wrapped in ANSI color codes around `[  OK  ]`/the unit name - but the
+  legacy literal-substring markers never matched real modern systemd
+  wording, so a genuine boot success was reported `fail`.
+  `evaluate_boot_log` now also matches, after stripping ANSI CSI/SGR
+  escape sequences (`_strip_ansi` - evaluation-only; the raw serial log
+  artifact on disk is never modified) via a scoped regex
+  (`_TARGET_MARKER_PATTERNS`):
+  ```text
+  Reached target basic.target - Basic System.
+  Reached target multi-user.target - Multi-User System.
+  Reached target graphical.target - Graphical Interface.
+  ```
+  Each pattern requires an explicit reached-target EVENT for the real
+  unit - never merely the unit's name appearing in an unrelated line.
+  Still rejected exactly as before: `"Queued start job for default
+  target basic.target"`, `"Starting basic.target"`, `"Wants="`/`"After="`
+  dependency lines, `"Started <anything>.service"`, and bare
+  snapd/apparmor/cloud-init/udev/dbus activity with no reached-target
+  line. `matched_marker` records the real matched evidence (the exact,
+  whitespace-normalized systemd line, or the legacy literal string) -
+  never a bare unit name like `"basic.target"` alone.
 - **Boot mode is derived, never asserted** (S7.0RM Corrective F) -
   `derive_boot_mode(ovmf_code)` is the one place `boot_mode` is
   decided: `"uefi"` only if an OVMF pflash drive was actually added to

@@ -839,6 +839,151 @@ class TestBootSmoke:
 
 
 # ---------------------------------------------------------------------------
+# S7.0RM7: canonical systemd target-marker fidelity (Tests A-J)
+# ---------------------------------------------------------------------------
+
+
+class TestSystemdTargetMarkerFidelity:
+    """Real Layer-B Run #8 genuinely reached ``basic.target`` - the
+    serial log contained ``Reached target basic.target - Basic
+    System.`` verbatim - but the prior literal-substring-only marker
+    set never recognized modern systemd's real wording, so
+    ``qemu_boot`` was reported ``fail`` despite real boot success.
+    These prove the fix recognizes the real event precisely, without
+    ever weakening what counts as evidence."""
+
+    def test_a_modern_basic_target_marker_passes(self):
+        success, marker = evaluate_boot_log(
+            "...\nReached target basic.target - Basic System.\n...\n"
+        )
+        assert success is True
+        assert marker == "Reached target basic.target - Basic System."
+
+    def test_b_ansi_wrapped_modern_marker_passes(self):
+        # A realistic shape: `[  OK  ]` and the unit name individually
+        # colorized, exactly the contamination pattern real serial
+        # consoles produce.
+        log_text = (
+            "\x1b[0;32m[  OK  ]\x1b[0m Reached target "
+            "\x1b[0;1;39mbasic.target\x1b[0m - Basic System.\n"
+        )
+        success, marker = evaluate_boot_log(log_text)
+        assert success is True
+        assert marker == "Reached target basic.target - Basic System."
+        # never leaks a stray ANSI byte into the recorded evidence
+        assert "\x1b" not in marker
+
+    def test_c_modern_multi_user_target_passes(self):
+        success, marker = evaluate_boot_log(
+            "Reached target multi-user.target - Multi-User System.\n"
+        )
+        assert success is True
+        assert "multi-user.target" in marker
+        assert "Multi-User System" in marker
+
+    def test_d_modern_graphical_target_passes(self):
+        success, marker = evaluate_boot_log(
+            "Reached target graphical.target - Graphical Interface.\n"
+        )
+        assert success is True
+        assert "graphical.target" in marker
+        assert "Graphical Interface" in marker
+
+    def test_e_weak_basic_target_reference_rejected(self):
+        for weak_line in (
+            "Queued start job for default target basic.target",
+            "Starting basic.target",
+            "Wants=basic.target",
+            "After=basic.target",
+            "Dependency on basic.target",
+        ):
+            success, marker = evaluate_boot_log(weak_line)
+            assert success is False, f"{weak_line!r} must not pass"
+            assert marker is None
+
+    def test_f_started_service_rejected(self):
+        for line in ("Started arbitrary.service", "Started snapd.service"):
+            success, marker = evaluate_boot_log(line)
+            assert success is False, f"{line!r} must not pass"
+            assert marker is None
+
+    def test_g_snapd_activity_alone_rejected(self):
+        # Representative real Run #8 activity - genuine progress, but
+        # not a reached-target event.
+        log_text = (
+            "Starting snapd.apparmor.service - Load AppArmor...\n"
+            "apparmor=\"STATUS\" operation=\"profile_load\"\n"
+            "Finished ldconfig.service - Rebuild Dynamic Linker Cache.\n"
+            "Starting cloud-init.service\n"
+        )
+        success, marker = evaluate_boot_log(log_text)
+        assert success is False
+        assert marker is None
+
+    def test_h_process_alive_alone_still_rejected(self):
+        success, marker = evaluate_boot_log("qemu started and is running\n" * 20)
+        assert success is False
+        assert marker is None
+
+    def test_i_timeout_still_bounded_at_600_tcg_300_kvm(self):
+        assert default_timeout_seconds_for_accel("tcg") == 600
+        assert default_timeout_seconds_for_accel("kvm") == 300
+
+    def test_i_no_marker_by_deadline_still_fails(self, tmp_path):
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
+
+        result = run_boot_smoke(
+            iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
+            timeout_seconds=3, poll_interval_seconds=1.0, accel="tcg",
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"],
+            sleep_fn=lambda s: (
+                fake_time.__setitem__("t", fake_time["t"] + s),
+                (tmp_path / "work" / "boot-smoke-serial.log").write_text(
+                    "Starting snapd.apparmor.service\nStarted arbitrary.service\n"
+                ),
+            ),
+        )
+        assert result.status == "fail"
+        assert result.matched_marker is None
+        assert result.timeout_seconds == 3
+        assert result.accelerator == "tcg"
+
+    def test_j_real_run_8_basic_target_fixture(self):
+        # Narrow regression fixture based on the exact semantic line
+        # observed in real Layer-B Run #8 (RUN_ID=34193940964) - never
+        # the full multi-megabyte serial log, just the one real line
+        # that must never again go unrecognized.
+        run_8_fixture_line = "[  OK  ] Reached target basic.target - Basic System."
+        success, marker = evaluate_boot_log(run_8_fixture_line)
+        assert success is True
+        assert marker == "Reached target basic.target - Basic System."
+
+    def test_run_boot_smoke_end_to_end_passes_on_modern_marker(self, tmp_path):
+        # The exact real defect, end to end through run_boot_smoke()
+        # itself (not just evaluate_boot_log directly).
+        fake_time = {"t": 0.0}
+        process = _FakeQemuProcess()
+
+        def fake_sleep(_seconds):
+            fake_time["t"] += _seconds
+            if fake_time["t"] >= 2.0:
+                (tmp_path / "work" / "boot-smoke-serial.log").write_text(
+                    "Starting snapd.apparmor.service\n"
+                    "Reached target basic.target - Basic System.\n"
+                )
+
+        result = run_boot_smoke(
+            iso_path=tmp_path / "iso.iso", work_dir=tmp_path / "work",
+            popen_factory=lambda *a, **k: process,
+            time_source=lambda: fake_time["t"], sleep_fn=fake_sleep,
+        )
+        assert result.status == "pass"
+        assert result.matched_marker == "Reached target basic.target - Basic System."
+
+
+# ---------------------------------------------------------------------------
 # S7.0RM6 Corrective B/D: boot-smoke evidence fidelity (Tests B2-B6;
 # B1 - canonical serial-log path - lives in TestLayerBWorkflow below)
 # ---------------------------------------------------------------------------

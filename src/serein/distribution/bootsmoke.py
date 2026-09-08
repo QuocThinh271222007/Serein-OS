@@ -1,5 +1,6 @@
 """QEMU boot-smoke harness (S7.0 Sections 44-49, 92, 94-95; marker-aware
-live monitoring and UEFI evidence fidelity added by S7.0RM Corrective D/F).
+live monitoring and UEFI evidence fidelity added by S7.0RM Corrective D/F;
+canonical systemd target-marker recognition added by S7.0RM7).
 
 Validates that built media actually boots - never "the QEMU process
 stayed alive for N seconds" (Section 46), always a positive marker read
@@ -29,23 +30,65 @@ the normal graphical boot entry (Section 47) - see
 
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-#: Systemd/casper log lines that constitute genuine positive boot
-#: evidence (Section 46) - kernel + initramfs + early userspace really
-#: came up, not merely "the emulator didn't crash". Ordered from the
-#: least to most demanding milestone; callers may pass a narrower tuple
-#: if they specifically need graphical-target evidence. Real Ubuntu
-#: 26.04.1 Layer-B evidence should confirm which of these actually
-#: appears reliably - see docs/distribution/known-limitations.md.
+#: Legacy/historical systemd log lines kept for backward compatibility
+#: (Section 5 of S7.0RM7) - matched as a plain substring, exactly as
+#: before. Real Layer-B Run #8's serial log proved MODERN systemd
+#: instead emits ``Reached target basic.target - Basic System.`` (with
+#: the real unit name and a trailing period, sometimes ANSI-wrapped),
+#: which none of these literal strings match - see
+#: `_TARGET_MARKER_PATTERNS` below for the fix. Ordered from the least
+#: to most demanding milestone; callers may pass a narrower tuple if
+#: they specifically need graphical-target evidence.
 DEFAULT_SUCCESS_MARKERS: tuple[str, ...] = (
     "Reached target Basic System",
     "Reached target Multi-User System",
     "Reached target Graphical Interface",
 )
+
+#: Strip ANSI CSI/SGR terminal control sequences (e.g. the color codes
+#: real serial output wraps around ``[  OK  ]`` and target names) -
+#: exactly the well-defined CSI escape shape (ESC ``[``, parameter/
+#: intermediate bytes, one final byte), never a broader/destructive
+#: filter that could rewrite unrelated semantic text (S7.0RM7
+#: Corrective A/Section 3).
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+#: Canonical, modern systemd "reached target" success lines (S7.0RM7
+#: Corrective B) - a real Layer-B run's serial log contained
+#: ``Reached target basic.target - Basic System.`` verbatim, which the
+#: legacy literal marker set above never recognized, even though the
+#: real OS had genuinely reached that milestone. Each pattern requires
+#: an explicit reached-target EVENT for a real target unit - never
+#: merely the target's name appearing in an unrelated line. Evaluated
+#: against text with ANSI escapes already stripped (`_strip_ansi`).
+#: Deliberately does NOT match, e.g.:
+#:   "Queued start job for default target basic.target"
+#:   "Starting basic.target"
+#:   "Wants=basic.target" / "After=basic.target"
+#:   "Started arbitrary.service"
+_TARGET_MARKER_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Reached target\s+basic\.target\s*-\s*Basic System\.?", re.IGNORECASE),
+    re.compile(
+        r"Reached target\s+multi-user\.target\s*-\s*Multi-User System\.?", re.IGNORECASE
+    ),
+    re.compile(
+        r"Reached target\s+graphical\.target\s*-\s*Graphical Interface\.?", re.IGNORECASE
+    ),
+)
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI CSI/SGR terminal control sequences from ``text`` -
+    evaluation-only normalization (S7.0RM7 Corrective A/Section 3).
+    The raw captured serial log on disk is never modified; only the
+    in-memory text handed to the marker parser is normalized."""
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 DEFAULT_TIMEOUT_SECONDS = 300
 
@@ -138,14 +181,43 @@ def build_qemu_boot_command(
 
 
 def evaluate_boot_log(
-    log_text: str, markers: tuple[str, ...] = DEFAULT_SUCCESS_MARKERS
+    log_text: str,
+    markers: tuple[str, ...] = DEFAULT_SUCCESS_MARKERS,
+    target_patterns: tuple[re.Pattern[str], ...] = _TARGET_MARKER_PATTERNS,
 ) -> tuple[bool, str | None]:
     """Return ``(success, matched_marker)``. ``success`` is only ever
-    ``True`` because a real marker string was found in the captured
-    serial log - never inferred from process exit status alone."""
+    ``True`` because a real, explicit reached-target/reached-system
+    event was found in the captured serial log - never inferred from
+    process exit status alone, and never from mere service/subsystem
+    activity (``snapd``, ``apparmor``, ``cloud-init``, ``Started
+    ...service``, etc.).
+
+    Two independent, both-strict recognition layers (S7.0RM7):
+
+    - ``markers`` - legacy literal substrings, kept for backward
+      compatibility with the historical marker text.
+    - ``target_patterns`` - canonical modern systemd
+      ``Reached target <unit> - <Description>`` lines (real Layer-B
+      Run #8 evidence), matched after stripping ANSI terminal control
+      sequences a real serial console can interleave around them
+      (``_strip_ansi``) - never by loosening what counts as a match.
+
+    ``matched_marker`` is always the real evidence that caused success:
+    either the literal legacy string, or the exact (whitespace-
+    normalized) matched systemd line - never a bare unit name like
+    ``"basic.target"`` alone.
+    """
     for marker in markers:
         if marker in log_text:
             return True, marker
+
+    normalized = _strip_ansi(log_text)
+    for pattern in target_patterns:
+        match = pattern.search(normalized)
+        if match:
+            matched_text = " ".join(match.group(0).split())
+            return True, matched_text
+
     return False, None
 
 

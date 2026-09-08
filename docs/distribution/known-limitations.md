@@ -1,4 +1,4 @@
-# Known Limitations (S7.0; updated by the S7.0R Layer-B closure corrective; most recently S7.0RM6)
+# Known Limitations (S7.0; updated by the S7.0R Layer-B closure corrective; most recently S7.0RM7)
 
 ## Scope limitations (by design - Section 83)
 
@@ -33,9 +33,9 @@
 - **Physical hardware boot not verified.** `REAL_PHYSICAL_BOOT=NOT_PERFORMED`
   - out of scope without a disposable physical machine (Section 96).
 
-## Real Layer B validation status (S7.0RM6)
+## Real Layer B validation status (S7.0RM7)
 
-**Five real Layer-B runs have now occurred**, each on the exact
+**Six real Layer-B runs have now occurred**, each on the exact
 reviewed feature HEAD, each exposing a genuine defect this corrective
 history has fixed in turn:
 
@@ -138,13 +138,56 @@ Run 5 (after S7.0RM5):
   though QA strict inspection had failed FIRST - a later, independent
   failure silently overwrote the first real closure blocker. All fixed
   by S7.0RM6 (Correctives A, B, C, D).
+
+Run 6 (after S7.0RM6):
+  RUN_ID=34193940964, RUN_NUMBER=8
+  HEAD=3466b3ec9fced22d87248db92ab07a14675a5bb8
+  RESULT=FAILURE - RM6 itself proved out completely: base
+  download/verify/report, production build+inspection, QA
+  transition+build+inspection, and real QEMU execution (UEFI,
+  `/usr/share/OVMF/OVMF_CODE_4M.fd`, no target disk, no autoinstall)
+  ALL PASSED for the first time - every stage up to and including
+  formal closure's boot-marker check. The run then failed on the ONE
+  remaining check:
+    FORMAL_QEMU_BOOT=FAIL, FORMAL_BOOT_MARKER=null
+  The real serial log genuinely contained systemd userspace evidence
+  equivalent to `[  OK  ] Reached target basic.target - Basic System.`
+  - the OS genuinely reached `basic.target` - but the harness's
+  literal-substring marker set (`"Reached target Basic System"`, no
+  `.target` suffix, no trailing period) never matched real modern
+  systemd wording, so a genuine boot success was reported `fail`.
+  Fixed by S7.0RM7 (Correctives A and B) - marker recognition fidelity,
+  never a lowered standard.
 ```
 
-The exact-head checkout has now worked correctly in all five real
+The exact-head checkout has now worked correctly in all six real
 runs, confirming Corrective A (S7.0R)'s PR-trigger and exact-head model
 remain sound across this whole corrective history.
 
-**S7.0RM6 fixes the defects Run 5 exposed:**
+**S7.0RM7 fixes the defect Run 6 exposed:**
+
+- **Corrective A** - `evaluate_boot_log` now strips ANSI CSI/SGR
+  terminal control sequences (`_strip_ansi`) before marker evaluation -
+  real serial consoles wrap `[  OK  ]`/target names in color codes -
+  evaluation-only; the raw captured serial log artifact on disk is
+  never modified.
+- **Corrective B** - a new, narrowly-scoped regex layer
+  (`_TARGET_MARKER_PATTERNS`) recognizes canonical modern systemd
+  `Reached target <unit> - <Description>` lines
+  (`basic.target`/`multi-user.target`/`graphical.target`), independent
+  of and in addition to the legacy literal `DEFAULT_SUCCESS_MARKERS`
+  strings (kept for backward compatibility - Section 5). Both layers
+  require an explicit reached-target/reached-system EVENT - a queued/
+  starting/dependency line naming the same unit, or a
+  `"Started <anything>.service"` line, or bare snapd/apparmor/
+  cloud-init activity, still never passes. `matched_marker` always
+  records the real matched evidence (the exact, whitespace-normalized
+  systemd line, or the legacy literal string) - never a bare unit name
+  alone. Timeout policy is unchanged (`TCG=600s`, `KVM=300s`) - Run 6
+  already reached `basic.target` within the existing bound, so the
+  timeout was never the defect.
+
+**S7.0RM6 fixed the defects Run 5 exposed:**
 
 - **Corrective A** - production and QA strict inspection now use
   distinct, uniquely-owned scratch work directories (the CLI's default
@@ -261,27 +304,27 @@ remain sound across this whole corrective history.
 
 This development environment still has no `xorriso`/`qemu`/
 `squashfs-tools` installed (unchanged from every prior pass this
-session), so the S7.0RM6 corrective code itself has only been
-validated via the fully injectable fake-`xorriso`/fake-`Popen` Layer-A
-test suite (`tests/test_distribution.py`, 1276+ tests passing,
-including real filesystem-mode-bit regressions against stale/read-only
-scratch directories, a real `bash`-executed `record-failure.sh`
-first-failure-wins proof, and fake-clock accelerator-timeout
-regressions) - not against a sixth real Layer-B run, which has not yet
-been observed from this environment:
+session), so the S7.0RM7 corrective code itself has only been
+validated via the fully injectable fake-`Popen` Layer-A test suite
+(`tests/test_distribution.py`, 1288+ tests passing, including a direct
+verification that the exact real Run #8 serial line - both bare and
+ANSI-wrapped - is recognized, that every weak/ambiguous line the
+corrective explicitly must keep rejecting still does, and an
+end-to-end `run_boot_smoke()` proof) - not against a seventh real
+Layer-B run, which has not yet been observed from this environment:
 
 | Field | Status | Why |
 |---|---|---|
-| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **PASS** (Run 5) | Confirmed real: base download, sha256 verify, and signature verify all passed on Run 5 against the real `ubuntu-26.04.1-desktop-amd64.iso`. |
-| `REAL_BASE_EL_TORITO_REPORT` | **PASS** (Run 5) | The S7.0RM3 fix continues to hold. |
-| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **PASS** (Run 5) | `serein-alpha-26.04-amd64.iso`, sha256 `c0adb235bf352fc79efe65ba027a7b663fa30ac167bf3495ce6be7f649dab7c9`. |
-| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **PASS** (Run 5) | Strict inspection of the real production ISO passed. |
-| `REAL_SEREIN_QA_TRANSITION` | **PASS** (Run 5) | The S7.0RM5 permissions fix worked for real - the in-place QA transition completed against the real extracted GRUB config. |
-| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **PASS** (Run 5) | `serein-alpha-26.04-amd64-qa.iso`, sha256 `423c84f8fc0e06c9acedcc54574ec02ba6074de5f13186beef264c945b3982fa`. |
-| `REAL_SEREIN_QA_ISO_INSPECTION` | **NOT_PERFORMED** (this pass) | Run 5 crashed with `PermissionError` deleting production strict inspection's own leftover scratch extraction before QA inspection could even begin. Fixed by S7.0RM6 Corrective A; not yet re-run for real. |
-| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** (this pass) | Run 5's real serial log proved genuine progress into systemd/apparmor/snapd userspace, but no configured positive marker was observed within the (then-300s TCG) timeout. Fixed by S7.0RM6 Corrective D (600s TCG bound); not yet re-run for real. The positive-marker requirement itself is unchanged - a longer timeout alone can never itself cause a PASS. |
+| `REAL_UBUNTU_26_04_BASE_VERIFICATION` | **PASS** (Run 6) | Confirmed real: base download, sha256 verify, and signature verify all passed on Run 6 against the real `ubuntu-26.04.1-desktop-amd64.iso`. |
+| `REAL_BASE_EL_TORITO_REPORT` | **PASS** (Run 6) | The S7.0RM3 fix continues to hold. |
+| `REAL_SEREIN_PRODUCTION_ISO_BUILD` | **PASS** (Run 6) | Production ISO built and strict-inspected successfully. |
+| `REAL_SEREIN_PRODUCTION_ISO_INSPECTION` | **PASS** (Run 6) | Strict inspection of the real production ISO passed. |
+| `REAL_SEREIN_QA_TRANSITION` | **PASS** (Run 6) | The S7.0RM5 permissions fix continues to hold for real. |
+| `REAL_SEREIN_QA_BOOT_ISO_BUILD` | **PASS** (Run 6) | QA ISO built successfully. |
+| `REAL_SEREIN_QA_ISO_INSPECTION` | **PASS** (Run 6) | The S7.0RM6 scratch-isolation fix worked for real - production and QA strict inspection no longer collided. |
+| `REAL_SEREIN_QEMU_BOOT` | **NOT_PERFORMED** (this pass) | Run 6's real QEMU execution succeeded (UEFI, real OVMF, no target disk, no autoinstall) and the real serial log genuinely contained `Reached target basic.target - Basic System.` - but the harness's literal-substring-only marker set never recognized modern systemd's real wording, so formal `qemu_boot`/closure reported `fail`. Fixed by S7.0RM7 Correctives A/B; not yet re-run for real. |
 | `REAL_INSTALLER_REACHABILITY` | **NOT_PERFORMED** | Depends on the above. |
-| `REAL_UEFI_BOOT` | **NOT_PERFORMED** | Real OVMF was observed launching in Run 5, but closure requires a real matched positive marker, not yet achieved. |
+| `REAL_UEFI_BOOT` | **NOT_PERFORMED** | Real OVMF (`/usr/share/OVMF/OVMF_CODE_4M.fd`) was observed launching in Run 6, but closure requires a real matched positive marker, not yet achieved. |
 | `REAL_BIOS_BOOT` | **NOT_PERFORMED** | Not exercised - UEFI is the required path. |
 | `REAL_SECURE_BOOT` | **NOT_PERFORMED** | No Secure-Boot-capable test environment. |
 | `REAL_PHYSICAL_BOOT` | **NOT_PERFORMED** | No disposable physical machine. |
@@ -296,29 +339,42 @@ and should not request interactively.
 **PR #9 retains the `run-iso-smoke` label.** `iso-smoke.yml` already
 supports `pull_request: synchronize` while the label remains attached -
 pushing this corrective's commits should automatically trigger a
-sixth real Layer-B run on the new exact HEAD, with no separate action
+seventh real Layer-B run on the new exact HEAD, with no separate action
 needed. This repository's `gh` CLI remains unavailable in this
 environment (consistent with every prior phase this session), so this
 pass could not itself observe that new run's outcome.
 
 ```text
-S7_0RM6_LAYER_B_TRIGGER_READY=true
-S7_0RM6_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
+S7_0RM7_LAYER_B_TRIGGER_READY=true
+S7_0RM7_LAYER_B_RUN=NOT_OBSERVED (auto-triggered by push; outcome must be observed externally)
 ```
 
 Per the corrective's own merge rule: **`S7_0_READY_FOR_MERGE=NO`**
-until a Layer-B run against the exact final S7.0RM6 commit turns every `REAL_*` field above
+until a Layer-B run against the exact final S7.0RM7 commit turns every `REAL_*` field above
 to a genuine PASS - this document states that blocker honestly rather
 than fabricating success. The independent reviewer should watch the
 automatically-triggered run (or re-apply/re-trigger it if needed) on
-the new HEAD. If that run still times out with `QA strict
-inspection=PASS, QEMU=FAIL`, the next pass must inspect the newly
-preserved full serial log (now retained at the correct artifact path)
-rather than blindly increasing the timeout again (Section 27 of the
-S7.0RM6 corrective).
+the new HEAD. If that run still fails with a boot marker not observed,
+capture the new real serial log/evidence JSON and determine whether it
+is (a) a marker-matcher defect still remaining, (b) a genuine boot
+regression, or (c) unrelated infrastructure - never widen scope or
+weaken the marker/timeout requirements without new real evidence
+specifically justifying it (Section 16 of the S7.0RM7 corrective).
 
 ## Implementation-scope limitations (this alpha pass specifically)
 
+- **Resolved in S7.0RM7**: `evaluate_boot_log` now recognizes canonical
+  modern systemd `Reached target <unit> - <Description>` lines (after
+  stripping ANSI terminal control sequences that can wrap them in real
+  serial output), in addition to the legacy literal marker strings -
+  real Run #6 (Layer-B run #8) genuinely reached `basic.target` but the
+  prior literal-substring-only marker set never recognized modern
+  systemd's real wording. Weak/ambiguous lines (a queued/starting/
+  dependency reference to the same unit, a `"Started ...service"` line,
+  bare snapd/apparmor/cloud-init activity) remain rejected exactly as
+  before - this is a recognition-fidelity fix, never a lowered
+  evidence standard. Boot-smoke timeout policy (`TCG=600s`, `KVM=300s`)
+  is unchanged.
 - **Resolved in S7.0RM6**: production and QA strict ISO inspection no
   longer default to the same mutable scratch subtree - each gets its
   own uniquely-owned work directory, and the inspector is now
