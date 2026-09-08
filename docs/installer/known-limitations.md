@@ -1,5 +1,72 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R4)
+
+**Four real Installer Layer-B runs have occurred.** Run #4 confirmed
+the S7.1R3 boot-entry fix works at runtime and moved the causal
+boundary one level deeper - the S7.1R3 root cause is CLOSED:
+
+```text
+Run 4 (after S7.1R3):
+  RUN_ID=34239853849, RUN_NUMBER=4
+  HEAD=12257b49f50a28755588c0d31ff1d8b91b3f338d
+  RESULT=FAILURE - failure_stage=installer_timeout.
+
+  PROVEN: the real captured kernel command line now includes
+  `autoinstall` (`BOOT_IMAGE=/casper/vmlinuz console=ttyS0,115200n8
+  autoinstall --- splash`) - the S7.1R3 fix works at runtime.
+  installer_userspace_reached=true; Subiquity-related services were
+  observed starting. qemu_exit_status=124 (the wrapper's own 1800s
+  timeout fired). Target qcow2 hash unchanged before/after (no
+  installation was ever proven to complete or begin destructive work).
+  Protected qcow2 hash CHANGED before/after - the SECOND consecutive
+  real run showing this (Run #3 also showed it), which invalidates
+  Run #3's "missing autoinstall -> live-desktop automount" hypothesis
+  as a SUFFICIENT explanation, since autoinstall is now proven present
+  and the mutation still occurred.
+
+  S7.1R4 fixes/instruments (without yet knowing the exact Subiquity/
+  curtin-side reason installation did not complete within 1800s -
+  that remains the primary open question for Run #5):
+
+  1. `installer/scripts/run-qa-install.sh`'s protected qcow2 backend
+     is now attached `readonly=on` (previously opened read-write by
+     both the bounded startup probe and the real timed run - the
+     exact code-cited point, `run-qa-install.sh`'s protected `-drive
+     if=none,...` line, confirmed by direct inspection, never merely
+     assumed). This is architecturally correct independent of the
+     exact causal mechanism - a disk that exists ONLY to prove the
+     installer never touches it should never be opened for write
+     access by any component - and closes off every QEMU-side write
+     vector categorically (guest writes, qcow2's own internal
+     lazy-refcount/dirty-bit bookkeeping on open/close).
+  2. `installer/scripts/hash-protected-disk.sh` (new) separately
+     measures the protected disk's container-file hash, its full
+     guest-visible logical block content (via read-only qemu-nbd), and
+     two real sentinel files (ESP + ext4 data) - called both
+     immediately before and immediately after the real install
+     attempt. This distinguishes "container bytes changed but
+     guest-visible content did not" from "guest-visible content
+     genuinely changed" - the existing container-hash-only measurement
+     could not make this distinction. Diagnostic only - the EXISTING
+     container-hash-based closure gate is unchanged and unweakened;
+     these new hashes are additive evidence in a separate,
+     non-gating file (`protected-disk-diagnostic.env`).
+  3. `installer/scripts/extract-installer-signals.sh` (new) - a
+     narrowly scoped grep of the real serial log for
+     Subiquity/curtin/autoinstall/cloud-init/error lines, uploaded as
+     `qa-install-subiquity-signals.log`, so a human reviewing a future
+     run's evidence does not have to manually search a 400+KB raw
+     transcript by hand.
+
+  This pass deliberately did NOT: increase the 1800s timeout, modify
+  target selection/storage-match/curtin-grammar code, or claim the
+  exact Subiquity/curtin-side reason installation did not complete -
+  those remain genuinely unknown pending Run #5's real evidence (in
+  particular the new signal-extraction file and the new protected-disk
+  before/after comparison).
+```
+
 ## Real Layer-B validation status (S7.1R3)
 
 **Three real Installer Layer-B runs have occurred**, each exposing and

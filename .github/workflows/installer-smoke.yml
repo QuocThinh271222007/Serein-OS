@@ -490,6 +490,24 @@ jobs:
             exit 1
           }
 
+      # S7.1R4 Section 8: a real, immediate-pre-install baseline for
+      # the protected disk's THREE separately-measured facts (container
+      # bytes, full guest-visible logical block content, and the two
+      # real sentinel files) - never merely the existing plain
+      # container-only sha256sum this workflow already takes at
+      # fixture-creation time. Establishing this baseline as close to
+      # the real install as possible (after topology re-verification,
+      # right before the destructive step) minimizes any
+      # time-of-check-to-time-of-use gap. Diagnostic only - never gates
+      # anything; the existing container-hash-based closure gate is
+      # unchanged.
+      - name: Hash protected disk (pre-install baseline)
+        id: protected-hash-before
+        if: always() && steps.verify-topology.outcome == 'success'
+        run: |
+          ./installer/scripts/hash-protected-disk.sh \
+            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT"
+
       # The real installer execution (Section 42-43). QA-only autoinstall
       # (Section 7) - never production media, never a physical disk
       # (Section 49-50).
@@ -535,6 +553,20 @@ jobs:
             exit 1
           fi
 
+      # S7.1R4 Section 10: a narrowly scoped, targeted extraction of
+      # the handful of serial-log lines that actually matter for
+      # diagnosing WHY the real installer did or did not progress
+      # (Subiquity/curtin/autoinstall/cloud-init activity, tracebacks,
+      # explicit error/warning lines) - diagnostic only, never a gate,
+      # never a substitute for the full retained serial log (still
+      # uploaded unabridged below).
+      - name: Extract installer signals from serial log
+        if: always()
+        run: |
+          ./installer/scripts/extract-installer-signals.sh \
+            dist/installer-fixtures/qa-install-serial.log \
+            dist/installer-fixtures/qa-install-subiquity-signals.log
+
       # S7.1 Section 47: remove the install ISO once the real install
       # has actually finished with it - never attached to any later
       # boot-check QEMU command anyway, but genuinely releasing the
@@ -563,6 +595,57 @@ jobs:
           echo "target_after=${TARGET_AFTER}" >> "$GITHUB_OUTPUT"
           echo "REAL_PROTECTED_DISK_SHA256_AFTER=${PROTECTED_AFTER}"
           echo "REAL_TARGET_DISK_SHA256_AFTER=${TARGET_AFTER}"
+
+      # S7.1R4 Section 8: the post-install counterpart to "Hash
+      # protected disk (pre-install baseline)" above - same three
+      # separately-measured facts, now AFTER the real install attempt.
+      # Diagnostic only - never gates anything; comparing this step's
+      # `protected_logical_sha256`/sentinel outputs against
+      # `protected-hash-before`'s is what actually distinguishes
+      # container-level-only mutation from real guest-visible block
+      # mutation (Section 8's central distinction), for a human or a
+      # future corrective to read from the uploaded evidence - this
+      # workflow does not yet auto-classify that distinction into a
+      # gate (Section 16: never silently change the safety contract's
+      # semantics without explicit spec justification).
+      - name: Hash protected disk (post-install)
+        id: protected-hash-after
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/hash-protected-disk.sh \
+            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT"
+
+      # S7.1R4 Section 8: persist the before/after comparison as a real
+      # evidence FILE (not merely step outputs visible only in job
+      # logs), so a human reviewing the downloaded artifact can see the
+      # container-vs-logical-vs-sentinel distinction directly. Purely
+      # diagnostic - written unconditionally whenever both measurements
+      # ran, never gates anything.
+      - name: Compare protected-disk measurements
+        if: always() && steps.protected-hash-after.outcome == 'success'
+        run: |
+          {
+            echo "protected_container_sha256_before=${{ steps.protected-hash-before.outputs.protected_container_sha256 }}"
+            echo "protected_container_sha256_after=${{ steps.protected-hash-after.outputs.protected_container_sha256 }}"
+            echo "protected_logical_sha256_before=${{ steps.protected-hash-before.outputs.protected_logical_sha256 }}"
+            echo "protected_logical_sha256_after=${{ steps.protected-hash-after.outputs.protected_logical_sha256 }}"
+            echo "protected_esp_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.protected_esp_sentinel_sha256 }}"
+            echo "protected_esp_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.protected_esp_sentinel_sha256 }}"
+            echo "protected_data_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.protected_data_sentinel_sha256 }}"
+            echo "protected_data_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.protected_data_sentinel_sha256 }}"
+            if [ "${{ steps.protected-hash-before.outputs.protected_container_sha256 }}" != \
+                 "${{ steps.protected-hash-after.outputs.protected_container_sha256 }}" ]; then
+              echo "protected_container_changed=true"
+            else
+              echo "protected_container_changed=false"
+            fi
+            if [ "${{ steps.protected-hash-before.outputs.protected_logical_sha256 }}" != \
+                 "${{ steps.protected-hash-after.outputs.protected_logical_sha256 }}" ]; then
+              echo "protected_logical_changed=true"
+            else
+              echo "protected_logical_changed=false"
+            fi
+          } | tee dist/installer-fixtures/protected-disk-diagnostic.env
 
       - name: "Disk usage: after_install"
         if: always()
@@ -730,6 +813,8 @@ jobs:
             dist/installer-fixtures/qa-install-qemu-stdout.log
             dist/installer-fixtures/qa-install-qemu-stderr.log
             dist/installer-fixtures/qa-install-qemu-result.env
+            dist/installer-fixtures/qa-install-subiquity-signals.log
+            dist/installer-fixtures/protected-disk-diagnostic.env
             dist/installer-fixtures/installed-boot/installed-boot-serial.log
           if-no-files-found: warn
           retention-days: 14

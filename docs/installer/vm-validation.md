@@ -143,6 +143,52 @@ installed target boots on its own (no install medium, self-contained
 All of this is real, hash-based, filesystem-inspected evidence - never
 inferred merely from installer log text or an overall QEMU exit code.
 
+## Protected-disk diagnostic instrumentation (S7.1R4)
+
+Real Layer-B runs #3 and #4 both showed the protected qcow2's
+CONTAINER hash changing. The pre-existing measurement
+(`sha256sum` on the raw qcow2 file, still the one that actually gates
+closure via `protected_disk_hash_unchanged`) cannot by itself
+distinguish a real guest-visible content change from a qcow2-format
+container-level artifact (e.g. lazy-refcount/dirty-bit bookkeeping
+that can occur purely from a qcow2 image being opened for write
+access, independent of any guest I/O).
+
+`installer/scripts/hash-protected-disk.sh` (called both immediately
+before and immediately after the real install attempt) separately
+measures:
+
+- `protected_container_sha256` - the existing raw-file measurement
+- `protected_logical_sha256` - the FULL guest-visible logical block
+  content, read via a read-only `qemu-nbd` connection (never a
+  mount, never partial)
+- `protected_esp_sentinel_sha256` / `protected_data_sentinel_sha256` -
+  the two real sentinel files `create-fixture-disks.sh` writes, read
+  via a read-only mount (`-o ro,noload` for the ext4 data partition
+  specifically, so even a read-only mount can never silently replay a
+  dirty journal onto the block device)
+
+This is purely diagnostic - it does not change what the closure gate
+enforces (Section 16 of the S7.1R4 corrective: never silently
+reinterpret the safety contract's semantics without explicit
+justification from a real run's evidence). The before/after comparison
+is persisted as `protected-disk-diagnostic.env` in the uploaded
+evidence artifact.
+
+Separately, `installer/scripts/run-qa-install.sh` now attaches the
+protected qcow2 backend `readonly=on` (Run #4 proved it was previously
+opened read-write by both the bounded startup probe and the real timed
+run) - independently, architecturally correct regardless of the exact
+causal mechanism, and closes off every QEMU-side write vector to that
+disk categorically.
+
+`installer/scripts/extract-installer-signals.sh` extracts a narrowly
+scoped, targeted set of Subiquity/curtin/autoinstall/cloud-init/error
+lines from the real serial log into
+`qa-install-subiquity-signals.log`, so a future run's evidence
+highlights the handful of lines that actually matter without requiring
+a human to search a 400+KB raw transcript by hand.
+
 ## What this development environment can and cannot prove
 
 This repository's development environment has no `qemu-img`/

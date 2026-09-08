@@ -18,6 +18,7 @@ exercised here - see ``docs/installer/known-limitations.md``.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -1487,6 +1488,52 @@ class TestInstallerSmokeWorkflow:
             assert "artifact_release_failed" in step["run"]
             assert "exit 1" not in step["run"]
 
+    # -- S7.1R4 Section 8-10: protected-disk diagnostic instrumentation --
+
+    def test_protected_disk_hashed_before_and_after_install(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        names = [s.get("name") for s in steps]
+        before_idx = names.index("Hash protected disk (pre-install baseline)")
+        install_idx = names.index("Run real QA autoinstall")
+        after_idx = names.index("Hash protected disk (post-install)")
+        assert before_idx < install_idx < after_idx
+
+    def test_protected_hash_steps_always_run(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        before = next(
+            s for s in steps if s.get("name") == "Hash protected disk (pre-install baseline)"
+        )
+        after = next(s for s in steps if s.get("name") == "Hash protected disk (post-install)")
+        assert before.get("if", "").startswith("always()")
+        assert after.get("if", "").startswith("always()")
+
+    def test_extract_signals_step_present_and_always_runs(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        step = next(
+            s for s in steps if s.get("name") == "Extract installer signals from serial log"
+        )
+        assert step.get("if") == "always()"
+
+    def test_new_evidence_files_uploaded(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        paths = upload["with"]["path"]
+        assert "dist/installer-fixtures/qa-install-subiquity-signals.log" in paths
+        assert "dist/installer-fixtures/protected-disk-diagnostic.env" in paths
+
+    def test_new_diagnostic_hashes_never_gate_closure(self, workflow):
+        # Section 16: never silently change the safety contract's
+        # semantics - the new protected-disk diagnostic hashing must
+        # never feed the evidence-assembly step's own ARGS (the
+        # existing container-hash-based closure gate stays exactly
+        # unchanged; this new instrumentation is additive/diagnostic
+        # only, uploaded as its own separate file).
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        assemble = next(s for s in steps if s.get("name") == "Assemble Installer Layer-B evidence")
+        assert "protected-hash-before" not in assemble["run"]
+        assert "protected-hash-after" not in assemble["run"]
+        assert "protected_logical_sha256" not in assemble["run"]
+
 
 # ---------------------------------------------------------------------------
 # S7.1R: real disk-preflight script execution (Tests A4-A5)
@@ -1794,6 +1841,27 @@ class TestRunQaInstallScript:
             if "/dev/vd" in line:
                 assert line.strip().startswith("#"), line
 
+    # -- S7.1R4 Corrective A (Test A8): protected backend is read-only --
+
+    def test_a8_protected_backend_is_readonly_target_remains_writable(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        protected_line = next(
+            li for li in text.splitlines() if "id=serein_protected_backend" in li
+        )
+        assert "readonly=on" in protected_line
+        target_line = next(li for li in text.splitlines() if "id=serein_target_backend" in li)
+        assert "readonly=on" not in target_line
+
+    def test_a8_readonly_applies_to_both_probe_and_real_run(self):
+        # QEMU_ARGS is a single shared array used by both the bounded
+        # startup probe and the real timed run below it - readonly=on
+        # must therefore apply to both automatically (Section 9).
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        args_block = text.split("QEMU_ARGS=(")[1].split(")\n")[0]
+        assert "readonly=on" in args_block
+        assert "qemu-system-x86_64 \"${QEMU_ARGS[@]}\"" in text  # probe invocation
+        assert text.count('qemu-system-x86_64 "${QEMU_ARGS[@]}"') >= 2  # probe + real run
+
     # -- Corrective B (Tests B1-B5): startup evidence --
 
     def test_b1_qemu_parser_failure_retains_diagnostics(self, tmp_path):
@@ -1914,6 +1982,188 @@ class TestReleaseArtifactScript:
     def test_e4_traversal_path_refused(self, tmp_path):
         result = self._run(tmp_path, "../outside.txt")
         assert result.returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# S7.1R4 Section 8: installer/scripts/hash-protected-disk.sh - real
+# bash execution against stub sudo/qemu-nbd/blkid/partprobe/dd tools
+# ---------------------------------------------------------------------------
+
+
+class TestHashProtectedDiskScript:
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "hash-protected-disk.sh"
+    _FAKE_LOGICAL_CONTENT = b"FAKE_LOGICAL_CONTENT"
+
+    def _run(
+        self, tmp_path: Path, protected_content: bytes = b"fake protected qcow2 bytes"
+    ) -> tuple[subprocess.CompletedProcess, Path]:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for name, body in {
+            "sudo": '#!/usr/bin/env bash\nexec "$@"\n',
+            "modprobe": "#!/usr/bin/env bash\nexit 0\n",
+            "qemu-nbd": "#!/usr/bin/env bash\nexit 0\n",
+            "partprobe": "#!/usr/bin/env bash\nexit 0\n",
+            # No real nbd block device exists in this sandbox - blkid
+            # never gets a real path to inspect anyway ([ -b ... ]
+            # already fails first), but fail closed here too.
+            "blkid": "#!/usr/bin/env bash\nexit 1\n",
+            "dd": (
+                "#!/usr/bin/env bash\n"
+                f"printf '%s' '{self._FAKE_LOGICAL_CONTENT.decode()}'\n"
+            ),
+        }.items():
+            script = bin_dir / name
+            script.write_text(body)
+            script.chmod(0o755)
+
+        protected = tmp_path / "disk-protected.qcow2"
+        protected.write_bytes(protected_content)
+
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT), str(protected)],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+        )
+        return result, protected
+
+    def _outputs(self, stdout: str) -> dict[str, str]:
+        # .lstrip("\\"): GNU sha256sum prefixes its output hash with a
+        # literal backslash when the filename needs escaping (e.g. a
+        # Windows-style path containing backslashes, as this test
+        # sandbox produces on this dev host) - never happens on real
+        # Linux CI, where paths never contain backslashes, but this
+        # test must tolerate it to assert the real hash value either
+        # way.
+        return {
+            k: v.lstrip("\\")
+            for k, v in (line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+        }
+
+    def test_container_hash_matches_real_sha256sum(self, tmp_path):
+        content = b"exact real protected fixture bytes"
+        result, _protected = self._run(tmp_path, content)
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs = self._outputs(result.stdout)
+        assert outputs["protected_container_sha256"] == hashlib.sha256(content).hexdigest()
+
+    def test_logical_hash_computed_from_readonly_nbd_read(self, tmp_path):
+        result, _protected = self._run(tmp_path)
+        outputs = self._outputs(result.stdout)
+        assert outputs["protected_logical_sha256"] == hashlib.sha256(
+            self._FAKE_LOGICAL_CONTENT
+        ).hexdigest()
+
+    def test_container_and_logical_hashes_are_independent_measurements(self, tmp_path):
+        # The central Section 8 distinction - these two hashes come
+        # from genuinely different sources (the raw file vs. the fake
+        # nbd read) and must never accidentally collapse into one
+        # measurement.
+        result, _protected = self._run(tmp_path, b"container bytes differ from logical bytes")
+        outputs = self._outputs(result.stdout)
+        assert outputs["protected_container_sha256"] != outputs["protected_logical_sha256"]
+
+    def test_no_block_device_means_sentinels_absent_not_fabricated(self, tmp_path):
+        # No real /dev/nbdXp1/p2 block device exists in this sandbox -
+        # must honestly report absent, never fabricate a sentinel hash.
+        result, _protected = self._run(tmp_path)
+        outputs = self._outputs(result.stdout)
+        assert outputs["protected_esp_sentinel_present"] == "false"
+        assert outputs["protected_esp_sentinel_sha256"] == ""
+        assert outputs["protected_data_sentinel_present"] == "false"
+        assert outputs["protected_data_sentinel_sha256"] == ""
+
+    def test_missing_required_tool_fails_closed(self, tmp_path):
+        bash_path = shutil.which("bash")
+        if bash_path is None:
+            pytest.skip("bash not available in this environment")
+        protected = tmp_path / "disk-protected.qcow2"
+        protected.write_bytes(b"x")
+        empty_bin = tmp_path / "empty-bin"
+        empty_bin.mkdir()
+        env = dict(os.environ)
+        env["PATH"] = str(empty_bin)  # deliberately no tools at all
+        result = subprocess.run(
+            [bash_path, str(self.SCRIPT), str(protected)],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode != 0
+
+    def test_qemu_nbd_connected_readonly(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        connect_line = next(li for li in text.splitlines() if "qemu-nbd --connect=" in li)
+        assert "--read-only" in connect_line
+
+    def test_ext4_mount_uses_noload_never_replays_journal(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        assert "ro,noload" in text
+
+    def test_never_mounts_read_write(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if re.match(r"\s*(sudo )?mount ", line.strip()):
+                assert "-o ro" in line, line
+
+
+# ---------------------------------------------------------------------------
+# S7.1R4 Section 10: installer/scripts/extract-installer-signals.sh
+# ---------------------------------------------------------------------------
+
+
+class TestExtractInstallerSignalsScript:
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "extract-installer-signals.sh"
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), *args], capture_output=True, text=True, timeout=15
+        )
+
+    def test_extracts_matching_lines_only(self, tmp_path):
+        serial = tmp_path / "serial.log"
+        serial.write_text(
+            "boot line one\n"
+            "subiquity server starting\n"
+            "irrelevant line\n"
+            "curtin: install begins\n"
+            "another irrelevant line\n"
+            "ERROR: something failed\n"
+        )
+        output = tmp_path / "signals.log"
+        result = self._run([str(serial), str(output)])
+        assert result.returncode == 0
+        text = output.read_text()
+        assert "subiquity server starting" in text
+        assert "curtin: install begins" in text
+        assert "ERROR: something failed" in text
+        assert "irrelevant line" not in text
+        assert "boot line one" not in text
+
+    def test_missing_serial_log_handled_honestly(self, tmp_path):
+        output = tmp_path / "signals.log"
+        result = self._run([str(tmp_path / "does-not-exist.log"), str(output)])
+        assert result.returncode == 0
+        assert "no serial log present" in output.read_text()
+
+    def test_no_matches_handled_honestly(self, tmp_path):
+        serial = tmp_path / "serial.log"
+        serial.write_text("nothing relevant here\njust boot noise\n")
+        output = tmp_path / "signals.log"
+        result = self._run([str(serial), str(output)])
+        assert result.returncode == 0
+        assert "no subiquity/curtin/autoinstall" in output.read_text()
+
+    def test_never_fails_the_job_regardless_of_match_outcome(self, tmp_path):
+        for content in ("no matches here\n", "subiquity: real match\n"):
+            serial = tmp_path / "serial.log"
+            serial.write_text(content)
+            output = tmp_path / "signals.log"
+            result = self._run([str(serial), str(output)])
+            assert result.returncode == 0
 
 
 # ---------------------------------------------------------------------------

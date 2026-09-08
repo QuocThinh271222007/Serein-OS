@@ -114,10 +114,28 @@ RUN_STARTED_GRACE_SECONDS="${SEREIN_TEST_RUN_STARTED_GRACE_SECONDS:-2}"
 # deterministic id per pair, never a QEMU-generated id, never possible
 # to swap protected<->target serials by construction (each serial is
 # hardcoded onto its own named device, never derived positionally).
+#
+# S7.1R4 Corrective A: the protected backend is now attached
+# `readonly=on` (real Run #4, RUN_ID=34239853849, proved the protected
+# qcow2's CONTAINER hash changed for the second consecutive real run,
+# while the target's did not - and this line, without `readonly=on`,
+# is the exact point QEMU opens the protected image for write access,
+# in BOTH the bounded startup probe below and the real timed run).
+# `readonly=on` closes off every QEMU-side write vector categorically
+# (guest-triggered writes, qcow2's own internal lazy-refcount/dirty-bit
+# bookkeeping on open/close) - never merely inferred to help, but a
+# real, structural QEMU block-layer guarantee. This is independently,
+# architecturally correct regardless of root cause: a disk that exists
+# ONLY to prove the installer will never touch it should never be
+# opened for write access by ANY component in the first place -
+# defense-in-depth, not merely a hash-greening trick. Read-only access
+# remains fully sufficient for the guest to discover, identify by
+# serial, and correctly reject this disk as non-target (no component
+# needs write access merely to probe/enumerate a disk).
 QEMU_ARGS=(
     -m 4096 -smp 2 -accel "${ACCEL}"
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}"
-    -drive if=none,id=serein_protected_backend,format=qcow2,file="${PROTECTED_DISK}"
+    -drive if=none,id=serein_protected_backend,format=qcow2,file="${PROTECTED_DISK}",readonly=on
     -device virtio-blk-pci,id=serein_protected_device,drive=serein_protected_backend,serial=SEREIN-PROTECTED-DISK
     -drive if=none,id=serein_target_backend,format=qcow2,file="${TARGET_DISK}"
     -device virtio-blk-pci,id=serein_target_device,drive=serein_target_backend,serial=SEREIN-TARGET-DISK
