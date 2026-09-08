@@ -167,3 +167,13 @@ jobs:
           # is required, and no systemd/cgroup mutation ever occurs.
           serein focus doctor
           serein focus doctor --json | python -c "import json,sys; json.load(sys.stdin)"
+
+      - name: Distribution CLI smoke test
+        run: |
+          # Read-only only - never fetches or builds (Section 78 of the
+          # S7.0 contract). No multi-GB download happens in this job;
+          # see iso-smoke.yml for the separate, manually-triggered real
+          # ISO build/boot validation workflow.
+          serein distribution status
+          serein distribution inspect distribution/test-fixtures/extracted-tree-ok
+          serein distribution inspect distribution/test-fixtures/extracted-tree-ok --json | python -c "import json,sys; json.load(sys.stdin)"

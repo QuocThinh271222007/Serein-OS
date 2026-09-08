@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "distribution": "ubuntu",
+  "release": "26.04",
+  "point_release": "26.04.1",
+  "codename": "resolute",
+  "architecture": "amd64",
+  "edition": "desktop",
+  "source": "official-ubuntu-release",
+  "filename": "ubuntu-26.04.1-desktop-amd64.iso",
+  "download_url": "https://releases.ubuntu.com/26.04/ubuntu-26.04.1-desktop-amd64.iso",
+  "sha256": "601e30fbf5d97759367c632e2c33630665039b7e2158fd068403da3ccf1bda1f",
+  "size_bytes": null,
+  "sha256sums_url": "https://releases.ubuntu.com/26.04/SHA256SUMS",
+  "signature_url": "https://releases.ubuntu.com/26.04/SHA256SUMS.gpg",
+  "signing_key_fingerprint": "843938DF228D22F7B3742BC0D94AA3F0EFE21092",
+  "signing_key_source": "https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0x843938DF228D22F7B3742BC0D94AA3F0EFE21092 (Ubuntu CD Image Automatic Signing Key (2012) <cdimage@ubuntu.com>)",
+  "verified": false,
+  "verified_at": null,
+  "notes": "SHA256SUMS and SHA256SUMS.gpg were downloaded directly from releases.ubuntu.com on 2026-09-07 during S7.0 research (raw curl, not summarized through any intermediate tool). The signing key was fetched by exact fingerprint from keyserver.ubuntu.com and `gpg --verify SHA256SUMS.gpg SHA256SUMS` reported a Good signature from that key - so the pinned `sha256` value above is proven authentic/untampered from Canonical's own publication chain, not guessed. That is NOT the same claim as `verified: true`: the actual 6.0 GB ISO itself has never been downloaded or hashed in this environment, so `verified` stays false and `verified_at` stays null until `verify-base-image.sh` (or `serein.distribution.base.verify_base_image`) actually runs against the real downloaded file - see docs/distribution/known-limitations.md and docs/distribution/security.md for the exact trust-chain evidence."
+}

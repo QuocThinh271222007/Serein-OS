@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "release_channel": "alpha",
+  "build_schema": 1,
+  "volume_id": "SEREIN_ALPHA",
+  "iso_filename_template": "serein-alpha-{release}-{arch}.iso",
+  "required_tools": [
+    "xorriso",
+    "python3",
+    "curl",
+    "jq"
+  ],
+  "optional_tools": [
+    "gpg",
+    "qemu-system-x86_64"
+  ],
+  "notes": "required_tools lists only what the current pipeline (extract via `xorriso -osirrox on`, rebuild via `xorriso -as mkisofs`) actually invokes - see docs/distribution/iso-build.md. squashfs-tools/mtools/dosfstools are NOT required because S7.0 does not modify the SquashFS live filesystem or any FAT/EFI partition contents; it only extracts the ISO9660 tree, applies the allowlisted overlay, and rebuilds with xorriso, preserving the base image's own live-filesystem and EFI partition bytes unchanged (Sections 34-36). rsync/jq are not required either - see docs/distribution/known-limitations.md for why the Section 19 tool list was trimmed rather than blanket-required."
+}

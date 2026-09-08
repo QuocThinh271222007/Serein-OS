@@ -1,0 +1,16 @@
+{
+  "entries": [
+    {
+      "path": "hello.txt",
+      "sha256": "45fe6ae78b55f3b6503b5bddf895de59117a9bb30fdc8d7fe7387e9bfd3c5c42",
+      "size_bytes": 34
+    }
+  ],
+  "entry_count": 1,
+  "generated_from": [
+    "fixture"
+  ],
+  "schema_version": 1,
+  "source_commit": "0000000000000000000000000000000000000000",
+  "total_bytes": 34
+}

@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/distribution-build-manifest.schema.json",
+  "title": "Serein Distribution Build Manifest",
+  "description": "Recorded alongside every successfully built Serein ISO as `<iso>.manifest.json`. Identifies exactly what went into the image (Serein commit, base ISO, payload, builder/overlay versions) and what came out (output sha256, boot validation status if performed). Deliberately excludes any host-identifying field (username, absolute home path, hostname) - see docs/distribution/security.md.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "release_channel",
+    "source_commit",
+    "build_schema",
+    "builder_version",
+    "overlay_version",
+    "base",
+    "payload_manifest_sha256",
+    "output",
+    "boot_validation"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "release_channel": { "type": "string", "enum": ["alpha"] },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "build_schema": { "type": "integer", "minimum": 1 },
+    "builder_version": { "type": "string", "minLength": 1 },
+    "overlay_version": { "type": "string", "minLength": 1 },
+    "source_date_epoch": { "type": ["integer", "null"], "minimum": 0 },
+    "base": {
+      "type": "object",
+      "required": ["distribution", "release", "architecture", "edition", "sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "distribution": { "const": "ubuntu" },
+        "release": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "enum": ["amd64"] },
+        "edition": { "type": "string", "enum": ["desktop", "server"] },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "payload_manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "output": {
+      "type": "object",
+      "required": ["filename", "sha256", "size_bytes", "volume_id"],
+      "additionalProperties": false,
+      "properties": {
+        "filename": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "volume_id": { "type": "string", "minLength": 1, "maxLength": 32 }
+      }
+    },
+    "boot_validation": {
+      "type": "object",
+      "required": ["status", "method"],
+      "additionalProperties": false,
+      "properties": {
+        "status": { "type": "string", "enum": ["not_performed", "pass", "fail"] },
+        "method": { "type": ["string", "null"] },
+        "evidence": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

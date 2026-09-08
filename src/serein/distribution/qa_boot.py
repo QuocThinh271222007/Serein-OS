@@ -1,0 +1,357 @@
+"""QA-only serial boot variant (S7.0R Corrective B; storage-efficient
+in-place transition added by S7.0RM Corrective A; safe read-only-file
+writability handling added by S7.0RM5 Corrective A).
+
+A template GRUB entry existing in Git (``distribution/boot/qa-serial-entry.cfg``)
+never proves the *built* media actually selects it - this module makes
+that real. It patches the discovered GRUB boot configuration to:
+
+- add a new, distinctly-titled QA menu entry that reuses the *real*
+  ``linux``/``initrd`` paths found in the base image's own default
+  entry (never guessed),
+- route console output to the serial port (``console=ttyS0,115200n8``),
+- select that entry automatically (``set default=0`` + a short
+  ``set timeout``) so the boot-smoke harness never needs keyboard
+  automation,
+- never add ``autoinstall`` and never touch any disk target.
+
+GRUB config discovery is fail-closed (Section 14): if none of the
+known candidate paths exist in the extracted tree,
+:func:`discover_grub_config` raises :class:`QaBootError` rather than
+guessing a path from an old tutorial.
+
+Two ways to apply this:
+
+- :func:`transition_to_qa_in_place` (used by
+  ``serein.distribution.build.run_build`` as of S7.0RM) - patches the
+  **same** extraction directory the canonical production ISO was
+  already, immutably, built from. This is the storage-efficient path a
+  real CI runner needs (Section 6-7 of the S7.0RM corrective): no
+  second multi-GB tree copy. Safe only because the production ISO's
+  bytes are already finalized before this ever runs, and because every
+  file outside the one GRUB config (plus an internal checksum catalog,
+  if present) is hash-verified unchanged before vs. after - any
+  unexpected mutation of the SquashFS, kernel, initramfs, payload, or
+  wheel raises :class:`QaProtectedFileMutationError` rather than
+  silently shipping corrupted QA media.
+- :func:`prepare_qa_variant` - the original copy-based transform,
+  still available (and still tested) for callers that specifically
+  want an independent QA tree rather than mutating the production
+  extraction (e.g. exploratory local use).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import shutil
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+from serein.distribution.pathsafety import PathSafetyError, resolve_within
+
+#: Candidate GRUB config locations, most to least common on a modern
+#: Ubuntu Desktop hybrid ISO's ISO9660 tree. Checked in order; the
+#: first that exists wins. Never assumed present without checking
+#: (Section 14).
+GRUB_CONFIG_CANDIDATES: tuple[str, ...] = (
+    "boot/grub/grub.cfg",
+    "boot/grub/loopback.cfg",
+    "EFI/boot/grub.cfg",
+    "efi/boot/grub.cfg",
+)
+
+_MENUENTRY_RE = re.compile(r'menuentry\s+["\']([^"\']*)["\'][^{]*\{', re.IGNORECASE)
+_LINUX_LINE_RE = re.compile(r"^(\s*linux(?:efi)?\s+)(\S+)(.*)$", re.IGNORECASE | re.MULTILINE)
+_INITRD_LINE_RE = re.compile(r"^(\s*initrd(?:efi)?\s+)(\S+)(.*)$", re.IGNORECASE | re.MULTILINE)
+
+QA_ENTRY_TITLE = "Serein Alpha (qa-serial-boot-smoke)"
+
+
+class QaBootError(ValueError):
+    """Raised when a QA boot variant cannot be safely prepared - e.g.
+    no known GRUB config candidate exists in the extracted tree
+    (``QA_BUILD=BLOCKED``, never guessed - Section 14)."""
+
+
+class QaProtectedFileMutationError(ValueError):
+    """Raised when an in-place QA transition would touch (or did touch)
+    a file outside the explicit GRUB-config/checksum-catalog allowlist
+    - e.g. the SquashFS, kernel, initramfs, payload, or wheel. Fail
+    closed rather than ship media whose non-boot-config content
+    silently diverged from what production inspection already
+    verified."""
+
+
+def _confine(extracted_dir: Path, relative: str) -> Path:
+    """Resolve ``relative`` against ``extracted_dir``, failing closed
+    (:class:`QaBootError` - ``QA_TRANSITION=BLOCKED``) if it does not
+    resolve inside the extraction root - e.g. a symlink whose target
+    escapes the tree (S7.0RM5 Corrective A/Section 7). Never chmods or
+    writes a path outside the extraction root."""
+    try:
+        return resolve_within(extracted_dir, relative)
+    except PathSafetyError as exc:
+        raise QaBootError(
+            f"QA_TRANSITION=BLOCKED: {relative!r} escapes the extraction root: {exc}"
+        ) from exc
+
+
+@contextmanager
+def _temporarily_owner_writable(path: Path) -> Iterator[None]:
+    """Ensure ``path`` has its owner-write bit set for the duration of
+    this context, then restore its exact original mode afterward - even
+    if the body raises (S7.0RM5 Corrective A/Section 6).
+
+    A real Ubuntu ISO extraction can preserve a non-owner-writable mode
+    on individual files (the real defect this corrective fixes - a real
+    Layer-B run hit ``PermissionError`` writing the discovered
+    ``boot/grub/grub.cfg``). This narrowly unblocks writing to exactly
+    the one already-path-confined file passed in - never a recursive
+    ``chmod``, and the final QA tree never retains a newly-added
+    writable bit that was not present in the original extraction.
+    """
+    original_mode = stat.S_IMODE(path.stat().st_mode)
+    try:
+        if not original_mode & stat.S_IWUSR:
+            path.chmod(original_mode | stat.S_IWUSR)
+        yield
+    finally:
+        path.chmod(original_mode)
+
+
+@dataclass(frozen=True)
+class QaTransitionResult:
+    """Result of :func:`transition_to_qa_in_place` - no
+    ``qa_extracted_dir`` field, since it is the same directory the
+    production ISO was already built from."""
+
+    grub_config_relative_path: str
+    qa_entry_title: str
+    checksum_catalog_updated: bool
+
+
+def _protected_file_manifest(extracted_dir: Path, excluded_relative: set[str]) -> dict[str, str]:
+    """sha256 of every file under ``extracted_dir`` except the paths in
+    ``excluded_relative`` - deliberately generic (every file, not a
+    named list of "kernel"/"squashfs" paths) so it catches an
+    unexpected mutation anywhere, not only in the specific files this
+    module happens to know about."""
+    import hashlib
+
+    manifest: dict[str, str] = {}
+    for path in sorted(extracted_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(extracted_dir).as_posix()
+        if relative in excluded_relative:
+            continue
+        manifest[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return manifest
+
+
+def transition_to_qa_in_place(extracted_dir: Path) -> QaTransitionResult:
+    """Patch ``extracted_dir`` (the SAME directory the canonical
+    production ISO was already, immutably, built from) into QA boot
+    form, storage-efficiently - no second multi-GB tree copy
+    (S7.0RM Corrective A).
+
+    Every file except the discovered GRUB config and an internal
+    checksum catalog (if present) is hash-verified byte-identical
+    before and after - any other change raises
+    :class:`QaProtectedFileMutationError` and leaves the caller unable
+    to proceed to a QA rebuild on unverified content.
+    """
+    grub_relative = discover_grub_config(extracted_dir)
+    catalog_relative = "md5sum.txt"
+    excluded = {grub_relative, catalog_relative}
+
+    before = _protected_file_manifest(extracted_dir, excluded)
+
+    grub_path = _confine(extracted_dir, grub_relative)
+    original_text = grub_path.read_text(encoding="utf-8")
+    qa_entry_text = derive_qa_menuentry(original_text)
+    patched_text = install_qa_entry_as_default(original_text, qa_entry_text)
+    with _temporarily_owner_writable(grub_path):
+        grub_path.write_text(patched_text, encoding="utf-8")
+
+    catalog_updated = update_checksum_catalog_if_present(extracted_dir, grub_relative)
+
+    after = _protected_file_manifest(extracted_dir, excluded)
+    if before != after:
+        differing = {k for k in before if before[k] != after.get(k)}
+        changed = sorted(set(before) ^ set(after) | differing)
+        raise QaProtectedFileMutationError(
+            f"QA transition modified protected files it must never touch: {changed}"
+        )
+
+    return QaTransitionResult(
+        grub_config_relative_path=grub_relative,
+        qa_entry_title=QA_ENTRY_TITLE,
+        checksum_catalog_updated=catalog_updated,
+    )
+
+
+@dataclass(frozen=True)
+class QaVariantResult:
+    qa_extracted_dir: Path
+    grub_config_relative_path: str
+    qa_entry_title: str
+    checksum_catalog_updated: bool
+
+
+def discover_grub_config(extracted_dir: Path) -> str:
+    """Return the relative path (POSIX) of the first existing GRUB
+    config candidate. Raises :class:`QaBootError` if none exist -
+    fail-closed candidate discovery, never a hardcoded assumption."""
+    for candidate in GRUB_CONFIG_CANDIDATES:
+        if (extracted_dir / candidate).is_file():
+            return candidate
+    raise QaBootError(
+        f"no known GRUB config candidate found under {extracted_dir} "
+        f"(checked {GRUB_CONFIG_CANDIDATES}) - QA_BUILD=BLOCKED"
+    )
+
+
+def _remove_quiet(args: str) -> str:
+    """Drop a standalone ``quiet`` kernel-cmdline token (Section 15
+    prefers status-visible boot for positive-marker capture) without
+    disturbing anything else on the line, including a trailing ``---``
+    init-arg separator."""
+    return re.sub(r"(?<!\S)quiet(?!\S)\s*", "", args)
+
+
+def _add_serial_console(args: str, token: str = "console=ttyS0,115200n8") -> str:
+    """Insert ``token`` as a kernel boot parameter - i.e. *before* a
+    ``---`` separator if one is present, never after it (anything after
+    ``---`` is passed to the init process, not the kernel, on a casper
+    live boot line)."""
+    if token in args:
+        return args
+    if "---" in args:
+        before, sep, after = args.partition("---")
+        return f"{before.rstrip()} {token} {sep}{after}"
+    return f"{args.rstrip()} {token}"
+
+
+def derive_qa_menuentry(grub_cfg_text: str, qa_entry_title: str = QA_ENTRY_TITLE) -> str:
+    """Build a new QA menu-entry block reusing the real ``linux``/
+    ``initrd`` lines from the first existing production entry, with
+    serial routing added and ``quiet`` removed (Section 15). Never
+    invents a kernel/initrd path - raises :class:`QaBootError` if no
+    ``menuentry`` with both a ``linux``/``linuxefi`` and an
+    ``initrd``/``initrdefi`` line can be found to derive from."""
+    matches = list(_MENUENTRY_RE.finditer(grub_cfg_text))
+    if not matches:
+        raise QaBootError("no menuentry block found to derive a QA entry from")
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(grub_cfg_text)
+        body = grub_cfg_text[start:end]
+
+        linux_match = _LINUX_LINE_RE.search(body)
+        initrd_match = _INITRD_LINE_RE.search(body)
+        if not linux_match or not initrd_match:
+            continue
+
+        linux_directive, linux_path, linux_args = linux_match.groups()
+        initrd_directive, initrd_path, initrd_args = initrd_match.groups()
+
+        args = _add_serial_console(_remove_quiet(linux_args))
+        if "autoinstall" in args:
+            raise QaBootError(
+                "refusing to derive a QA entry from a production entry that already "
+                "carries autoinstall - this would need explicit human review"
+            )
+
+        return (
+            f'menuentry "{qa_entry_title}" {{\n'
+            f"{linux_directive}{linux_path}{args}\n"
+            f"{initrd_directive}{initrd_path}{initrd_args}\n"
+            f"}}\n"
+        )
+
+    raise QaBootError(
+        "no menuentry with both a linux and initrd line found to derive a QA entry from"
+    )
+
+
+def install_qa_entry_as_default(grub_cfg_text: str, qa_entry_text: str) -> str:
+    """Prepend the QA entry and force it to boot automatically -
+    ``set default=0`` + a short ``set timeout`` (Section 17: "QA
+    variant sets QA entry as temporary default"), never relying on
+    keyboard automation."""
+    prelude = 'set default="0"\nset timeout=1\n\n'
+    body_without_defaults = re.sub(r"^set default=.*$", "", grub_cfg_text, flags=re.MULTILINE)
+    body_without_defaults = re.sub(
+        r"^set timeout=.*$", "", body_without_defaults, flags=re.MULTILINE
+    )
+    return prelude + qa_entry_text + "\n" + body_without_defaults
+
+
+def update_checksum_catalog_if_present(tree_root: Path, modified_relative_path: str) -> bool:
+    """If ``tree_root`` contains a top-level ``md5sum.txt`` (Ubuntu's
+    real internal checksum catalog - Section 18), recompute the
+    modified file's line so no stale checksum remains. Returns whether
+    a catalog was found and updated - ``False`` (not an error) if no
+    catalog exists at that conventional path, since not every base
+    image is guaranteed to ship one there.
+    """
+    catalog_path = tree_root / "md5sum.txt"
+    if not catalog_path.is_file():
+        return False
+    catalog_path = _confine(tree_root, "md5sum.txt")
+
+    normalized_target = modified_relative_path.lstrip("./")
+    lines = catalog_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    updated = False
+    new_lines = []
+    for line in lines:
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            _old_hash, entry_path = parts
+            if entry_path.strip().lstrip("./") == normalized_target:
+                new_digest = hashlib.md5(  # noqa: S324 - matching Ubuntu's own md5sum.txt format
+                    (tree_root / normalized_target).read_bytes()
+                ).hexdigest()
+                new_lines.append(f"{new_digest}  ./{normalized_target}")
+                updated = True
+                continue
+        new_lines.append(line)
+
+    if updated:
+        with _temporarily_owner_writable(catalog_path):
+            catalog_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return updated
+
+
+def prepare_qa_variant(extracted_dir: Path, qa_extracted_dir: Path) -> QaVariantResult:
+    """Copy the already-assembled production extraction tree and patch
+    only its GRUB boot configuration to add and auto-select a QA serial
+    entry. The production tree at ``extracted_dir`` is never modified.
+    """
+    if qa_extracted_dir.exists():
+        shutil.rmtree(qa_extracted_dir)
+    shutil.copytree(extracted_dir, qa_extracted_dir)
+
+    grub_relative = discover_grub_config(qa_extracted_dir)
+    grub_path = _confine(qa_extracted_dir, grub_relative)
+    original_text = grub_path.read_text(encoding="utf-8")
+
+    qa_entry_text = derive_qa_menuentry(original_text)
+    patched_text = install_qa_entry_as_default(original_text, qa_entry_text)
+    with _temporarily_owner_writable(grub_path):
+        grub_path.write_text(patched_text, encoding="utf-8")
+
+    catalog_updated = update_checksum_catalog_if_present(qa_extracted_dir, grub_relative)
+
+    return QaVariantResult(
+        qa_extracted_dir=qa_extracted_dir,
+        grub_config_relative_path=grub_relative,
+        qa_entry_title=QA_ENTRY_TITLE,
+        checksum_catalog_updated=catalog_updated,
+    )

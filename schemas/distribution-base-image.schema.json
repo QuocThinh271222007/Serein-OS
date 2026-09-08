@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/distribution-base-image.schema.json",
+  "title": "Serein Distribution Base Image",
+  "description": "Pinned, machine-readable provenance for the upstream Ubuntu release image S7.0 remasters. This is a contract, never a live probe result - `verified` only ever becomes true after an actual sha256 (and, where present, GPG signature) check has run against the real downloaded file; it is never set true by construction.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "distribution",
+    "release",
+    "point_release",
+    "codename",
+    "architecture",
+    "edition",
+    "source",
+    "filename",
+    "sha256",
+    "sha256sums_url",
+    "signature_url",
+    "signing_key_fingerprint",
+    "signing_key_source",
+    "verified"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "distribution": { "const": "ubuntu" },
+    "release": { "type": "string", "minLength": 1 },
+    "point_release": { "type": ["string", "null"] },
+    "codename": { "type": "string", "minLength": 1 },
+    "architecture": { "type": "string", "enum": ["amd64"] },
+    "edition": { "type": "string", "enum": ["desktop", "server"] },
+    "source": { "type": "string", "enum": ["official-ubuntu-release"] },
+    "filename": { "type": "string", "minLength": 1 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "size_bytes": { "type": ["integer", "null"], "minimum": 0 },
+    "download_url": { "type": "string", "minLength": 1 },
+    "sha256sums_url": { "type": "string", "minLength": 1 },
+    "signature_url": { "type": "string", "minLength": 1 },
+    "signing_key_fingerprint": {
+      "type": "string",
+      "pattern": "^[0-9A-F]{40}$",
+      "description": "40-hex-char OpenPGP v4 fingerprint of the expected signer, pinned so verify-base-image.sh never trusts an arbitrary key merely because a signature happens to be present."
+    },
+    "signing_key_source": { "type": "string", "minLength": 1 },
+    "verified": {
+      "type": "boolean",
+      "description": "True only after this exact file (matched by sha256) has actually been checksum-verified in this environment. Never true by construction."
+    },
+    "verified_at": { "type": ["string", "null"], "description": "ISO 8601 timestamp of the last real verification, or null if never verified here." },
+    "notes": { "type": "string" }
+  }
+}

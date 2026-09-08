@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 from serein import __version__
 from serein.ai.capabilities import build_ai_capabilities
@@ -35,6 +36,8 @@ from serein.development.models import ToolStatus
 from serein.development.planner import VALID_COMPONENTS as DEV_VALID_COMPONENTS
 from serein.development.planner import build_development_plan
 from serein.development.status import build_development_status
+from serein.distribution.inspect import inspect_extracted_tree, inspect_iso_file
+from serein.distribution.status import build_distribution_status
 from serein.doctor.checks import run_checks
 from serein.doctor.models import CheckStatus, DoctorReport
 from serein.focus.capabilities import build_focus_capabilities
@@ -763,6 +766,45 @@ def _cmd_veil_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_distribution_status(_args: argparse.Namespace) -> int:
+    status = build_distribution_status()
+    print("SEREIN DISTRIBUTION")
+    print()
+    print("Target")
+    print(f"  Ubuntu base   {status.base_release}")
+    print(f"  architecture  {status.architecture}")
+    print(f"  edition       {status.edition}")
+    print(f"  channel       {status.release_channel}")
+    print()
+    print("Builder")
+    print(f"  configured    {'yes' if status.base_configured else 'no'}")
+    print()
+    print("Base image")
+    print(f"  cached        {'yes' if status.base_cached else 'no'}")
+    print(f"  verified      {'yes' if status.base_verified else 'no'}")
+    print()
+    print("Last ISO")
+    print(f"  {status.last_iso_filename if status.last_iso_exists else 'not built'}")
+    return 0
+
+
+def _cmd_distribution_inspect(args: argparse.Namespace) -> int:
+    target = Path(args.path)
+    report = inspect_iso_file(target) if target.is_file() else inspect_extracted_tree(target)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2))
+        return 0 if report.passed else 1
+
+    print(f"SEREIN DISTRIBUTION INSPECT - {report.target}")
+    print()
+    for finding in report.findings:
+        print(f"[{finding.status.upper():4}] {finding.check}: {finding.detail}")
+    print()
+    print("PASSED" if report.passed else "FAILED")
+    return 0 if report.passed else 1
+
+
 def _cmd_focus_status(_args: argparse.Namespace) -> int:
     status = build_focus_status()
     print("SEREIN FOCUS")
@@ -1247,6 +1289,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     focus_doctor_parser.set_defaults(func=_cmd_focus_doctor)
+
+    distribution_parser = subparsers.add_parser(
+        "distribution", help="Distribution/ISO build status and inspection (read-only)"
+    )
+    distribution_subparsers = distribution_parser.add_subparsers(
+        dest="distribution_command", required=True
+    )
+
+    distribution_subparsers.add_parser(
+        "status", help="Show base-image/build status (never fetches or builds)"
+    ).set_defaults(func=_cmd_distribution_status)
+
+    distribution_inspect_parser = distribution_subparsers.add_parser(
+        "inspect", help="Structurally inspect a built ISO or extracted tree (read-only)"
+    )
+    distribution_inspect_parser.add_argument(
+        "path", help="Path to a .iso file or an extracted tree directory"
+    )
+    distribution_inspect_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    distribution_inspect_parser.set_defaults(func=_cmd_distribution_inspect)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)

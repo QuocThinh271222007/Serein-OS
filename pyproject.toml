@@ -26,6 +26,10 @@ dev = [
     "jsonschema>=4.20",
     "ruff>=0.6",
     "mypy>=1.10",
+    "build>=1.0",
+    "setuptools>=68",
+    "wheel>=0.42",
+    "pyyaml>=6.0",
 ]
 
 [tool.setuptools.dynamic]

@@ -159,11 +159,48 @@ executor) remains future work - see `docs/focus/future-runtime.md`.
 
 ## S7 — Distribution
 
-Installer implementation (built on the S0 installer *contract*, not
-before it), recovery integration, and ISO/image production. This is the
-first phase that may perform real host mutation, and only within the
-Discover → Resolve → Plan → Validate → Apply → Verify → Record lifecycle
-defined in `docs/architecture/installer-contract.md`.
+Split into four sub-phases - see
+[ADR-0029](adr/0029-s7-split-into-four-subphases.md) and
+[`docs/distribution/s7-roadmap.md`](distribution/s7-roadmap.md).
+
+### S7.0 — Bootable ISO Prototype *(this repository, in progress)*
+
+Proves Serein can be assembled into real, reproducible bootable media by
+remastering a verified, checksum-pinned upstream Ubuntu 26.04 LTS
+release image with a controlled, integrity-checked Serein payload
+overlay - rootless, immutable-base, single-canonical-build-entrypoint,
+never a full worktree copy. Adds `serein distribution status` and
+`serein distribution inspect <path>` (both read-only), plus explicit
+tooling (`distribution/scripts/`) for fetch/verify/build/inspect/
+boot-smoke, none of which run implicitly. See
+[`docs/distribution/`](distribution/architecture.md) for the full design
+and [ADR-0029](adr/0029-s7-split-into-four-subphases.md) through
+[ADR-0031](adr/0031-production-iso-preserves-interactive-installer.md).
+**No installer is forked or built, no host disk is ever mutated, no
+first-boot provisioning exists, and no recovery system exists** - see
+`docs/distribution/known-limitations.md` for exactly what "implemented"
+means at this phase, including this pass's real (Layer B) validation
+status. This is **not** a public release - the project has no selected
+license yet (`docs/distribution/licensing-and-release-boundary.md`).
+
+### S7.1 — Installer Integration *(future, not started)*
+
+Builds on the S0 installer *contract* (not before it) and S7.0's
+base-image/payload contracts to integrate real Subiquity-driven target
+installation. This is the first phase that may perform real host
+mutation, and only within the Discover → Resolve → Plan → Validate →
+Apply → Verify → Record lifecycle defined in
+`docs/architecture/installer-contract.md`.
+
+### S7.2 — First-Boot Provisioning *(future, not started)*
+
+Applies the desktop/hardware/dev/AI/cyber/veil/focus profile resources
+S7.0 merely embeds on media today into a freshly-installed target
+system.
+
+### S7.3 — Recovery / Repair / Fallback *(future, not started)*
+
+Recovery partition, rollback, and factory-reset capability.
 
 ## S8 — Refinement & Benchmarking
 

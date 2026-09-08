@@ -1,0 +1,9 @@
+{
+  "architecture": "amd64",
+  "base_point_release": "26.04.1",
+  "base_release": "26.04",
+  "build_schema": 1,
+  "distribution": "serein",
+  "product": "Serein OS Alpha",
+  "source_commit": "0000000000000000000000000000000000000000"
+}
