@@ -1,5 +1,72 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R3)
+
+**Three real Installer Layer-B runs have occurred**, each exposing and
+fixing a real defect:
+
+```text
+Run 3 (after S7.1R2):
+  RUN_ID=34224122883, RUN_NUMBER=4
+  HEAD=957542960c849d404796ef7c1027052cdc1fe031
+  RESULT=FAILURE - failure_stage=installer_timeout. R2's QEMU corrective
+  is PROVEN: qemu_started=true, installer_userspace_reached=true, and
+  the real guest kernel dmesg shows the intended topology exactly
+  (virtio0=[vda] 4.00 GiB=protected, virtio1=[vdb] 8.00 GiB=target) -
+  no drive/device swap, no /dev/vdX confusion. The QEMU process was
+  killed by the wrapper's own `timeout` after the full 1800s budget
+  (qemu_exit_status=124).
+
+  PROVEN root cause (direct evidence, not inferred): the real captured
+  kernel command line was exactly
+  `BOOT_IMAGE=/casper/vmlinuz console=ttyS0,115200n8 --- splash` - no
+  `autoinstall` token anywhere. `serein.installer.isoprep.prepare_qa_install_iso`
+  wrote `autoinstall.yaml` at the extracted tree's root but never
+  patched the boot entry to actually trigger unattended installation -
+  the boot entry it inherits unmodified is
+  `serein.distribution.qa_boot`'s own "Serein Alpha
+  (qa-serial-boot-smoke)" entry, which is EXPLICITLY documented and
+  coded (Section: "never add autoinstall and never touch any disk
+  target") to never carry that parameter, since it exists only for
+  S7.0's own read-only boot-smoke test. The medium therefore booted
+  into a completely normal interactive Ubuntu Desktop live session -
+  matching every other observed symptom: the full stock snap set
+  loading (firefox, thunderbird, gnome-46-2404, ubuntu-desktop-bootstrap,
+  ...; Serein Alpha's base is `edition: "desktop"` per
+  `distribution/base-image.json`, so this alone is not evidence of a
+  wrong ISO - Ubuntu Desktop DOES ship its own curtin/subiquity-server
+  via the `ubuntu-desktop-bootstrap` snap, whose apparmor profiles
+  visibly loaded in the serial log, but were never invoked in
+  unattended mode), the target disk hash never changing (curtin was
+  never told to run), and the run exhausting its 30-minute timeout
+  idling in a live session that had nothing to unattend.
+
+  Fixed by S7.1R3: `prepare_qa_install_iso` now further patches its
+  OWN independent copy of the extracted tree (never
+  `serein.distribution.qa_boot` itself, whose "never autoinstall"
+  contract must stay intact for S7.0's boot-smoke use) to add the bare
+  `autoinstall` kernel parameter to that one specific boot entry - see
+  `serein.installer.isoprep._enable_autoinstall_on_qa_entry`.
+
+  Real Run #3 also showed the protected disk's hash changed
+  (`protected_disk_modification_count=1`) while the target's did not.
+  INFERRED (not proven): this is a downstream symptom of the SAME root
+  cause, not an independent storage-selector defect - a normal
+  interactive Ubuntu Desktop live session runs `udisks2.service`
+  ("Disk Manager") with automount active, and even a brief, harmless
+  mount of the protected fixture's pre-existing ext4 partition
+  (superblock last-mount-time/journal-replay) is a well-known way to
+  produce a small hash delta with zero deliberate content change - a
+  real unattended Subiquity autoinstall run explicitly does NOT load
+  the full desktop/automount stack this evidence shows running. This
+  is not yet proven; a real Run #4 (which will, for the first time,
+  actually reach curtin/Subiquity) is the genuine test of whether it
+  recurs. The protected-disk safety invariant itself
+  (`protected_disk_hash_unchanged`/`protected_disk_modification_count`)
+  is unchanged and unweakened by this pass - see
+  `docs/installer/protected-disks.md`.
+```
+
 ## Real Layer-B validation status (S7.1R2)
 
 **Two real Installer Layer-B runs have occurred**, each exposing and

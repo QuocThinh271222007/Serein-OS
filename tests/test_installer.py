@@ -29,6 +29,7 @@ import jsonschema
 import pytest
 
 from serein.development.runner import CommandResult
+from serein.distribution.qa_boot import QA_ENTRY_TITLE
 from serein.distribution.safety import scan_text_for_credentials, scan_tree_for_credentials
 from serein.installer.bootcheck import (
     build_installed_disk_boot_command,
@@ -64,7 +65,12 @@ from serein.installer.identity import (
     identity_strength,
     resolve_target,
 )
-from serein.installer.isoprep import IsoPrepError, prepare_qa_install_iso
+from serein.installer.isoprep import (
+    AutoinstallBootError,
+    IsoPrepError,
+    _enable_autoinstall_on_qa_entry,
+    prepare_qa_install_iso,
+)
 from serein.installer.models import (
     TARGET_ESP_SIZE_BYTES,
     DiskInfo,
@@ -1982,6 +1988,34 @@ class TestInstallerScriptExecutableModes:
 # ---------------------------------------------------------------------------
 
 
+# A realistic fake grub.cfg mirroring exactly the structure real Run #3
+# evidence proved (RUN_ID=34224122883): the QA-serial-boot-smoke entry
+# S7.0's own qa_boot.transition_to_qa_in_place bakes in - default,
+# short timeout, `console=ttyS0,115200n8` already present, `---`
+# separator, no `autoinstall` token anywhere - alongside an unrelated
+# second entry that must NEVER be touched.
+_FAKE_QA_GRUB_CFG = f"""set default="0"
+set timeout=1
+
+menuentry "{QA_ENTRY_TITLE}" {{
+    linux   /casper/vmlinuz console=ttyS0,115200n8 ---
+    initrd  /casper/initrd
+}}
+
+menuentry "Try or Install Ubuntu" {{
+    linux   /casper/vmlinuz quiet splash ---
+    initrd  /casper/initrd
+}}
+"""
+
+
+def _write_fake_qa_grub_cfg(extracted_dir: Path) -> Path:
+    grub_path = extracted_dir / "boot" / "grub" / "grub.cfg"
+    grub_path.parent.mkdir(parents=True, exist_ok=True)
+    grub_path.write_text(_FAKE_QA_GRUB_CFG, encoding="utf-8")
+    return grub_path
+
+
 class TestIsoPrep:
     def test_prepare_qa_install_iso_embeds_autoinstall_and_rebuilds(self, tmp_path):
         qa_iso = tmp_path / "serein-alpha-qa.iso"
@@ -1991,6 +2025,7 @@ class TestIsoPrep:
             if "-osirrox" in argv and "-extract" in argv:
                 dest = Path(argv[argv.index("-extract") + 2])
                 dest.mkdir(parents=True, exist_ok=True)
+                _write_fake_qa_grub_cfg(dest)
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
             if "-report_el_torito" in argv:
                 return subprocess.CompletedProcess(
@@ -2010,8 +2045,23 @@ class TestIsoPrep:
         )
         assert result == output
         assert output.is_file()
-        written = (tmp_path / "work" / "qa-install-extracted" / "autoinstall.yaml").read_text()
+        extracted = tmp_path / "work" / "qa-install-extracted"
+        written = (extracted / "autoinstall.yaml").read_text()
         assert written == "AUTOINSTALL CONTENT"
+
+        # -- S7.1R3: the real, proven fix - the rebuilt medium's own
+        # boot entry must actually carry `autoinstall` now. --
+        final_grub = (extracted / "boot" / "grub" / "grub.cfg").read_text()
+        qa_entry_body = final_grub.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert re.search(r"(?<!\S)autoinstall(?!\S)", qa_entry_body)
+        # Never after the `---` init-arg separator.
+        linux_line = next(li for li in qa_entry_body.splitlines() if "linux" in li)
+        assert re.search(r"autoinstall.*---", linux_line)
+        # The serial console token S7.0 already added must survive.
+        assert "console=ttyS0,115200n8" in qa_entry_body
+        # The unrelated second entry must never be touched.
+        other_entry_body = final_grub.split('menuentry "Try or Install Ubuntu"')[1]
+        assert "autoinstall" not in other_entry_body
 
     def test_missing_source_iso_fails_closed(self, tmp_path):
         with pytest.raises(IsoPrepError):
@@ -2032,6 +2082,29 @@ class TestIsoPrep:
                 subprocess_runner=failing_runner,
             )
 
+    def test_missing_grub_config_fails_closed(self, tmp_path):
+        # No boot/grub/grub.cfg written by this fake extraction at all -
+        # must never silently ship an ISO with no autoinstall trigger.
+        qa_iso = tmp_path / "serein-alpha-qa.iso"
+        qa_iso.write_bytes(b"fake qa iso")
+
+        def fake_runner(argv, **kwargs):
+            if "-osirrox" in argv and "-extract" in argv:
+                dest = Path(argv[argv.index("-extract") + 2])
+                dest.mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if "-report_el_torito" in argv:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="-c '/boot.catalog'\n", stderr=""
+                )
+            raise AssertionError(argv)
+
+        with pytest.raises(IsoPrepError, match="autoinstall boot"):
+            prepare_qa_install_iso(
+                qa_iso, tmp_path / "work", tmp_path / "out.iso", "x",
+                subprocess_runner=fake_runner,
+            )
+
     def test_second_invocation_starts_from_clean_scratch(self, tmp_path):
         qa_iso = tmp_path / "serein-alpha-qa.iso"
         qa_iso.write_bytes(b"fake qa iso")
@@ -2040,6 +2113,7 @@ class TestIsoPrep:
             if "-osirrox" in argv and "-extract" in argv:
                 dest = Path(argv[argv.index("-extract") + 2])
                 dest.mkdir(parents=True, exist_ok=True)
+                _write_fake_qa_grub_cfg(dest)
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
             if "-report_el_torito" in argv:
                 return subprocess.CompletedProcess(
@@ -2062,6 +2136,76 @@ class TestIsoPrep:
         )
         assert not (work_dir / "qa-install-extracted" / "stale.txt").exists()
         assert (work_dir / "qa-install-extracted" / "autoinstall.yaml").read_text() == "SECOND"
+
+
+class TestEnableAutoinstallOnQaEntry:
+    """S7.1R3: real, direct regression coverage for the exact Run #3
+    root cause (RUN_ID=34224122883) - the QA-serial-boot-smoke entry's
+    real, proven-missing kernel parameter."""
+
+    def test_reproduces_exact_run_3_missing_parameter(self):
+        # The EXACT real kernel command line Run #3 proved was booted -
+        # no autoinstall token anywhere.
+        patched = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        assert "console=ttyS0,115200n8" in linux_line
+        assert re.search(r"(?<!\S)autoinstall(?!\S)", linux_line)
+
+    def test_inserted_before_init_arg_separator_never_after(self):
+        patched = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        before_sep, _, after_sep = linux_line.partition("---")
+        assert "autoinstall" in before_sep
+        assert "autoinstall" not in after_sep
+
+    def test_idempotent_no_duplicate_on_second_call(self):
+        once = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        twice = _enable_autoinstall_on_qa_entry(once)
+        assert once == twice
+        qa_body = twice.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert qa_body.count("autoinstall") == 1
+
+    def test_unrelated_entry_never_touched(self):
+        patched = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        other_body = patched.split('menuentry "Try or Install Ubuntu"')[1]
+        assert "autoinstall" not in other_body
+        assert "quiet splash" in other_body  # untouched, exact original text
+
+    def test_missing_entry_title_fails_closed(self):
+        with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
+            _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG, entry_title="Does Not Exist")
+
+    def test_entry_with_no_linux_line_fails_closed(self):
+        broken = f'menuentry "{QA_ENTRY_TITLE}" {{\n    initrd /casper/initrd\n}}\n'
+        with pytest.raises(AutoinstallBootError, match="no linux/linuxefi line"):
+            _enable_autoinstall_on_qa_entry(broken)
+
+    def test_linuxefi_directive_also_supported(self):
+        text = (
+            f'menuentry "{QA_ENTRY_TITLE}" {{\n'
+            "    linuxefi /casper/vmlinuz console=ttyS0,115200n8 ---\n"
+            "    initrdefi /casper/initrd\n"
+            "}\n"
+        )
+        patched = _enable_autoinstall_on_qa_entry(text)
+        assert re.search(r"(?<!\S)autoinstall(?!\S)", patched)
+
+    def test_never_mutates_qa_boot_modules_own_contract(self):
+        # S7.1R3 Section 21/29: never reopens S7.0's qa_boot.py, whose
+        # derive_qa_menuentry must keep refusing to add autoinstall for
+        # its OWN (boot-smoke-only) purpose.
+        from serein.distribution.qa_boot import derive_qa_menuentry
+
+        base_cfg = (
+            'menuentry "Try or Install Ubuntu" {\n'
+            "    linux   /casper/vmlinuz quiet splash ---\n"
+            "    initrd  /casper/initrd\n"
+            "}\n"
+        )
+        qa_entry_text = derive_qa_menuentry(base_cfg)
+        assert "autoinstall" not in qa_entry_text
 
 
 # ---------------------------------------------------------------------------
