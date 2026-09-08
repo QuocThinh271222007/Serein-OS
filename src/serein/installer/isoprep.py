@@ -100,23 +100,25 @@ def _temporarily_owner_writable(path: Path) -> Iterator[None]:
         path.chmod(original_mode)
 
 
-def _enable_autoinstall_on_qa_entry(
-    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
+def _add_kernel_token_to_qa_entry(
+    grub_cfg_text: str, token: str, entry_title: str = QA_ENTRY_TITLE
 ) -> str:
-    """Add the bare ``autoinstall`` kernel parameter to the named
-    menuentry's ``linux``/``linuxefi`` line - the real, evidence-proven
-    Run #3 fix (see this module's own docstring for the full causal
-    chain). Inserted before a ``---`` init-arg separator if present
-    (mirrors ``qa_boot._add_serial_console``'s own placement rule) -
-    never after it, since anything after ``---`` is passed to the init
-    process, not the kernel, on a casper live boot line.
+    """Add one bare kernel parameter ``token`` to the named menuentry's
+    ``linux``/``linuxefi`` line. Inserted before a ``---`` init-arg
+    separator if present (mirrors ``qa_boot._add_serial_console``'s own
+    placement rule) - never after it, since anything after ``---`` is
+    passed to the init process, not the kernel, on a casper live boot
+    line.
 
-    Idempotent: a no-op if ``autoinstall`` is already present, so
-    re-running preparation twice never duplicates the token. Raises
-    :class:`AutoinstallBootError` if the named entry, or a
-    ``linux``/``linuxefi`` line inside it, cannot be found - never
-    silently ships a QA-install ISO whose autoinstall trigger failed to
-    attach.
+    Idempotent: a no-op if ``token`` is already present, so re-running
+    preparation twice (or adding several tokens in sequence) never
+    duplicates anything. Raises :class:`AutoinstallBootError` if the
+    named entry, or a ``linux``/``linuxefi`` line inside it, cannot be
+    found - never silently ships a QA-install ISO whose intended kernel
+    parameter failed to attach. The generalized core behind both
+    :func:`_enable_autoinstall_on_qa_entry` (Run #3's real, evidence-
+    proven fix) and :func:`_enable_journald_console_forwarding_on_qa_entry`
+    (S7.1R5 Objective C).
     """
     matches = list(_QA_MENUENTRY_RE.finditer(grub_cfg_text))
     for index, match in enumerate(matches):
@@ -133,14 +135,14 @@ def _enable_autoinstall_on_qa_entry(
                 "AUTOINSTALL_BOOT=BLOCKED"
             )
         directive, kernel_path, args = linux_match.groups()
-        if re.search(r"(?<!\S)autoinstall(?!\S)", args):
+        if re.search(rf"(?<!\S){re.escape(token)}(?!\S)", args):
             return grub_cfg_text  # already present - idempotent no-op
 
         if "---" in args:
             before, sep, after = args.partition("---")
-            new_args = f"{before.rstrip()} autoinstall {sep}{after}"
+            new_args = f"{before.rstrip()} {token} {sep}{after}"
         else:
-            new_args = f"{args.rstrip()} autoinstall"
+            new_args = f"{args.rstrip()} {token}"
         new_line = f"{directive}{kernel_path}{new_args}"
         new_body = body[: linux_match.start()] + new_line + body[linux_match.end() :]
         return grub_cfg_text[:start] + new_body + grub_cfg_text[end:]
@@ -148,6 +150,44 @@ def _enable_autoinstall_on_qa_entry(
     raise AutoinstallBootError(
         f"no menuentry titled {entry_title!r} found in the extracted QA-install tree - "
         "AUTOINSTALL_BOOT=BLOCKED (S7.1R3)"
+    )
+
+
+def _enable_autoinstall_on_qa_entry(
+    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
+) -> str:
+    """Add the bare ``autoinstall`` kernel parameter to the named
+    menuentry - the real, evidence-proven Run #3 fix (see this module's
+    own docstring for the full causal chain)."""
+    return _add_kernel_token_to_qa_entry(grub_cfg_text, "autoinstall", entry_title)
+
+
+def _enable_journald_console_forwarding_on_qa_entry(
+    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
+) -> str:
+    """S7.1R5 Objective C: add ``systemd.journald.forward_to_console=1``
+    to the named menuentry.
+
+    Run #4/#5 both proved the guest reaches real userspace with
+    Subiquity-related snap apparmor profiles loading (per the
+    `snap.ubuntu-desktop-bootstrap.subiquity-server`/`.curtin` lines
+    real serial evidence showed), but the serial console alone never
+    showed Subiquity/curtin/cloud-init's OWN log output - only kernel/
+    systemd boot messages. Since `ubuntu-desktop-bootstrap`'s installer
+    services run as ordinary systemd-managed snap services, their
+    stdout/stderr is captured by the systemd journal by default, not
+    necessarily echoed to any console. This standard, well-documented
+    systemd kernel parameter forwards ALL journal entries to the
+    active console in real time - a single, low-risk kernel parameter
+    addition (the smallest robust mechanism per Section 8 of the
+    S7.1R5 corrective), never a new guest-side service, mount, or
+    transport. This is the SAME evidence-gathering intent as R3's
+    `autoinstall` fix - reusing the SAME real, tested mechanism
+    (:func:`_add_kernel_token_to_qa_entry`) rather than inventing a new
+    one.
+    """
+    return _add_kernel_token_to_qa_entry(
+        grub_cfg_text, "systemd.journald.forward_to_console=1", entry_title
     )
 
 
@@ -204,6 +244,9 @@ def prepare_qa_install_iso(
     original_grub_text = grub_path.read_text(encoding="utf-8")
     try:
         patched_grub_text = _enable_autoinstall_on_qa_entry(original_grub_text)
+        # S7.1R5 Objective C: chained onto the same, already-patched
+        # text - never a second independent grub.cfg parse/write cycle.
+        patched_grub_text = _enable_journald_console_forwarding_on_qa_entry(patched_grub_text)
     except AutoinstallBootError as exc:
         raise IsoPrepError(f"cannot enable autoinstall boot: {exc}") from exc
     with _temporarily_owner_writable(grub_path):

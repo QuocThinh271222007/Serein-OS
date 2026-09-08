@@ -1,5 +1,88 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R5)
+
+**Five real Installer Layer-B runs have occurred.** Run #5 confirmed
+BOTH the R3 boot-entry fix and the R4 protected-disk readonly
+hardening work at runtime, and moved the causal boundary one level
+deeper - the R4 root cause is CLOSED:
+
+```text
+Run 5 (after S7.1R4):
+  RUN_ID=34255177947, RUN_NUMBER=5
+  HEAD=978099b78c4d758b4773c531b104c80ef871f9fe
+  RESULT=FAILURE.
+
+  PROVEN PASS (locked, not reopened):
+    - autoinstall kernel token present (R3's fix, re-confirmed)
+    - protected_disk_hash_unchanged=true,
+      protected_disk_modification_count=0,
+      protected_esp_unchanged=true (R4's readonly=on fix WORKS - the
+      protected container hash is now genuinely stable across a real
+      run, resolving the exact defect Run #3 and Run #4 both showed)
+
+  PROVEN FAIL:
+    - "Hash protected disk (pre-install baseline)" - the FIRST real
+      workflow failure. The exact underlying qemu-nbd/device-node
+      failure could not be reproduced locally (this development
+      environment has no qemu-nbd/nbd kernel module - BLOCKED), but
+      nbd-based device access was the one operation in that script
+      with no precedent of PROVEN success anywhere else in this
+      repository (create-fixture-disks.sh's nbd0/nbd1 usage IS proven
+      by every run reaching fixture creation; nbd2/nbd3 usage -
+      inspect-target-layout.sh, and the original
+      hash-protected-disk.sh - had never actually executed
+      successfully in any real run before this failure). This step's
+      own failure was ALSO invisible to the evidence/closure system -
+      unlike every other failure-capable step in this workflow, it
+      never called `record-failure.sh` at all.
+    - qemu_exit_status=124 (installer_timeout, the wrapper's own 1800s
+      budget), installer_userspace_reached=true - matches Run #4's
+      pattern exactly; the real installer still does not complete.
+    - target qcow2 CONTAINER hash changed
+      (860d31a3...4113 -> 16e46dba...da151), but this alone does NOT
+      prove curtin ever wrote real partitions (the same container-
+      vs-guest-visible ambiguity the R4 corrective already identified
+      for the protected disk) - target_esp_present=false,
+      target_root_present=false, installed_boot_status=not_performed,
+      serein_core_present=false all remained the fail-closed defaults,
+      since "Inspect target disk layout" never ran (gated on a
+      successful install that never happened).
+
+  S7.1R5 fixes/instruments:
+
+  1. installer/scripts/hash-disk-image.sh (replaces
+     hash-protected-disk.sh) - removes the qemu-nbd/nbd-kernel-module/
+     device-node dependency entirely. Uses `qemu-img convert` (pure
+     userspace, no root, no kernel module) to produce a temporary raw
+     file for the guest-visible logical-content hash, and `losetup -P`
+     (the kernel's always-built-in loop driver, never a separately
+     loadable module like nbd) on that already-converted, disposable
+     temp file for the two sentinel-file checks. Generalized
+     (Objective D) to hash BOTH the protected AND target disks, before
+     and after the install attempt, regardless of install success -
+     giving real diagnostic evidence even on a stalled/timed-out
+     install like Run #5. Every one of these four new hashing steps
+     now also calls `record-failure.sh` on its own failure (secondary,
+     non-blocking - never `exit 1`), fixing the exact invisibility
+     defect Run #5 exposed.
+  2. `installer/scripts/isoprep.py`'s boot-entry patching now ALSO adds
+     `systemd.journald.forward_to_console=1` (Objective C) - forwards
+     the systemd journal (which Subiquity-server/curtin/cloud-init, as
+     ordinary systemd-managed snap services, log to by default) to the
+     serial console in real time, giving the NEXT run's serial log
+     actual Subiquity/curtin runtime evidence instead of only kernel/
+     systemd boot messages.
+
+  This pass deliberately did NOT: increase the 1800s timeout, modify
+  target selection/storage-match/curtin-grammar code, weaken the
+  protected-disk readonly hardening, or claim the exact Subiquity/
+  curtin-side reason installation stalls - that remains the primary
+  open question for Run #6, now with meaningfully better evidence
+  infrastructure (journald forwarding + generalized before/after
+  logical-content hashing for both disks) to actually answer it.
+```
+
 ## Real Layer-B validation status (S7.1R4)
 
 **Four real Installer Layer-B runs have occurred.** Run #4 confirmed

@@ -490,23 +490,54 @@ jobs:
             exit 1
           }
 
-      # S7.1R4 Section 8: a real, immediate-pre-install baseline for
-      # the protected disk's THREE separately-measured facts (container
-      # bytes, full guest-visible logical block content, and the two
-      # real sentinel files) - never merely the existing plain
-      # container-only sha256sum this workflow already takes at
-      # fixture-creation time. Establishing this baseline as close to
-      # the real install as possible (after topology re-verification,
-      # right before the destructive step) minimizes any
-      # time-of-check-to-time-of-use gap. Diagnostic only - never gates
-      # anything; the existing container-hash-based closure gate is
-      # unchanged.
+      # S7.1R4 Section 8 (generalized to both disks in S7.1R5 Objective
+      # D): a real, immediate-pre-install baseline for each disk's four
+      # separately-measured facts (container bytes, full guest-visible
+      # logical block content, and the two real sentinel files) - never
+      # merely the existing plain container-only sha256sum this
+      # workflow already takes at fixture-creation time. Establishing
+      # this baseline as close to the real install as possible (after
+      # topology re-verification, right before the destructive step)
+      # minimizes any time-of-check-to-time-of-use gap. Diagnostic only
+      # - never gates anything; the existing container-hash-based
+      # closure gate is unchanged.
+      #
+      # S7.1R5 Corrective A (Run #5, RUN_ID=34255177947, failed here):
+      # this step itself was the FIRST real workflow failure - the
+      # original implementation used qemu-nbd/a kernel nbd device node,
+      # which the exact underlying failure could not be reproduced
+      # locally (BLOCKED - no qemu-nbd in this development environment)
+      # but was the one operation in that script with no precedent of
+      # proven success anywhere in this repository (see
+      # installer/scripts/hash-disk-image.sh's own header for the full
+      # analysis). Replaced with a qemu-img-convert + losetup based
+      # implementation that needs no nbd kernel module and no
+      # kernel-nbd device node at all. This step's own failure is now
+      # ALSO wired into the established record-failure.sh secondary,
+      # non-blocking discipline (Section 18 of the S7.1R5 corrective) -
+      # a real defect the S7.1R4 version of this step did not, unlike
+      # every other failure-capable step in this workflow, ever call
+      # record-failure.sh at all, meaning its own real Run #5 failure
+      # was invisible to the evidence/closure system entirely.
       - name: Hash protected disk (pre-install baseline)
         id: protected-hash-before
         if: always() && steps.verify-topology.outcome == 'success'
         run: |
-          ./installer/scripts/hash-protected-disk.sh \
-            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT"
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "protected_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the protected disk pre-install baseline (secondary, non-blocking)"
+          }
+
+      - name: Hash target disk (pre-install baseline)
+        id: target-hash-before
+        if: always() && steps.verify-topology.outcome == 'success'
+        run: |
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "target_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the target disk pre-install baseline (secondary, non-blocking)"
+          }
 
       # The real installer execution (Section 42-43). QA-only autoinstall
       # (Section 7) - never production media, never a physical disk
@@ -596,56 +627,100 @@ jobs:
           echo "REAL_PROTECTED_DISK_SHA256_AFTER=${PROTECTED_AFTER}"
           echo "REAL_TARGET_DISK_SHA256_AFTER=${TARGET_AFTER}"
 
-      # S7.1R4 Section 8: the post-install counterpart to "Hash
-      # protected disk (pre-install baseline)" above - same three
-      # separately-measured facts, now AFTER the real install attempt.
-      # Diagnostic only - never gates anything; comparing this step's
-      # `protected_logical_sha256`/sentinel outputs against
-      # `protected-hash-before`'s is what actually distinguishes
-      # container-level-only mutation from real guest-visible block
-      # mutation (Section 8's central distinction), for a human or a
-      # future corrective to read from the uploaded evidence - this
-      # workflow does not yet auto-classify that distinction into a
-      # gate (Section 16: never silently change the safety contract's
-      # semantics without explicit spec justification).
+      # S7.1R4 Section 8 (generalized in S7.1R5): the post-install
+      # counterpart to the "before" hashing steps above - same four
+      # separately-measured facts, now AFTER the real install attempt,
+      # for BOTH disks (Objective D: the target's guest-visible content
+      # must be proven distinctly from its container bytes too - a
+      # changed container hash alone, per Run #5's own evidence, is not
+      # proof curtin ever wrote real partitions). Diagnostic only -
+      # never gates anything; comparing these against the "before"
+      # step's outputs is what actually distinguishes container-level-
+      # only mutation from real guest-visible block mutation (Section
+      # 8's central distinction) - this workflow does not yet
+      # auto-classify that distinction into a gate (Section 16: never
+      # silently change the safety contract's semantics without
+      # explicit spec justification). Both run regardless of install
+      # success, so a genuinely stalled/timed-out install (like Run #5)
+      # still produces real diagnostic evidence rather than none.
       - name: Hash protected disk (post-install)
         id: protected-hash-after
         if: always() && steps.create-fixtures.outputs.status == 'pass'
         run: |
-          ./installer/scripts/hash-protected-disk.sh \
-            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT"
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "protected_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the protected disk post-install measurement (secondary, non-blocking)"
+          }
 
-      # S7.1R4 Section 8: persist the before/after comparison as a real
-      # evidence FILE (not merely step outputs visible only in job
-      # logs), so a human reviewing the downloaded artifact can see the
+      - name: Hash target disk (post-install)
+        id: target-hash-after
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "target_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the target disk post-install measurement (secondary, non-blocking)"
+          }
+
+      # S7.1R4 Section 8 (generalized in S7.1R5): persist the
+      # before/after comparison for BOTH disks as real evidence FILES
+      # (not merely step outputs visible only in job logs), so a human
+      # reviewing the downloaded artifact can see the
       # container-vs-logical-vs-sentinel distinction directly. Purely
       # diagnostic - written unconditionally whenever both measurements
-      # ran, never gates anything.
+      # for that disk ran, never gates anything.
       - name: Compare protected-disk measurements
         if: always() && steps.protected-hash-after.outcome == 'success'
         run: |
           {
-            echo "protected_container_sha256_before=${{ steps.protected-hash-before.outputs.protected_container_sha256 }}"
-            echo "protected_container_sha256_after=${{ steps.protected-hash-after.outputs.protected_container_sha256 }}"
-            echo "protected_logical_sha256_before=${{ steps.protected-hash-before.outputs.protected_logical_sha256 }}"
-            echo "protected_logical_sha256_after=${{ steps.protected-hash-after.outputs.protected_logical_sha256 }}"
-            echo "protected_esp_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.protected_esp_sentinel_sha256 }}"
-            echo "protected_esp_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.protected_esp_sentinel_sha256 }}"
-            echo "protected_data_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.protected_data_sentinel_sha256 }}"
-            echo "protected_data_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.protected_data_sentinel_sha256 }}"
-            if [ "${{ steps.protected-hash-before.outputs.protected_container_sha256 }}" != \
-                 "${{ steps.protected-hash-after.outputs.protected_container_sha256 }}" ]; then
-              echo "protected_container_changed=true"
+            echo "container_sha256_before=${{ steps.protected-hash-before.outputs.container_sha256 }}"
+            echo "container_sha256_after=${{ steps.protected-hash-after.outputs.container_sha256 }}"
+            echo "logical_sha256_before=${{ steps.protected-hash-before.outputs.logical_sha256 }}"
+            echo "logical_sha256_after=${{ steps.protected-hash-after.outputs.logical_sha256 }}"
+            echo "esp_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.esp_sentinel_sha256 }}"
+            echo "esp_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.esp_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.data_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.data_sentinel_sha256 }}"
+            if [ "${{ steps.protected-hash-before.outputs.container_sha256 }}" != \
+                 "${{ steps.protected-hash-after.outputs.container_sha256 }}" ]; then
+              echo "container_changed=true"
             else
-              echo "protected_container_changed=false"
+              echo "container_changed=false"
             fi
-            if [ "${{ steps.protected-hash-before.outputs.protected_logical_sha256 }}" != \
-                 "${{ steps.protected-hash-after.outputs.protected_logical_sha256 }}" ]; then
-              echo "protected_logical_changed=true"
+            if [ "${{ steps.protected-hash-before.outputs.logical_sha256 }}" != \
+                 "${{ steps.protected-hash-after.outputs.logical_sha256 }}" ]; then
+              echo "logical_changed=true"
             else
-              echo "protected_logical_changed=false"
+              echo "logical_changed=false"
             fi
           } | tee dist/installer-fixtures/protected-disk-diagnostic.env
+
+      - name: Compare target-disk measurements
+        if: always() && steps.target-hash-after.outcome == 'success'
+        run: |
+          {
+            echo "container_sha256_before=${{ steps.target-hash-before.outputs.container_sha256 }}"
+            echo "container_sha256_after=${{ steps.target-hash-after.outputs.container_sha256 }}"
+            echo "logical_sha256_before=${{ steps.target-hash-before.outputs.logical_sha256 }}"
+            echo "logical_sha256_after=${{ steps.target-hash-after.outputs.logical_sha256 }}"
+            echo "esp_sentinel_sha256_before=${{ steps.target-hash-before.outputs.esp_sentinel_sha256 }}"
+            echo "esp_sentinel_sha256_after=${{ steps.target-hash-after.outputs.esp_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_before=${{ steps.target-hash-before.outputs.data_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_after=${{ steps.target-hash-after.outputs.data_sentinel_sha256 }}"
+            if [ "${{ steps.target-hash-before.outputs.container_sha256 }}" != \
+                 "${{ steps.target-hash-after.outputs.container_sha256 }}" ]; then
+              echo "container_changed=true"
+            else
+              echo "container_changed=false"
+            fi
+            if [ "${{ steps.target-hash-before.outputs.logical_sha256 }}" != \
+                 "${{ steps.target-hash-after.outputs.logical_sha256 }}" ]; then
+              echo "logical_changed=true"
+            else
+              echo "logical_changed=false"
+            fi
+          } | tee dist/installer-fixtures/target-disk-diagnostic.env
 
       - name: "Disk usage: after_install"
         if: always()
@@ -815,6 +890,7 @@ jobs:
             dist/installer-fixtures/qa-install-qemu-result.env
             dist/installer-fixtures/qa-install-subiquity-signals.log
             dist/installer-fixtures/protected-disk-diagnostic.env
+            dist/installer-fixtures/target-disk-diagnostic.env
             dist/installer-fixtures/installed-boot/installed-boot-serial.log
           if-no-files-found: warn
           retention-days: 14

@@ -143,44 +143,59 @@ installed target boots on its own (no install medium, self-contained
 All of this is real, hash-based, filesystem-inspected evidence - never
 inferred merely from installer log text or an overall QEMU exit code.
 
-## Protected-disk diagnostic instrumentation (S7.1R4)
+## Disk diagnostic instrumentation (S7.1R4, revised S7.1R5)
 
 Real Layer-B runs #3 and #4 both showed the protected qcow2's
-CONTAINER hash changing. The pre-existing measurement
-(`sha256sum` on the raw qcow2 file, still the one that actually gates
-closure via `protected_disk_hash_unchanged`) cannot by itself
-distinguish a real guest-visible content change from a qcow2-format
-container-level artifact (e.g. lazy-refcount/dirty-bit bookkeeping
-that can occur purely from a qcow2 image being opened for write
-access, independent of any guest I/O).
+CONTAINER hash changing (Run #5 then proved the R4 `readonly=on` fix
+resolves that exact defect - see below). The plain container-level
+measurement (`sha256sum` on the raw qcow2 file, still the one that
+actually gates closure via `protected_disk_hash_unchanged`) cannot by
+itself distinguish a real guest-visible content change from a
+qcow2-format container-level artifact (e.g. lazy-refcount/dirty-bit
+bookkeeping that can occur purely from a qcow2 image being opened for
+write access, independent of any guest I/O).
 
-`installer/scripts/hash-protected-disk.sh` (called both immediately
-before and immediately after the real install attempt) separately
-measures:
+`installer/scripts/hash-disk-image.sh` (called both immediately before
+and immediately after the real install attempt, for BOTH the protected
+AND target disks as of S7.1R5) separately measures:
 
-- `protected_container_sha256` - the existing raw-file measurement
-- `protected_logical_sha256` - the FULL guest-visible logical block
-  content, read via a read-only `qemu-nbd` connection (never a
-  mount, never partial)
-- `protected_esp_sentinel_sha256` / `protected_data_sentinel_sha256` -
-  the two real sentinel files `create-fixture-disks.sh` writes, read
-  via a read-only mount (`-o ro,noload` for the ext4 data partition
-  specifically, so even a read-only mount can never silently replay a
-  dirty journal onto the block device)
+- `container_sha256` - the existing raw-file measurement
+- `logical_sha256` - the FULL guest-visible logical block content
+- `esp_sentinel_sha256` / `data_sentinel_sha256` - the two real
+  sentinel files `create-fixture-disks.sh` writes (on the TARGET disk,
+  `data_sentinel_present` honestly flipping to `false` after a real
+  successful install is itself expected/correct evidence - curtin
+  replaces the original pre-populated partition table with Serein's
+  own layout)
 
-This is purely diagnostic - it does not change what the closure gate
-enforces (Section 16 of the S7.1R4 corrective: never silently
+**S7.1R5 Corrective A**: the original S7.1R4 implementation
+(`hash-protected-disk.sh`) used `qemu-nbd` + a real kernel `/dev/nbdX`
+device node. Real Run #5 proved this fails in this exact CI
+environment (it was the FIRST real workflow failure). The rewritten
+`hash-disk-image.sh` removes the nbd/kernel-module/device-node
+dependency entirely: `qemu-img convert` (pure userspace, no root, no
+kernel module) produces a temporary raw file for the logical-content
+hash, and `losetup -P` (the kernel's always-built-in loop driver, never
+a separately loadable module like nbd) on that already-converted,
+disposable temp file handles the sentinel-file checks. See the
+script's own header comment for the full causal analysis. Every
+hashing step's own failure is now also recorded via
+`record-failure.sh` (secondary, non-blocking) - Run #5 also proved the
+R4 version's failure was invisible to the evidence system entirely,
+unlike every other failure-capable step in this workflow.
+
+This remains purely diagnostic - it does not change what the closure
+gate enforces (Section 16 of the S7.1R4 corrective: never silently
 reinterpret the safety contract's semantics without explicit
 justification from a real run's evidence). The before/after comparison
-is persisted as `protected-disk-diagnostic.env` in the uploaded
-evidence artifact.
+is persisted as `protected-disk-diagnostic.env` /
+`target-disk-diagnostic.env` in the uploaded evidence artifact.
 
-Separately, `installer/scripts/run-qa-install.sh` now attaches the
-protected qcow2 backend `readonly=on` (Run #4 proved it was previously
-opened read-write by both the bounded startup probe and the real timed
-run) - independently, architecturally correct regardless of the exact
-causal mechanism, and closes off every QEMU-side write vector to that
-disk categorically.
+Separately, `installer/scripts/run-qa-install.sh` attaches the
+protected qcow2 backend `readonly=on` (added in S7.1R4; Run #5 PROVED
+this works at runtime - `protected_disk_hash_unchanged=true`,
+`protected_disk_modification_count=0` - resolving the exact defect Run
+#3 and Run #4 both showed). Do not remove this.
 
 `installer/scripts/extract-installer-signals.sh` extracts a narrowly
 scoped, targeted set of Subiquity/curtin/autoinstall/cloud-init/error
@@ -188,6 +203,17 @@ lines from the real serial log into
 `qa-install-subiquity-signals.log`, so a future run's evidence
 highlights the handful of lines that actually matter without requiring
 a human to search a 400+KB raw transcript by hand.
+
+**S7.1R5 Objective C**: `serein.installer.isoprep`'s boot-entry
+patching now also adds `systemd.journald.forward_to_console=1`
+alongside `autoinstall` (both via the same, generalized
+`_add_kernel_token_to_qa_entry` mechanism R3's fix established). Since
+`ubuntu-desktop-bootstrap`'s installer services (subiquity-server,
+curtin, ...) run as ordinary systemd-managed snap services, their
+stdout/stderr is captured by the systemd journal by default - this
+forwards the whole journal to the serial console in real time, giving
+the next real run's serial log actual Subiquity/curtin runtime
+evidence instead of only kernel/systemd boot messages.
 
 ## What this development environment can and cannot prove
 

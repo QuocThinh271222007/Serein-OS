@@ -70,6 +70,7 @@ from serein.installer.isoprep import (
     AutoinstallBootError,
     IsoPrepError,
     _enable_autoinstall_on_qa_entry,
+    _enable_journald_console_forwarding_on_qa_entry,
     prepare_qa_install_iso,
 )
 from serein.installer.models import (
@@ -1498,14 +1499,54 @@ class TestInstallerSmokeWorkflow:
         after_idx = names.index("Hash protected disk (post-install)")
         assert before_idx < install_idx < after_idx
 
-    def test_protected_hash_steps_always_run(self, workflow):
+    def test_target_disk_hashed_before_and_after_install(self, workflow):
+        # S7.1R5 Objective D.
         steps = workflow["jobs"]["installer-smoke"]["steps"]
-        before = next(
-            s for s in steps if s.get("name") == "Hash protected disk (pre-install baseline)"
-        )
-        after = next(s for s in steps if s.get("name") == "Hash protected disk (post-install)")
-        assert before.get("if", "").startswith("always()")
-        assert after.get("if", "").startswith("always()")
+        names = [s.get("name") for s in steps]
+        before_idx = names.index("Hash target disk (pre-install baseline)")
+        install_idx = names.index("Run real QA autoinstall")
+        after_idx = names.index("Hash target disk (post-install)")
+        assert before_idx < install_idx < after_idx
+
+    def test_disk_hash_steps_always_run(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        for name in (
+            "Hash protected disk (pre-install baseline)", "Hash protected disk (post-install)",
+            "Hash target disk (pre-install baseline)", "Hash target disk (post-install)",
+        ):
+            step = next(s for s in steps if s.get("name") == name)
+            assert step.get("if", "").startswith("always()")
+
+    def test_disk_hash_steps_use_the_generalized_script(self, workflow):
+        # S7.1R5 Corrective A - every hashing step must call the new,
+        # qemu-nbd-free script, never the old removed one.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        for name in (
+            "Hash protected disk (pre-install baseline)", "Hash protected disk (post-install)",
+            "Hash target disk (pre-install baseline)", "Hash target disk (post-install)",
+        ):
+            step = next(s for s in steps if s.get("name") == name)
+            assert "hash-disk-image.sh" in step["run"]
+            assert "hash-protected-disk.sh" not in step["run"]
+
+    def test_disk_hash_step_failures_recorded_as_secondary_never_abort(self, workflow):
+        # S7.1R5 Section 18/Corrective A: Run #5 proved this step's own
+        # failure was previously invisible to the evidence system
+        # (unlike every other failure-capable step, it never called
+        # record-failure.sh). Now it does, mirroring the Release
+        # steps' own established non-blocking pattern - never `exit 1`,
+        # so a diagnostic failure never masks (or gets masked by) the
+        # real installer_timeout blocker via first-failure-wins.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        for name, stage in (
+            ("Hash protected disk (pre-install baseline)", "protected_disk_diagnostic_failed"),
+            ("Hash protected disk (post-install)", "protected_disk_diagnostic_failed"),
+            ("Hash target disk (pre-install baseline)", "target_disk_diagnostic_failed"),
+            ("Hash target disk (post-install)", "target_disk_diagnostic_failed"),
+        ):
+            step = next(s for s in steps if s.get("name") == name)
+            assert stage in step["run"]
+            assert "exit 1" not in step["run"]
 
     def test_extract_signals_step_present_and_always_runs(self, workflow):
         steps = workflow["jobs"]["installer-smoke"]["steps"]
@@ -1520,19 +1561,22 @@ class TestInstallerSmokeWorkflow:
         paths = upload["with"]["path"]
         assert "dist/installer-fixtures/qa-install-subiquity-signals.log" in paths
         assert "dist/installer-fixtures/protected-disk-diagnostic.env" in paths
+        assert "dist/installer-fixtures/target-disk-diagnostic.env" in paths
 
     def test_new_diagnostic_hashes_never_gate_closure(self, workflow):
         # Section 16: never silently change the safety contract's
-        # semantics - the new protected-disk diagnostic hashing must
-        # never feed the evidence-assembly step's own ARGS (the
-        # existing container-hash-based closure gate stays exactly
-        # unchanged; this new instrumentation is additive/diagnostic
-        # only, uploaded as its own separate file).
+        # semantics - the new disk diagnostic hashing must never feed
+        # the evidence-assembly step's own ARGS (the existing
+        # container-hash-based closure gate stays exactly unchanged;
+        # this new instrumentation is additive/diagnostic only,
+        # uploaded as its own separate files).
         steps = workflow["jobs"]["installer-smoke"]["steps"]
         assemble = next(s for s in steps if s.get("name") == "Assemble Installer Layer-B evidence")
         assert "protected-hash-before" not in assemble["run"]
         assert "protected-hash-after" not in assemble["run"]
-        assert "protected_logical_sha256" not in assemble["run"]
+        assert "target-hash-before" not in assemble["run"]
+        assert "target-hash-after" not in assemble["run"]
+        assert "logical_sha256" not in assemble["run"]
 
 
 # ---------------------------------------------------------------------------
@@ -1985,17 +2029,20 @@ class TestReleaseArtifactScript:
 
 
 # ---------------------------------------------------------------------------
-# S7.1R4 Section 8: installer/scripts/hash-protected-disk.sh - real
-# bash execution against stub sudo/qemu-nbd/blkid/partprobe/dd tools
+# S7.1R5 Corrective A: installer/scripts/hash-disk-image.sh - real bash
+# execution against stub sudo/qemu-img/losetup/blkid tools. Replaces
+# the S7.1R4 qemu-nbd-based hash-protected-disk.sh (real Run #5,
+# RUN_ID=34255177947, proved that failed) - never nbd, never a kernel
+# module, generalized to hash either disk (S7.1R5 Objective D).
 # ---------------------------------------------------------------------------
 
 
-class TestHashProtectedDiskScript:
-    SCRIPT = REPO_ROOT / "installer" / "scripts" / "hash-protected-disk.sh"
+class TestHashDiskImageScript:
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "hash-disk-image.sh"
     _FAKE_LOGICAL_CONTENT = b"FAKE_LOGICAL_CONTENT"
 
     def _run(
-        self, tmp_path: Path, protected_content: bytes = b"fake protected qcow2 bytes"
+        self, tmp_path: Path, image_content: bytes = b"fake qcow2 container bytes"
     ) -> tuple[subprocess.CompletedProcess, Path]:
         if shutil.which("bash") is None:
             pytest.skip("bash not available in this environment")
@@ -2003,32 +2050,43 @@ class TestHashProtectedDiskScript:
         bin_dir.mkdir(parents=True, exist_ok=True)
         for name, body in {
             "sudo": '#!/usr/bin/env bash\nexec "$@"\n',
-            "modprobe": "#!/usr/bin/env bash\nexit 0\n",
-            "qemu-nbd": "#!/usr/bin/env bash\nexit 0\n",
-            "partprobe": "#!/usr/bin/env bash\nexit 0\n",
-            # No real nbd block device exists in this sandbox - blkid
-            # never gets a real path to inspect anyway ([ -b ... ]
-            # already fails first), but fail closed here too.
-            "blkid": "#!/usr/bin/env bash\nexit 1\n",
-            "dd": (
+            "qemu-img": (
                 "#!/usr/bin/env bash\n"
-                f"printf '%s' '{self._FAKE_LOGICAL_CONTENT.decode()}'\n"
+                'if [ "$1" = "convert" ]; then\n'
+                '  dst="${@: -1}"\n'
+                f"  printf '%s' '{self._FAKE_LOGICAL_CONTENT.decode()}' > \"$dst\"\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 1\n"
             ),
+            "losetup": (
+                "#!/usr/bin/env bash\n"
+                'case "$1" in\n'
+                "  --show) echo '/dev/loop77'; exit 0 ;;\n"
+                "  -d) exit 0 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            ),
+            "partprobe": "#!/usr/bin/env bash\nexit 0\n",
+            # No real loop-backed block device exists in this sandbox -
+            # blkid never gets a real path to inspect anyway
+            # ([ -b ... ] already fails first), but fail closed too.
+            "blkid": "#!/usr/bin/env bash\nexit 1\n",
         }.items():
             script = bin_dir / name
             script.write_text(body)
             script.chmod(0o755)
 
-        protected = tmp_path / "disk-protected.qcow2"
-        protected.write_bytes(protected_content)
+        image = tmp_path / "disk.qcow2"
+        image.write_bytes(image_content)
 
         env = dict(os.environ)
         env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
         result = subprocess.run(
-            ["bash", str(self.SCRIPT), str(protected)],
+            ["bash", str(self.SCRIPT), str(image)],
             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
         )
-        return result, protected
+        return result, image
 
     def _outputs(self, stdout: str) -> dict[str, str]:
         # .lstrip("\\"): GNU sha256sum prefixes its output hash with a
@@ -2044,58 +2102,99 @@ class TestHashProtectedDiskScript:
         }
 
     def test_container_hash_matches_real_sha256sum(self, tmp_path):
-        content = b"exact real protected fixture bytes"
-        result, _protected = self._run(tmp_path, content)
+        content = b"exact real fixture bytes"
+        result, _image = self._run(tmp_path, content)
         assert result.returncode == 0, result.stdout + result.stderr
         outputs = self._outputs(result.stdout)
-        assert outputs["protected_container_sha256"] == hashlib.sha256(content).hexdigest()
+        assert outputs["container_sha256"] == hashlib.sha256(content).hexdigest()
 
-    def test_logical_hash_computed_from_readonly_nbd_read(self, tmp_path):
-        result, _protected = self._run(tmp_path)
+    def test_logical_hash_computed_from_qemu_img_convert(self, tmp_path):
+        result, _image = self._run(tmp_path)
         outputs = self._outputs(result.stdout)
-        assert outputs["protected_logical_sha256"] == hashlib.sha256(
+        assert outputs["logical_sha256"] == hashlib.sha256(
             self._FAKE_LOGICAL_CONTENT
         ).hexdigest()
 
     def test_container_and_logical_hashes_are_independent_measurements(self, tmp_path):
         # The central Section 8 distinction - these two hashes come
-        # from genuinely different sources (the raw file vs. the fake
-        # nbd read) and must never accidentally collapse into one
-        # measurement.
-        result, _protected = self._run(tmp_path, b"container bytes differ from logical bytes")
+        # from genuinely different sources (the raw file vs. the
+        # converted logical content) and must never accidentally
+        # collapse into one measurement.
+        result, _image = self._run(tmp_path, b"container bytes differ from logical bytes")
         outputs = self._outputs(result.stdout)
-        assert outputs["protected_container_sha256"] != outputs["protected_logical_sha256"]
+        assert outputs["container_sha256"] != outputs["logical_sha256"]
 
     def test_no_block_device_means_sentinels_absent_not_fabricated(self, tmp_path):
-        # No real /dev/nbdXp1/p2 block device exists in this sandbox -
+        # No real /dev/loopXp1/p2 block device exists in this sandbox -
         # must honestly report absent, never fabricate a sentinel hash.
-        result, _protected = self._run(tmp_path)
+        result, _image = self._run(tmp_path)
         outputs = self._outputs(result.stdout)
-        assert outputs["protected_esp_sentinel_present"] == "false"
-        assert outputs["protected_esp_sentinel_sha256"] == ""
-        assert outputs["protected_data_sentinel_present"] == "false"
-        assert outputs["protected_data_sentinel_sha256"] == ""
+        assert outputs["esp_sentinel_present"] == "false"
+        assert outputs["esp_sentinel_sha256"] == ""
+        assert outputs["data_sentinel_present"] == "false"
+        assert outputs["data_sentinel_sha256"] == ""
 
     def test_missing_required_tool_fails_closed(self, tmp_path):
         bash_path = shutil.which("bash")
         if bash_path is None:
             pytest.skip("bash not available in this environment")
-        protected = tmp_path / "disk-protected.qcow2"
-        protected.write_bytes(b"x")
+        image = tmp_path / "disk.qcow2"
+        image.write_bytes(b"x")
         empty_bin = tmp_path / "empty-bin"
         empty_bin.mkdir()
         env = dict(os.environ)
         env["PATH"] = str(empty_bin)  # deliberately no tools at all
         result = subprocess.run(
-            [bash_path, str(self.SCRIPT), str(protected)],
+            [bash_path, str(self.SCRIPT), str(image)],
             cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
         )
         assert result.returncode != 0
 
-    def test_qemu_nbd_connected_readonly(self):
+    def test_missing_image_fails_closed(self, tmp_path):
+        bash_path = shutil.which("bash")
+        if bash_path is None:
+            pytest.skip("bash not available in this environment")
+        result = subprocess.run(
+            [bash_path, str(self.SCRIPT), str(tmp_path / "does-not-exist.qcow2")],
+            cwd=tmp_path, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode != 0
+
+    def test_no_qemu_nbd_or_nbd_device_dependency(self):
+        # S7.1R5 Corrective A - the exact real Run #5 defect class this
+        # rewrite eliminates: no nbd kernel module, no /dev/nbdX device
+        # node, anywhere in this script's REAL executable code
+        # (comments explaining the historical R4 defect legitimately
+        # mention these strings, and must not trip this check).
         text = self.SCRIPT.read_text(encoding="utf-8")
-        connect_line = next(li for li in text.splitlines() if "qemu-nbd --connect=" in li)
-        assert "--read-only" in connect_line
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "qemu-nbd" not in stripped, line
+            assert "/dev/nbd" not in stripped, line
+            assert "modprobe" not in stripped, line
+
+    def test_loop_device_attached_readonly(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        connect_line = next(
+            li for li in text.splitlines()
+            if "losetup --show" in li and not li.strip().startswith("#")
+        )
+        assert " -r " in connect_line or connect_line.rstrip().endswith(" -r")
+
+    def test_conversion_never_writes_to_source_image(self):
+        # qemu-img convert's SOURCE argument (-f qcow2 ... "${IMG}")
+        # must never also appear as convert's OWN destination - i.e.
+        # the script must convert into a genuinely separate temp file,
+        # never in-place.
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        convert_line = next(
+            li for li in text.splitlines()
+            if "qemu-img convert" in li and not li.strip().startswith("#")
+        )
+        assert '"${IMG}"' in convert_line
+        assert '"${RAW_TMP}"' in convert_line
 
     def test_ext4_mount_uses_noload_never_replays_journal(self):
         text = self.SCRIPT.read_text(encoding="utf-8")
@@ -2106,6 +2205,12 @@ class TestHashProtectedDiskScript:
         for line in text.splitlines():
             if re.match(r"\s*(sudo )?mount ", line.strip()):
                 assert "-o ro" in line, line
+
+    def test_cleanup_removes_temp_raw_file_and_loop_device_on_success(self, tmp_path):
+        result, _image = self._run(tmp_path)
+        assert result.returncode == 0
+        leftover = list(tmp_path.glob(".hash-disk-image-raw.*"))
+        assert leftover == []
 
 
 # ---------------------------------------------------------------------------
@@ -2309,9 +2414,12 @@ class TestIsoPrep:
         assert re.search(r"autoinstall.*---", linux_line)
         # The serial console token S7.0 already added must survive.
         assert "console=ttyS0,115200n8" in qa_entry_body
+        # -- S7.1R5 Objective C: journald forwarding chained on top. --
+        assert "systemd.journald.forward_to_console=1" in qa_entry_body
         # The unrelated second entry must never be touched.
         other_entry_body = final_grub.split('menuentry "Try or Install Ubuntu"')[1]
         assert "autoinstall" not in other_entry_body
+        assert "systemd.journald.forward_to_console" not in other_entry_body
 
     def test_missing_source_iso_fails_closed(self, tmp_path):
         with pytest.raises(IsoPrepError):
@@ -2456,6 +2564,51 @@ class TestEnableAutoinstallOnQaEntry:
         )
         qa_entry_text = derive_qa_menuentry(base_cfg)
         assert "autoinstall" not in qa_entry_text
+
+
+class TestJournaldConsoleForwardingOnQaEntry:
+    """S7.1R5 Objective C: real, direct regression coverage for the
+    new systemd.journald.forward_to_console=1 kernel-parameter
+    addition - reuses the exact same, already-tested core mechanism
+    as _enable_autoinstall_on_qa_entry (Run #3's proven fix)."""
+
+    def test_token_added_to_qa_entry_only(self):
+        patched = _enable_journald_console_forwarding_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert "systemd.journald.forward_to_console=1" in qa_body
+        other_body = patched.split('menuentry "Try or Install Ubuntu"')[1]
+        assert "systemd.journald.forward_to_console" not in other_body
+
+    def test_inserted_before_init_arg_separator(self):
+        patched = _enable_journald_console_forwarding_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        before_sep, _, after_sep = linux_line.partition("---")
+        assert "systemd.journald.forward_to_console" in before_sep
+        assert "systemd.journald.forward_to_console" not in after_sep
+
+    def test_idempotent_no_duplicate(self):
+        once = _enable_journald_console_forwarding_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        twice = _enable_journald_console_forwarding_on_qa_entry(once)
+        assert once == twice
+        qa_body = twice.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert qa_body.count("systemd.journald.forward_to_console") == 1
+
+    def test_composes_with_autoinstall_token_chained(self):
+        # The exact real usage in prepare_qa_install_iso - autoinstall
+        # first, then journald forwarding chained onto that result.
+        with_autoinstall = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        both = _enable_journald_console_forwarding_on_qa_entry(with_autoinstall)
+        qa_body = both.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert "autoinstall" in qa_body
+        assert "systemd.journald.forward_to_console=1" in qa_body
+        assert "console=ttyS0,115200n8" in qa_body
+
+    def test_missing_entry_title_fails_closed(self):
+        with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
+            _enable_journald_console_forwarding_on_qa_entry(
+                _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
+            )
 
 
 # ---------------------------------------------------------------------------

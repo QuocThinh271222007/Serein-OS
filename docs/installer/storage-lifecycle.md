@@ -87,3 +87,24 @@ stages, once their own release step has run. A real run's logs give
 real numbers this estimate can be corrected against, exactly like
 S7.0's own preflight arithmetic was revised more than once after real
 evidence (see `docs/distribution/known-limitations.md`'s run history).
+
+## S7.1R5: transient raw-conversion temp files
+
+`installer/scripts/hash-disk-image.sh` (Objective A/D of the S7.1R5
+corrective) creates one transient, disposable raw-format copy of
+whichever disk it is currently hashing (via `qemu-img convert`),
+deleted immediately (trap-based cleanup) before the script returns -
+never more than one such temp file alive at a time. Reasoned peak
+impact (not measured - `REQUIRED_GIB` is deliberately NOT bumped this
+round without real telemetry justifying it, per this document's own
+established discipline): the largest single call converts the target
+disk (virtual capacity 8 GiB) while the QA-install ISO (7 GiB) is
+still alive and both fixture qcow2s are resident - a reasoned new
+candidate peak of roughly `7 + 6(FIXTURE_QCOW2_ALLOCATED_GIB) + 8 = 21`
+GiB, at parity with (not exceeding) the existing `ISOPREP_PEAK_GIB=21`
+this document already accounts for, so `REQUIRED_GIB=27` should retain
+its existing real margin. This reasoning is unverified against a real
+run - `log-disk-usage.sh`'s existing telemetry (unchanged this round)
+is what will actually confirm or correct it from Run #6's real
+`du`/`df` output, exactly as this document's own established
+discipline requires.
