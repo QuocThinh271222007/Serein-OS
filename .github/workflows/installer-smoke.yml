@@ -197,16 +197,27 @@ jobs:
       #   than FIXTURE_QCOW2_VIRTUAL_GIB (documented for contrast only,
       #   never summed into the required total).
       #
+      #   S7.1R6: real Run #6 (RUN_ID=34265949262) proved curtin
+      #   actually progressed into the target chroot's real apt/dpkg
+      #   phase (genuine package-database work, not merely a partition
+      #   table write) before the previous 1800s timeout - meaning a
+      #   real, successful run (now with a 3600s budget, Objective A)
+      #   plausibly grows the target's real allocated bytes well beyond
+      #   the original conservative estimate. FIXTURE_QCOW2_ALLOCATED_GIB
+      #   is revised 6->12 accordingly - still comfortably within the
+      #   SAME REQUIRED_GIB, since ISOPREP_PEAK_GIB remains the binding
+      #   constraint either way (see the arithmetic below).
+      #
       #   Two candidate peak moments, the real maximum of which is used:
       #     ISOPREP_PEAK_GIB = QA_ISO_GIB(7, isoprep's own source) +
       #       QA_INSTALL_EXTRACTED_TREE_GIB(7, isoprep's own independent
       #       re-extraction) + QA_INSTALL_ISO_GIB(7, being rebuilt) = 21
       #     INSTALL_PEAK_GIB = QA_INSTALL_ISO_GIB(7, still present until
       #       released right after the real install completes -
-      #       Section 47) + FIXTURE_QCOW2_ALLOCATED_GIB(6, generous
+      #       Section 47) + FIXTURE_QCOW2_ALLOCATED_GIB(12, revised
       #       real-allocation estimate, mostly target-disk growth - the
       #       protected disk's real allocated size never meaningfully
-      #       changes, which is the entire point of the safety proof) = 13
+      #       changes, which is the entire point of the safety proof) = 19
       #   By this point S7.0's own base ISO, extracted tree, and
       #   production ISO have ALL already been released by their own
       #   real final consumers (see the "Release ..." steps below), so
@@ -225,8 +236,8 @@ jobs:
           QA_ISO_GIB=7
           QA_INSTALL_EXTRACTED_TREE_GIB=7
           QA_INSTALL_ISO_GIB=7
-          FIXTURE_QCOW2_VIRTUAL_GIB=12
-          FIXTURE_QCOW2_ALLOCATED_GIB=6
+          FIXTURE_QCOW2_VIRTUAL_GIB=20
+          FIXTURE_QCOW2_ALLOCATED_GIB=12
           SAFETY_MARGIN_GIB=6
 
           ISOPREP_PEAK_GIB=$((QA_ISO_GIB + QA_INSTALL_EXTRACTED_TREE_GIB + QA_INSTALL_ISO_GIB))
@@ -322,6 +333,8 @@ jobs:
           ./installer/scripts/release-artifact.sh build/work/extracted || {
             ./distribution/scripts/record-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for build/work/extracted (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for build/work/extracted (secondary, non-blocking)"
           }
 
       - name: "Disk usage: after_s7_0_build"
@@ -360,6 +373,8 @@ jobs:
         run: |
           ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64.iso || {
             ./distribution/scripts/record-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the production ISO (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for the production ISO (secondary, non-blocking)"
           }
 
@@ -451,6 +466,8 @@ jobs:
             build/installer-work/qa-install-extracted || {
             ./distribution/scripts/record-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for the QA ISO/extraction tree (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the QA ISO/extraction tree (secondary, non-blocking)"
           }
 
       - name: "Disk usage: after_qa_install_iso"
@@ -527,6 +544,8 @@ jobs:
             dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
             ./distribution/scripts/record-failure.sh "protected_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the protected disk pre-install baseline (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "protected_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the protected disk pre-install baseline (secondary, non-blocking)"
           }
 
       - name: Hash target disk (pre-install baseline)
@@ -536,6 +555,8 @@ jobs:
           ./installer/scripts/hash-disk-image.sh \
             dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
             ./distribution/scripts/record-failure.sh "target_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the target disk pre-install baseline (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "target_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the target disk pre-install baseline (secondary, non-blocking)"
           }
 
@@ -553,6 +574,20 @@ jobs:
       # (qemu_startup/installer_timeout/installer_execution - Section 9)
       # is what actually gets recorded as the causal blocker now,
       # replacing the old generic, undifferentiated "install_failed".
+      #
+      # S7.1R6 Objective A: this is the ONE real, expensive Layer-B QA
+      # install budget - real Run #6 (RUN_ID=34265949262) proved the
+      # installer was ACTIVELY progressing (real curtin chroot/apt
+      # phase - "chroot ... dpkg --print-architecture", "Applying
+      # debconf selections") at ~1769s, only ~31s before the previous
+      # 1800s deadline killed it. This is the first real evidence that
+      # authorizes a bounded increase - never merely because the run
+      # failed, and never an unbounded wait: `timeout --signal=TERM`
+      # inside run-qa-install.sh still fail-closes at this new bound.
+      # Every OTHER timeout in this codebase (the bounded, non-
+      # destructive startup probe; bootcheck.py's installed-target
+      # boot-check timeout) is a genuinely separate, already-bounded
+      # scope and is deliberately left unchanged.
       - name: Run real QA autoinstall
         id: run-install
         if: always() && steps.verify-topology.outcome == 'success'
@@ -562,7 +597,7 @@ jobs:
               dist/serein-alpha-26.04-amd64-qa-install.iso \
               dist/installer-fixtures/disk-protected.qcow2 \
               dist/installer-fixtures/disk-target.qcow2 \
-              --timeout 1800
+              --timeout 3600
           RUN_STATUS=$?
           set -e
 
@@ -609,6 +644,8 @@ jobs:
           ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64-qa-install.iso || {
             ./distribution/scripts/record-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for the QA-install ISO (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the QA-install ISO (secondary, non-blocking)"
           }
 
       # The central S7.1 proof (Section 44-46) - hash BOTH disk images
@@ -651,6 +688,8 @@ jobs:
             dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
             ./distribution/scripts/record-failure.sh "protected_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the protected disk post-install measurement (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "protected_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the protected disk post-install measurement (secondary, non-blocking)"
           }
 
       - name: Hash target disk (post-install)
@@ -660,6 +699,8 @@ jobs:
           ./installer/scripts/hash-disk-image.sh \
             dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
             ./distribution/scripts/record-failure.sh "target_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the target disk post-install measurement (secondary, non-blocking)"
+            ./installer/scripts/record-secondary-failure.sh "target_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the target disk post-install measurement (secondary, non-blocking)"
           }
 
@@ -790,6 +831,20 @@ jobs:
             ARGS+=(--failure-reason "$(cat dist/.failure_reason)")
           fi
 
+          # S7.1R6 Objective D: every real secondary/non-blocking
+          # failure this run recorded (installer/scripts/
+          # record-secondary-failure.sh) - purely additive visibility,
+          # never touching --failure-stage/-reason above, which remain
+          # computed exclusively from dist/.failure_stage/.failure_reason
+          # (record-failure.sh's own, unmodified, first-failure-wins
+          # mechanism).
+          if [ -f dist/.secondary_failures ]; then
+            while IFS=$'\t' read -r SECONDARY_STAGE SECONDARY_REASON; do
+              [ -n "${SECONDARY_STAGE}" ] || continue
+              ARGS+=(--secondary-failure "${SECONDARY_STAGE}:${SECONDARY_REASON}")
+            done < dist/.secondary_failures
+          fi
+
           ARGS+=(--installer-backend curtin)
           ARGS+=(--target-serial SEREIN-TARGET-DISK --target-device-path /dev/vdb)
           ARGS+=(--protected-disk SEREIN-PROTECTED-DISK:/dev/vda)
@@ -891,6 +946,7 @@ jobs:
             dist/installer-fixtures/qa-install-subiquity-signals.log
             dist/installer-fixtures/protected-disk-diagnostic.env
             dist/installer-fixtures/target-disk-diagnostic.env
+            dist/.secondary_failures
             dist/installer-fixtures/installed-boot/installed-boot-serial.log
           if-no-files-found: warn
           retention-days: 14

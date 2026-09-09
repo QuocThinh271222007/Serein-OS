@@ -999,6 +999,119 @@ class TestEvidenceStageGating:
         assert both_different.target_disk_changed is True
 
 
+class TestSecondaryFailures:
+    """S7.1R6 Objective D: real, direct regression coverage for the
+    primary/secondary failure distinction. Real Run #6 raised the
+    concern that a genuine primary blocker (installer_timeout) could
+    become obscured by a later, purely secondary cleanup/diagnostic
+    failure (artifact_release_failed) - these tests prove the
+    invariant holds: PRIMARY FAILURE MUST NEVER BE LOST OR OVERWRITTEN
+    BY CLEANUP/EVIDENCE FAILURES."""
+
+    def test_primary_installer_failure_preserved_with_secondary_present(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="installer_timeout",
+            failure_reason="real QA autoinstall run timed out",
+            secondary_failures=(
+                ("artifact_release_failed", "release-artifact.sh failed for the QA-install ISO"),
+            ),
+        )
+        assert evidence.failure_stage == "installer_timeout"
+        assert evidence.failure_reason == "real QA autoinstall run timed out"
+
+    def test_secondary_failure_remains_visible_in_evidence(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="installer_timeout",
+            failure_reason="real QA autoinstall run timed out",
+            secondary_failures=(
+                ("artifact_release_failed", "release-artifact.sh failed for the QA-install ISO"),
+            ),
+        )
+        assert evidence.secondary_failures == (
+            ("artifact_release_failed", "release-artifact.sh failed for the QA-install ISO"),
+        )
+
+    def test_multiple_secondary_failures_all_visible(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="installer_timeout",
+            failure_reason="real QA autoinstall run timed out",
+            secondary_failures=(
+                ("protected_disk_diagnostic_failed", "hash-disk-image.sh failed (before)"),
+                ("target_disk_diagnostic_failed", "hash-disk-image.sh failed (after)"),
+            ),
+        )
+        assert len(evidence.secondary_failures) == 2
+
+    def test_success_path_unaffected_no_secondary_failures(self):
+        evidence = _passing_evidence()
+        assert evidence.secondary_failures == ()
+        assert evidence.failure_stage is None
+
+    def test_empty_secondary_failures_never_fabricated(self):
+        evidence = assemble_installer_layer_b_evidence(source_commit="a" * 40)
+        assert evidence.secondary_failures == ()
+
+    def test_to_dict_serializes_secondary_failures_as_stage_reason_objects(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            secondary_failures=(("artifact_release_failed", "some real reason"),),
+        )
+        data = evidence.to_dict()
+        assert data["secondary_failures"] == [
+            {"stage": "artifact_release_failed", "reason": "some real reason"}
+        ]
+
+    def test_matches_schema(self):
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="installer_timeout",
+            failure_reason="timed out",
+            secondary_failures=(("artifact_release_failed", "some reason"),),
+        )
+        jsonschema.validate(
+            evidence.to_dict(), _load_schema("installer-layer-b-evidence.schema.json")
+        )
+
+    def test_round_trip_through_write_and_load(self, tmp_path):
+        original = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="installer_timeout",
+            failure_reason="timed out",
+            secondary_failures=(
+                ("artifact_release_failed", "reason one"),
+                ("protected_disk_diagnostic_failed", "reason two"),
+            ),
+        )
+        path = write_installer_layer_b_evidence(original, tmp_path / "evidence.json")
+        reloaded = load_installer_layer_b_evidence(path)
+        assert reloaded.failure_stage == "installer_timeout"
+        assert reloaded.secondary_failures == (
+            ("artifact_release_failed", "reason one"),
+            ("protected_disk_diagnostic_failed", "reason two"),
+        )
+
+    def test_older_evidence_without_field_loads_with_empty_tuple(self, tmp_path):
+        # Backward compatibility - evidence written before S7.1R6 never
+        # had this field at all.
+        path = tmp_path / "old-evidence.json"
+        data = _passing_evidence().to_dict()
+        del data["secondary_failures"]
+        path.write_text(json.dumps(data), encoding="utf-8")
+        reloaded = load_installer_layer_b_evidence(path)
+        assert reloaded.secondary_failures == ()
+
+    def test_secondary_failures_never_gate_closure(self):
+        # Purely additive visibility - closure enforcement must remain
+        # exclusively driven by the existing, unchanged fields.
+        evidence = _passing_evidence(
+            secondary_failures=(("artifact_release_failed", "cleanup hiccup"),),
+        )
+        enforce_installer_layer_b_closure(evidence, expected_source_commit="a" * 40)
+
+
 class TestClosureGate:
     def test_all_required_fields_pass_closure_passes(self):
         evidence = _passing_evidence()
@@ -1548,6 +1661,35 @@ class TestInstallerSmokeWorkflow:
             assert stage in step["run"]
             assert "exit 1" not in step["run"]
 
+    def test_every_secondary_failure_site_also_calls_the_new_recorder(self, workflow):
+        # S7.1R6 Objective D - every existing "secondary, non-blocking"
+        # record-failure.sh call site must ALSO call the new,
+        # additive-visibility record-secondary-failure.sh, so its
+        # failure appears in evidence's secondary_failures list without
+        # ever touching (or being subject to) record-failure.sh's own
+        # first-failure-wins primary mechanism.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        for name in (
+            "Release S7.0 build work tree", "Release production ISO",
+            "Release QA ISO and QA-install extraction tree", "Release QA-install ISO",
+            "Hash protected disk (pre-install baseline)", "Hash protected disk (post-install)",
+            "Hash target disk (pre-install baseline)", "Hash target disk (post-install)",
+        ):
+            step = next(s for s in steps if s.get("name") == name)
+            assert "record-secondary-failure.sh" in step["run"], name
+
+    def test_evidence_assembly_reads_secondary_failures_file(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        assemble = next(s for s in steps if s.get("name") == "Assemble Installer Layer-B evidence")
+        assert "dist/.secondary_failures" in assemble["run"]
+        assert "--secondary-failure" in assemble["run"]
+
+    def test_secondary_failures_file_uploaded(self, workflow):
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        paths = upload["with"]["path"]
+        assert "dist/.secondary_failures" in paths
+
     def test_extract_signals_step_present_and_always_runs(self, workflow):
         steps = workflow["jobs"]["installer-smoke"]["steps"]
         step = next(
@@ -1717,6 +1859,78 @@ class TestInstallerFirstFailureWins:
         assert (
             work_dir / "dist" / ".failure_stage"
         ).read_text().strip() == "installer_execution"
+
+
+# ---------------------------------------------------------------------------
+# S7.1R6 Objective D: installer/scripts/record-secondary-failure.sh -
+# real bash execution, plus the combined primary+secondary invariant.
+# ---------------------------------------------------------------------------
+
+
+class TestRecordSecondaryFailureScript:
+    SCRIPT_PATH = REPO_ROOT / "installer" / "scripts" / "record-secondary-failure.sh"
+    PRIMARY_SCRIPT_PATH = REPO_ROOT / "distribution" / "scripts" / "record-failure.sh"
+
+    def _run(self, work_dir: Path, stage: str, reason: str) -> subprocess.CompletedProcess:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        return subprocess.run(
+            ["bash", str(self.SCRIPT_PATH), stage, reason],
+            cwd=work_dir, capture_output=True, text=True,
+        )
+
+    def test_appends_one_line_per_call(self, tmp_path):
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        self._run(work_dir, "artifact_release_failed", "reason one")
+        self._run(work_dir, "protected_disk_diagnostic_failed", "reason two")
+        lines = (work_dir / "dist" / ".secondary_failures").read_text().splitlines()
+        assert lines == [
+            "artifact_release_failed\treason one",
+            "protected_disk_diagnostic_failed\treason two",
+        ]
+
+    def test_never_touches_primary_failure_files(self, tmp_path):
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        self._run(work_dir, "artifact_release_failed", "some reason")
+        assert not (work_dir / "dist" / ".failure_stage").exists()
+        assert not (work_dir / "dist" / ".failure_reason").exists()
+
+    def test_missing_args_fails_closed(self, tmp_path):
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT_PATH), "only_one_arg"],
+            cwd=work_dir, capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+
+    def test_primary_never_overwritten_by_secondary_recorder(self, tmp_path):
+        # The exact real invariant Section 10/18 requires: a genuine
+        # primary blocker (installer_timeout, via the UNMODIFIED S7.0
+        # record-failure.sh) coexists with, and is never affected by,
+        # any number of secondary recordings.
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+
+        subprocess.run(
+            ["bash", str(self.PRIMARY_SCRIPT_PATH), "installer_timeout", "timed out at 1800s"],
+            cwd=work_dir, capture_output=True, text=True, check=True,
+        )
+        self._run(work_dir, "artifact_release_failed", "release-artifact.sh failed for the ISO")
+        self._run(work_dir, "protected_disk_diagnostic_failed", "hash-disk-image.sh failed")
+
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "installer_timeout"
+        assert (
+            work_dir / "dist" / ".failure_reason"
+        ).read_text().strip() == "timed out at 1800s"
+        secondary_lines = (work_dir / "dist" / ".secondary_failures").read_text().splitlines()
+        assert len(secondary_lines) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2214,6 +2428,185 @@ class TestHashDiskImageScript:
 
 
 # ---------------------------------------------------------------------------
+# S7.1R6 Objective C: installer/scripts/inspect-target-layout.sh - real
+# bash execution against stub sudo/qemu-img/losetup/blkid tools.
+# Rewritten to remove the same qemu-nbd/nbd-device-node dependency
+# real Run #5 proved fragile in the sibling hash-disk-image.sh - this
+# script's own nbd2 usage had never actually executed successfully in
+# any real run (every prior run timed out before "Inspect target disk
+# layout" could run at all).
+#
+# Section 9's own instruction: "if actual runtime-level NBD
+# verification cannot be performed locally... do not label it PASS."
+# This development environment has no real block-device/loop
+# capability, so only what is HONESTLY testable without one is tested
+# here - a genuine "valid expected layout accepted" runtime scenario
+# remains TARGET_LAYOUT_INSPECTOR_RUNTIME=NOT_OBSERVED, reported as
+# such in the final report, never fabricated as PASS.
+# ---------------------------------------------------------------------------
+
+
+class TestInspectTargetLayoutScript:
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "inspect-target-layout.sh"
+
+    def _fake_tools(self, bin_dir: Path, *, convert_exit: int = 0) -> None:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        for name, body in {
+            "sudo": '#!/usr/bin/env bash\nexec "$@"\n',
+            "qemu-img": (
+                "#!/usr/bin/env bash\n"
+                'if [ "$1" = "convert" ]; then\n'
+                f"  exit {convert_exit}\n"
+                "fi\n"
+                "exit 1\n"
+            ),
+            "losetup": (
+                "#!/usr/bin/env bash\n"
+                'case "$1" in\n'
+                "  --show) echo '/dev/loop88'; exit 0 ;;\n"
+                "  -d) exit 0 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            ),
+            "partprobe": "#!/usr/bin/env bash\nexit 0\n",
+            # No real loop-backed block device exists in this sandbox -
+            # blkid never gets a real path to inspect anyway
+            # ([ -b ... ] already fails first), but fail closed too.
+            "blkid": "#!/usr/bin/env bash\nexit 1\n",
+        }.items():
+            script = bin_dir / name
+            script.write_text(body)
+            script.chmod(0o755)
+
+    def _run(
+        self, tmp_path: Path, *, convert_exit: int = 0, image_present: bool = True
+    ) -> tuple[subprocess.CompletedProcess, Path]:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        bin_dir = tmp_path / "bin"
+        self._fake_tools(bin_dir, convert_exit=convert_exit)
+        target = tmp_path / "disk-target.qcow2"
+        if image_present:
+            target.write_bytes(b"fake target qcow2 bytes")
+
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT), str(target)],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+        )
+        return result, target
+
+    def _outputs(self, stdout: str) -> dict[str, str]:
+        return dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+
+    def test_no_block_device_reports_honest_fail_closed_defaults(self, tmp_path):
+        # TARGET_LAYOUT_INSPECTOR_RUNTIME=NOT_OBSERVED (Section 9) - no
+        # real loop-backed partition exists in this sandbox, so this is
+        # the only runtime scenario honestly testable here. Every field
+        # must be the fail-closed default, never fabricated.
+        result, _target = self._run(tmp_path)
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs = self._outputs(result.stdout)
+        assert outputs["target_esp_present"] == "false"
+        assert outputs["target_root_present"] == "false"
+        assert outputs["serein_core_present"] == "false"
+        assert outputs["firstboot_provisioning"] == "unknown"
+
+    def test_missing_image_fails_closed(self, tmp_path):
+        result, _target = self._run(tmp_path, image_present=False)
+        assert result.returncode != 0
+
+    def test_conversion_failure_fails_closed_and_cleans_up(self, tmp_path):
+        result, _target = self._run(tmp_path, convert_exit=1)
+        assert result.returncode != 0
+        leftover = list(tmp_path.glob(".inspect-target-layout-raw.*"))
+        assert leftover == []
+
+    def test_missing_required_tool_fails_closed(self, tmp_path):
+        bash_path = shutil.which("bash")
+        if bash_path is None:
+            pytest.skip("bash not available in this environment")
+        target = tmp_path / "disk-target.qcow2"
+        target.write_bytes(b"x")
+        empty_bin = tmp_path / "empty-bin"
+        empty_bin.mkdir()
+        env = dict(os.environ)
+        env["PATH"] = str(empty_bin)
+        result = subprocess.run(
+            [bash_path, str(self.SCRIPT), str(target)],
+            cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode != 0
+
+    def test_cleanup_removes_temp_raw_file_on_success(self, tmp_path):
+        result, _target = self._run(tmp_path)
+        assert result.returncode == 0
+        leftover = list(tmp_path.glob(".inspect-target-layout-raw.*"))
+        assert leftover == []
+
+    def test_no_qemu_nbd_or_nbd_device_dependency(self):
+        # S7.1R6 Objective C - the exact same real defect class this
+        # rewrite eliminates for this sibling script (comments
+        # explaining the historical defect legitimately mention these
+        # strings, and must not trip this check).
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert "qemu-nbd" not in stripped, line
+            assert "/dev/nbd" not in stripped, line
+            assert "modprobe" not in stripped, line
+
+    def test_loop_device_attached_readonly(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        connect_line = next(
+            li for li in text.splitlines()
+            if "losetup --show" in li and not li.strip().startswith("#")
+        )
+        assert " -r " in connect_line or connect_line.rstrip().endswith(" -r")
+
+    def test_root_mount_uses_noload_never_replays_journal(self):
+        # The real, independently-found gap this pass fixes - the
+        # previous version used plain `-o ro` (no noload) for the root
+        # partition, risking a journal replay on a disk a real install
+        # just touched.
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        mount_line = next(
+            li for li in text.splitlines()
+            if re.match(r"\s*if sudo mount ", li) and "p2" in li
+        )
+        assert "ro,noload" in mount_line
+
+    def test_never_mounts_read_write(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if re.match(r"\s*(sudo )?mount ", line.strip()):
+                assert "-o ro" in line, line
+
+    def test_conversion_never_writes_to_source_image(self):
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        convert_line = next(
+            li for li in text.splitlines()
+            if "qemu-img convert" in li and not li.strip().startswith("#")
+        )
+        assert '"${TARGET_IMG}"' in convert_line
+        assert '"${RAW_TMP}"' in convert_line
+
+    def test_output_contract_unchanged_from_prior_version(self):
+        # Section 9's own concern: other code (evidence assembly)
+        # depends on these exact keys - the rewrite must never change
+        # the output contract, only the internal mechanism.
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        for key in (
+            "target_esp_present=", "target_root_present=",
+            "serein_core_present=", "firstboot_provisioning=",
+        ):
+            assert key in text
+
+
+# ---------------------------------------------------------------------------
 # S7.1R4 Section 10: installer/scripts/extract-installer-signals.sh
 # ---------------------------------------------------------------------------
 
@@ -2300,6 +2693,28 @@ class TestInstallerScriptsStatic:
                 ["bash", "-n", str(script)], capture_output=True, text=True
             )
             assert result.returncode == 0, f"{script}: {result.stderr}"
+
+    def test_r6_target_fixture_capacity_increased_protected_unchanged(self):
+        # S7.1R6 Objective B: real Run #6 evidence (Serein's own built
+        # QA ISO is ~7 GiB per docs/installer/storage-lifecycle.md's
+        # own documented QA_ISO_GIB estimate) means the previous 8G
+        # target left essentially no real margin for a decompressed
+        # full-desktop install. Only the TARGET fixture grows - the
+        # PROTECTED fixture size is independently justified (it exists
+        # only to prove non-mutation, not to hold an installed system)
+        # and must never change merely because target did.
+        text = (REPO_ROOT / "installer" / "scripts" / "create-fixture-disks.sh").read_text(
+            encoding="utf-8"
+        )
+        protected_line = next(
+            li for li in text.splitlines() if '"${OUT_DIR}/disk-protected.qcow2"' in li
+        )
+        assert "4G" in protected_line
+        target_line = next(
+            li for li in text.splitlines() if '"${OUT_DIR}/disk-target.qcow2"' in li
+        )
+        assert "16G" in target_line
+        assert "8G" not in target_line
 
 
 class TestInstallerScriptExecutableModes:

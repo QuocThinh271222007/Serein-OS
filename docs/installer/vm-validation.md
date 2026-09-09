@@ -215,6 +215,38 @@ forwards the whole journal to the serial console in real time, giving
 the next real run's serial log actual Subiquity/curtin runtime
 evidence instead of only kernel/systemd boot messages.
 
+## S7.1R6: real install time budget, target capacity, closure preflight
+
+Real Run #6 proved curtin actively progressing (real chroot/apt/dpkg
+work) only ~31s before the previous 1800s timeout killed it - the
+first real evidence authorizing a bounded increase. The real QA
+install's own timeout is now 3600s
+(`installer/scripts/run-qa-install.sh`'s default and the workflow's
+explicit `--timeout`) - every OTHER timeout in this codebase (the
+bounded, non-destructive startup probe; the installed-target boot
+check) is a separately-bounded scope, deliberately unchanged.
+
+The target fixture grew 8G -> 16G (see
+`docs/installer/storage-lifecycle.md`'s "S7.1R6" section for the full
+evidence and preflight-arithmetic reasoning) - the protected fixture
+(4G) is unchanged.
+
+`installer/scripts/inspect-target-layout.sh` was rewritten to use the
+same `qemu-img convert` + `losetup -P` approach `hash-disk-image.sh`
+already established (never qemu-nbd) - this script had never actually
+executed successfully in any real run, and Run #6's real progress
+makes Run #7 newly likely to finally reach it. Its output contract
+(`target_esp_present`/`target_root_present`/`serein_core_present`/
+`firstboot_provisioning`) is unchanged.
+
+Evidence now also carries a purely-additive `secondary_failures` field
+(`installer/scripts/record-secondary-failure.sh` +
+`serein.installer.evidence`) - every diagnostic/cleanup step's own
+failure remains visible without ever being able to overwrite (or be
+confused with) the real primary blocker, which stays computed
+exclusively by `distribution/scripts/record-failure.sh` (S7.0-owned,
+unmodified).
+
 ## What this development environment can and cannot prove
 
 This repository's development environment has no `qemu-img`/

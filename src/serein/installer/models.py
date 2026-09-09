@@ -288,6 +288,20 @@ class InstallerLayerBEvidence:
     failure_stage: str | None = None
     failure_reason: str | None = None
 
+    #: S7.1R6 Objective D - real, secondary/non-blocking failures
+    #: (e.g. a diagnostic hashing step or an artifact-release cleanup
+    #: step) that occurred during this run, each as a real
+    #: ``(stage, reason)`` pair. NEVER the source of ``failure_stage``/
+    #: ``failure_reason`` above - those remain computed exclusively by
+    #: ``distribution/scripts/record-failure.sh``'s own, unmodified,
+    #: first-failure-wins mechanism (an S7.0-owned helper this field
+    #: never touches or reinterprets). This is purely additive
+    #: visibility - a real primary blocker (e.g. ``installer_timeout``)
+    #: must never be lost or overwritten by a later secondary
+    #: cleanup/diagnostic failure; this field is what makes every such
+    #: secondary failure visible in evidence without risking that.
+    secondary_failures: tuple[tuple[str, str], ...] = ()
+
     installer_backend: str | None = None
     installer_backend_version: str | None = None
     installer_backend_available: bool = False
@@ -359,6 +373,9 @@ class InstallerLayerBEvidence:
             "source_commit": self.source_commit,
             "failure_stage": self.failure_stage,
             "failure_reason": self.failure_reason,
+            "secondary_failures": [
+                {"stage": stage, "reason": reason} for stage, reason in self.secondary_failures
+            ],
             "installer_backend": self.installer_backend,
             "installer_backend_version": self.installer_backend_version,
             "installer_backend_available": self.installer_backend_available,

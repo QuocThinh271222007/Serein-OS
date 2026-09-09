@@ -1,5 +1,84 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R6)
+
+**Six real Installer Layer-B runs have occurred.** Run #6 is the
+furthest any real run has ever progressed - both R4's readonly hardening
+and R3's autoinstall activation are now PROVEN correct, and real
+Subiquity/curtin execution was directly observed for the first time:
+
+```text
+Run 6 (after S7.1R5):
+  RUN_ID=34265949262, RUN_NUMBER=6
+  HEAD=7dab8b650fabbd9f56d6ec94b45797f102951bf4
+  RESULT=FAILURE - failure_stage=installer_timeout, but NOT a stall.
+
+  LOCKED PROVEN PASS (re-confirmed, not reopened):
+    - protected_container_sha256 unchanged, protected_logical_sha256
+      unchanged, both protected sentinels unchanged (R4's readonly=on
+      fix + R5's hash-disk-image.sh both proven correct at runtime)
+    - autoinstall kernel token present, Subiquity started, autoinstall
+      config extracted/loaded/core-validated/applied, Subiquity
+      entered its real Install phase (R3's fix proven to actually
+      trigger the full activation chain, not merely the kernel token)
+    - REAL curtin execution: `python3.12 -m curtin --showtrace -vvv`,
+      real chroot/apt/dpkg/debconf activity observed as late as
+      ~1769s - only ~31s before the previous 1800s deadline killed it
+
+  This is the first real evidence that QEMU was terminated WHILE the
+  installer was actively progressing, not stalled - the first
+  evidence that genuinely authorizes a timeout increase (never merely
+  because a run failed).
+
+  S7.1R6 fixes/instruments:
+
+  1. Real QA-install timeout: 1800s -> 3600s (installer/scripts/
+     run-qa-install.sh's own default, and the workflow's explicit
+     --timeout). Every OTHER timeout (bounded startup probe,
+     installed-target boot check) is a separate, already-bounded
+     scope, deliberately left unchanged.
+  2. Target fixture capacity: 8G -> 16G
+     (installer/scripts/create-fixture-disks.sh) - real project
+     evidence (this document's own QA_ISO_GIB=7 estimate for Serein's
+     built Ubuntu 26.04 Desktop QA ISO; ~6.0 GB base ISO per
+     distribution/base-image.json's own recorded notes) meant the
+     previous 8G target left essentially no real margin for a
+     decompressed full-desktop install. Protected fixture size (4G)
+     is unchanged - independently justified, never grown merely
+     because target did.
+  3. installer/scripts/inspect-target-layout.sh rewritten to remove
+     its qemu-nbd/nbd-device-node dependency (the same class of defect
+     R5 already proved fragile in the sibling hash-disk-image.sh) -
+     this script had never actually executed successfully in any real
+     run (every prior run timed out before reaching it), and Run #6's
+     real curtin progress makes Run #7 newly likely to finally reach
+     it. Also fixed a real, independently-found gap: the root-partition
+     mount previously lacked `noload`, risking an ext4 journal replay
+     even under a read-only mount.
+  4. Primary/secondary failure-stage semantics: new
+     installer/scripts/record-secondary-failure.sh + a new,
+     purely-additive `secondary_failures` evidence field, so every
+     diagnostic/cleanup step's own failure remains visible without
+     ever being able to overwrite (or be confused with) the real
+     primary blocker - which remains computed exclusively by
+     `distribution/scripts/record-failure.sh` (S7.0-owned, unmodified).
+
+  Preflight arithmetic revised (Section 8-9 of storage-lifecycle.md):
+  FIXTURE_QCOW2_VIRTUAL_GIB 12->20 (documentation/contrast only) and
+  FIXTURE_QCOW2_ALLOCATED_GIB 6->12 (Run #6's real curtin progress
+  justifies a more generous real-allocation estimate) - REQUIRED_GIB
+  stays 27 unchanged, since ISOPREP_PEAK_GIB=21 remains the binding
+  constraint either way.
+
+  This pass deliberately did NOT: touch storage-selection/curtin-
+  grammar/target-identity code (Section 12's "block_probe_fail" was
+  observed but not proven fatal - installer activity continued
+  afterward to ~1769s, so it was left untouched), weaken any safety
+  invariant, or claim closure - the exact reason installation does not
+  complete within the new 3600s budget remains genuinely unknown
+  pending Run #7's real evidence.
+```
+
 ## Real Layer-B validation status (S7.1R5)
 
 **Five real Installer Layer-B runs have occurred.** Run #5 confirmed

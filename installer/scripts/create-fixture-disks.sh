@@ -96,9 +96,20 @@ _populate_disk \
     "${OUT_DIR}/disk-protected.qcow2" 4G /dev/nbd0 \
     "PROTECTED_DATA" "SEREIN_PROTECTED_FIXTURE"
 
+# S7.1R6 Objective B: 16G (was 8G) - real project evidence
+# (docs/installer/storage-lifecycle.md's own documented QA_ISO_GIB=7
+# estimate for Serein's built Ubuntu 26.04 Desktop QA ISO; base
+# ISO ~6.0 GB per distribution/base-image.json's own recorded notes)
+# means the compressed source payload alone is already ~6-7 GiB - a
+# real full-desktop install's DECOMPRESSED root filesystem footprint
+# is virtually always larger than its compressed source, never
+# smaller, so the previous 8G target left essentially no real margin.
+# 16G is a bounded, evidence-informed increase - still a realistic
+# constrained installation target, never made absurdly large merely to
+# guarantee CI success.
 echo "==> Creating target disk fixture (${OUT_DIR}/disk-target.qcow2)"
 _populate_disk \
-    "${OUT_DIR}/disk-target.qcow2" 8G /dev/nbd1 \
+    "${OUT_DIR}/disk-target.qcow2" 16G /dev/nbd1 \
     "OLD_DEBIAN_DATA" "SEREIN_TARGET_FIXTURE_PRE_INSTALL"
 
 echo "==> Recording pre-install fixture disk hashes"

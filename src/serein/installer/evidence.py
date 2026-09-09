@@ -50,6 +50,7 @@ def assemble_installer_layer_b_evidence(
     source_commit: str,
     failure_stage: str | None = None,
     failure_reason: str | None = None,
+    secondary_failures: tuple[tuple[str, str], ...] = (),
     installer_backend: str | None = None,
     installer_backend_version: str | None = None,
     installer_backend_available: bool = False,
@@ -90,11 +91,20 @@ def assemble_installer_layer_b_evidence(
     preflight, before any fixture disk was ever created. It defaults to
     ``False`` and must only ever be set ``True`` by a caller that has
     observed the real fixture-disk topology actually exists (never
-    merely that the workflow source code declares a target serial)."""
+    merely that the workflow source code declares a target serial).
+
+    ``secondary_failures`` (S7.1R6 Objective D) is purely additive
+    visibility for real, non-blocking cleanup/diagnostic failures -
+    never the source of ``failure_stage``/``failure_reason``, which
+    remain computed exclusively from whatever
+    ``distribution/scripts/record-failure.sh`` (unmodified,
+    first-failure-wins) actually recorded as the real primary
+    blocker."""
     return InstallerLayerBEvidence(
         source_commit=source_commit,
         failure_stage=failure_stage,
         failure_reason=failure_reason,
+        secondary_failures=secondary_failures,
         installer_backend=installer_backend,
         installer_backend_version=installer_backend_version,
         installer_backend_available=installer_backend_available,
@@ -167,6 +177,12 @@ def load_installer_layer_b_evidence(path: Path) -> InstallerLayerBEvidence:
         source_commit=data["source_commit"],
         failure_stage=data.get("failure_stage"),
         failure_reason=data.get("failure_reason"),
+        # Backward compatible - absent (older evidence, before S7.1R6)
+        # means simply no secondary failures were ever recorded, never
+        # an error.
+        secondary_failures=tuple(
+            (entry["stage"], entry["reason"]) for entry in data.get("secondary_failures", [])
+        ),
         installer_backend=data.get("installer_backend"),
         installer_backend_version=data.get("installer_backend_version"),
         installer_backend_available=bool(data.get("installer_backend_available", False)),

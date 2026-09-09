@@ -54,6 +54,22 @@ def _parse_protected_disk(spec: str) -> tuple[str, str]:
     return serial, device_path
 
 
+def _parse_secondary_failure(spec: str) -> tuple[str, str]:
+    """Parse one ``--secondary-failure <stage>:<reason>`` entry
+    (S7.1R6 Objective D) - splits on the FIRST ``:`` only, so a reason
+    text may itself legitimately contain colons."""
+    if ":" not in spec:
+        raise argparse.ArgumentTypeError(
+            f"--secondary-failure must be 'STAGE:REASON', got {spec!r}"
+        )
+    stage, reason = spec.split(":", 1)
+    if not stage or not reason:
+        raise argparse.ArgumentTypeError(
+            f"--secondary-failure must be 'STAGE:REASON', got {spec!r}"
+        )
+    return stage, reason
+
+
 def _cmd_render_autoinstall(args: argparse.Namespace) -> int:
     from serein.installer.models import TargetDiskIdentity
     from serein.installer.payload import build_install_state_marker, generate_qa_credential
@@ -218,11 +234,13 @@ def _cmd_evidence(args: argparse.Namespace) -> int:
     )
 
     boot_result = _load_json_optional(args.installed_boot_result)
+    secondary_failures = tuple(args.secondary_failure or ())
 
     evidence = assemble_installer_layer_b_evidence(
         source_commit=args.source_commit,
         failure_stage=args.failure_stage,
         failure_reason=args.failure_reason,
+        secondary_failures=secondary_failures,
         installer_backend=args.installer_backend or None,
         installer_backend_version=args.installer_backend_version or None,
         installer_backend_available=args.installer_backend_available,
@@ -344,6 +362,11 @@ def main(argv: list[str] | None = None) -> int:
     evidence_parser.add_argument("--source-commit", required=True)
     evidence_parser.add_argument("--failure-stage", default=None)
     evidence_parser.add_argument("--failure-reason", default=None)
+    evidence_parser.add_argument(
+        "--secondary-failure", action="append", type=_parse_secondary_failure, default=[],
+        help="'STAGE:REASON' - repeatable, one per real non-blocking cleanup/diagnostic "
+             "failure (S7.1R6 Objective D) - never the source of --failure-stage/-reason",
+    )
     evidence_parser.add_argument("--installer-backend", default="")
     evidence_parser.add_argument("--installer-backend-version", default="")
     evidence_parser.add_argument("--installer-backend-available", action="store_true")

@@ -94,17 +94,44 @@ evidence (see `docs/distribution/known-limitations.md`'s run history).
 corrective) creates one transient, disposable raw-format copy of
 whichever disk it is currently hashing (via `qemu-img convert`),
 deleted immediately (trap-based cleanup) before the script returns -
-never more than one such temp file alive at a time. Reasoned peak
-impact (not measured - `REQUIRED_GIB` is deliberately NOT bumped this
-round without real telemetry justifying it, per this document's own
-established discipline): the largest single call converts the target
-disk (virtual capacity 8 GiB) while the QA-install ISO (7 GiB) is
-still alive and both fixture qcow2s are resident - a reasoned new
-candidate peak of roughly `7 + 6(FIXTURE_QCOW2_ALLOCATED_GIB) + 8 = 21`
-GiB, at parity with (not exceeding) the existing `ISOPREP_PEAK_GIB=21`
-this document already accounts for, so `REQUIRED_GIB=27` should retain
-its existing real margin. This reasoning is unverified against a real
-run - `log-disk-usage.sh`'s existing telemetry (unchanged this round)
-is what will actually confirm or correct it from Run #6's real
-`du`/`df` output, exactly as this document's own established
-discipline requires.
+never more than one such temp file alive at a time.
+`installer/scripts/inspect-target-layout.sh` (S7.1R6 Objective C) uses
+the identical pattern for its own single, transient raw copy of the
+target disk.
+
+## S7.1R6: target fixture capacity + revised allocation estimate
+
+Real Run #6 (`RUN_ID=34265949262`) proved curtin actively progressing
+into real chroot/apt/dpkg work before the previous 1800s timeout -
+direct evidence that a real install's actual allocated growth on the
+target can exceed the original conservative estimate. Two real,
+evidence-driven revisions:
+
+- **Target fixture virtual capacity: 8 GiB -> 16 GiB**
+  (`installer/scripts/create-fixture-disks.sh`) - the previous 8 GiB
+  left essentially no real margin against this document's own already-
+  documented `QA_ISO_GIB=7` estimate for Serein's built Ubuntu 26.04
+  Desktop QA ISO (compressed source); a decompressed full-desktop
+  install's real footprint is virtually always larger than its
+  compressed source, never smaller. Protected fixture capacity
+  (4 GiB) is unchanged - independently justified (it exists only to
+  prove non-mutation, never to hold an installed system).
+- **`FIXTURE_QCOW2_ALLOCATED_GIB`: 6 -> 12** - a more generous,
+  evidence-informed real-allocation estimate for the SAME reason.
+
+Recomputed candidate peaks: `ISOPREP_PEAK_GIB` is unchanged at 21
+(does not depend on fixture size). The largest single raw-conversion
+call now converts the target disk (virtual capacity 16 GiB, but the
+transient raw file's real disk consumption tracks the source's real
+ALLOCATED bytes, not its full virtual capacity, since `qemu-img
+convert -O raw` produces a sparse output file on a sparse-capable
+filesystem like the GitHub runner's own ext4) - `INSTALL_PEAK_GIB =
+QA_INSTALL_ISO_GIB(7) + FIXTURE_QCOW2_ALLOCATED_GIB(12) = 19`, still
+below `ISOPREP_PEAK_GIB=21`, so `PEAK_GIB` and therefore
+`REQUIRED_GIB=27` are BOTH unchanged - this revision fits within the
+existing real margin without needing to raise the enforced gate
+number. This reasoning remains unverified against a real run -
+`log-disk-usage.sh`'s existing telemetry (unchanged this round) is
+what will actually confirm or correct it from Run #7's real `du`/`df`
+output, exactly as this document's own established discipline
+requires.
