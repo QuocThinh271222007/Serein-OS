@@ -191,6 +191,31 @@ def _enable_journald_console_forwarding_on_qa_entry(
     )
 
 
+def _enable_systemd_debug_logging_on_qa_entry(
+    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
+) -> str:
+    """S7.1R7 Objective A: add ``systemd.log_level=debug`` to the named
+    menuentry.
+
+    Real Run #7 evidence (RUN_ID=34335197624), surfaced entirely via
+    R5's journald-forwarding fix above, showed a ~3044s pre-Subiquity
+    bootstrap window dominated by real systemd/snapd activity (service
+    startup timeouts, restarts, a desktop-security-center hook
+    failure/sanity timeout, mass snap service removal/remount, an NTP
+    10-minute wait) - but at systemd's default log level, WHY each of
+    these transitions occurred (exact dependency-ordering reasoning,
+    job-timeout detail) is not necessarily logged. Debug-level systemd
+    logging surfaces materially more detail about job/unit state
+    transitions and timeout reasoning, still purely a kernel-parameter
+    change through the SAME real, already-proven mechanism - never a
+    new guest-side service, file, or transport. Not expected to
+    increase noise unmanageably since only systemd's own logging
+    verbosity changes, not application-level (e.g. snapd's own)
+    verbosity.
+    """
+    return _add_kernel_token_to_qa_entry(grub_cfg_text, "systemd.log_level=debug", entry_title)
+
+
 def prepare_qa_install_iso(
     qa_iso_path: Path,
     work_dir: Path,
@@ -244,9 +269,11 @@ def prepare_qa_install_iso(
     original_grub_text = grub_path.read_text(encoding="utf-8")
     try:
         patched_grub_text = _enable_autoinstall_on_qa_entry(original_grub_text)
-        # S7.1R5 Objective C: chained onto the same, already-patched
-        # text - never a second independent grub.cfg parse/write cycle.
+        # S7.1R5 Objective C / S7.1R7 Objective A: both chained onto the
+        # same, already-patched text - never a second independent
+        # grub.cfg parse/write cycle.
         patched_grub_text = _enable_journald_console_forwarding_on_qa_entry(patched_grub_text)
+        patched_grub_text = _enable_systemd_debug_logging_on_qa_entry(patched_grub_text)
     except AutoinstallBootError as exc:
         raise IsoPrepError(f"cannot enable autoinstall boot: {exc}") from exc
     with _temporarily_owner_writable(grub_path):

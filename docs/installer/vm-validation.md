@@ -247,6 +247,53 @@ confused with) the real primary blocker, which stays computed
 exclusively by `distribution/scripts/record-failure.sh` (S7.0-owned,
 unmodified).
 
+## S7.1R7: primary/secondary wiring fix + bootstrap forensics
+
+Real Run #7 (`RUN_ID=34335197624`) exposed a real defect in R6's own
+secondary-failure wiring: every one of the 8 "secondary, non-blocking"
+call sites called BOTH `distribution/scripts/record-failure.sh`
+(PRIMARY) and `installer/scripts/record-secondary-failure.sh`
+(SECONDARY) for the SAME event - meaning a genuinely non-blocking
+cleanup/diagnostic failure (Run #7: a `build/work/extracted` release
+failure) could occupy `dist/.failure_stage` if it happened
+chronologically before the real installer blocker. Fixed: every
+secondary call site now calls ONLY the secondary recorder. The
+genuinely-primary call sites (`disk_preflight`, `base_fetch`, the real
+install run itself, target-layout-inspection failure, etc.) are
+unchanged. `distribution/scripts/record-failure.sh`'s own
+first-failure-wins mechanism was never the defect - it was working
+exactly as designed; the bug was which recorder each call site used.
+
+Run #7 also revealed a ~3044s pre-Subiquity bootstrap window (real
+snapd service startup timeouts/restarts, a desktop-security-center
+hook/sanity-timeout failure, mass snap service removal/remount, a
+task referencing a missing `/snap/snapd/current`, and a real 10-minute
+NTP wait) - `WHY_RUN_7_SNAPD_SEEDED_TOOK_~3044s` remains genuinely
+unproven. Two safe, zero-guest-modification-risk additions:
+
+- `installer/scripts/extract-bootstrap-milestones.sh` (new) - bounded,
+  host-side parsing of the already-captured serial log into a compact,
+  machine-readable milestone/duration record
+  (`qa-install-bootstrap-milestones.env`) for real run-to-run
+  comparison (`snapd_seed_duration`,
+  `curtin_runtime_before_qemu_exit`, etc.) - `qemu_timeout` specifically
+  comes from the real, already-known `qemu_elapsed_seconds` host-side
+  fact rather than being grep-matched, since QEMU's own termination
+  message has no guest-console timestamp.
+- `systemd.log_level=debug` added to the QA-install boot entry
+  (chained onto the same proven kernel-parameter mechanism as
+  `autoinstall`/journald-forwarding).
+
+Live in-guest command execution (`snap changes`/`snap tasks`,
+structured `systemctl show`, `timedatectl`, `ip route`) was
+deliberately NOT implemented this round - it would require injecting a
+new systemd unit into the live ISO's squashfs tree, a materially
+larger, untestable-in-this-environment change with real risk of
+breaking a future boot if done wrong. Deferred rather than risked
+without real testing capability; see
+`docs/installer/known-limitations.md`'s S7.1R7 entry for the full
+reasoning.
+
 ## What this development environment can and cannot prove
 
 This repository's development environment has no `qemu-img`/

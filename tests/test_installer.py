@@ -71,6 +71,7 @@ from serein.installer.isoprep import (
     IsoPrepError,
     _enable_autoinstall_on_qa_entry,
     _enable_journald_console_forwarding_on_qa_entry,
+    _enable_systemd_debug_logging_on_qa_entry,
     prepare_qa_install_iso,
 )
 from serein.installer.models import (
@@ -1111,6 +1112,25 @@ class TestSecondaryFailures:
         )
         enforce_installer_layer_b_closure(evidence, expected_source_commit="a" * 40)
 
+    def test_f_final_evidence_reflects_the_run_7_scenario(self, tmp_path):
+        # Section 22 Test F - given primary=installer_timeout and a
+        # secondary artifact_release_failed, the assembled JSON on disk
+        # must show both correctly.
+        evidence = assemble_installer_layer_b_evidence(
+            source_commit="a" * 40,
+            failure_stage="installer_timeout",
+            failure_reason="timed out at 3600s",
+            secondary_failures=(
+                ("artifact_release_failed", "release-artifact.sh failed for build/work/extracted"),
+            ),
+        )
+        path = write_installer_layer_b_evidence(evidence, tmp_path / "evidence.json")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["failure_stage"] == "installer_timeout"
+        assert {"stage": "artifact_release_failed",
+                "reason": "release-artifact.sh failed for build/work/extracted"} \
+            in data["secondary_failures"]
+
 
 class TestClosureGate:
     def test_all_required_fields_pass_closure_passes(self):
@@ -1661,13 +1681,10 @@ class TestInstallerSmokeWorkflow:
             assert stage in step["run"]
             assert "exit 1" not in step["run"]
 
-    def test_every_secondary_failure_site_also_calls_the_new_recorder(self, workflow):
-        # S7.1R6 Objective D - every existing "secondary, non-blocking"
-        # record-failure.sh call site must ALSO call the new,
-        # additive-visibility record-secondary-failure.sh, so its
-        # failure appears in evidence's secondary_failures list without
-        # ever touching (or being subject to) record-failure.sh's own
-        # first-failure-wins primary mechanism.
+    def test_every_secondary_failure_site_calls_the_secondary_recorder(self, workflow):
+        # Every "secondary, non-blocking" site must call
+        # record-secondary-failure.sh, so its failure appears in
+        # evidence's secondary_failures list.
         steps = workflow["jobs"]["installer-smoke"]["steps"]
         for name in (
             "Release S7.0 build work tree", "Release production ISO",
@@ -1677,6 +1694,46 @@ class TestInstallerSmokeWorkflow:
         ):
             step = next(s for s in steps if s.get("name") == name)
             assert "record-secondary-failure.sh" in step["run"], name
+
+    def test_secondary_failure_sites_never_also_call_the_primary_recorder(self, workflow):
+        # S7.1R7 Objective B (Test E) - the exact real Run #7 wiring
+        # defect: a "secondary, non-blocking" site must NEVER also call
+        # distribution/scripts/record-failure.sh for the SAME event,
+        # since that is the PRIMARY, first-failure-wins recorder - a
+        # non-blocking cleanup/diagnostic failure occupying
+        # dist/.failure_stage before the real installer blocker occurs
+        # is exactly the defect real Run #7 proved. This is a real,
+        # per-step structural check, not merely "the secondary recorder
+        # is present somewhere in the file" (which the previous,
+        # buggy R6 wiring would also have passed).
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        for name in (
+            "Release S7.0 build work tree", "Release production ISO",
+            "Release QA ISO and QA-install extraction tree", "Release QA-install ISO",
+            "Hash protected disk (pre-install baseline)", "Hash protected disk (post-install)",
+            "Hash target disk (pre-install baseline)", "Hash target disk (post-install)",
+        ):
+            step = next(s for s in steps if s.get("name") == name)
+            assert "distribution/scripts/record-failure.sh" not in step["run"], name
+
+    def test_genuine_primary_blocker_sites_still_call_the_primary_recorder(self, workflow):
+        # The fix must be surgical - genuinely blocking failures
+        # (disk_preflight, base_fetch, the real install run itself,
+        # etc.) must still call the PRIMARY recorder exactly as before.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        for name in (
+            "Disk space preflight", "Fetch pinned base image",
+            "Verify base image (fail-closed, checksum + signature)",
+            "Build Serein Alpha ISO (production + QA variant)",
+            "Strict-inspect production ISO", "Strict-inspect QA ISO",
+            "Render QA autoinstall config", "Prepare QA-install ISO",
+            "Create fixture disks (protected + target)",
+            "Re-verify fixture topology", "Run real QA autoinstall",
+            "Inspect target disk layout",
+            "Boot installed target (self-contained, no protected disk)",
+        ):
+            step = next(s for s in steps if s.get("name") == name)
+            assert "distribution/scripts/record-failure.sh" in step["run"], name
 
     def test_evidence_assembly_reads_secondary_failures_file(self, workflow):
         steps = workflow["jobs"]["installer-smoke"]["steps"]
@@ -1931,6 +1988,64 @@ class TestRecordSecondaryFailureScript:
         ).read_text().strip() == "timed out at 1800s"
         secondary_lines = (work_dir / "dist" / ".secondary_failures").read_text().splitlines()
         assert len(secondary_lines) == 2
+
+    # -- S7.1R7 Section 22: the exact required failure-semantics tests --
+
+    def test_a_no_primary_before_secondary(self, tmp_path):
+        # Test A - a lone primary recording.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        subprocess.run(
+            ["bash", str(self.PRIMARY_SCRIPT_PATH), "A", "reason A"],
+            cwd=work_dir, capture_output=True, text=True, check=True,
+        )
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "A"
+        assert not (work_dir / "dist" / ".secondary_failures").exists()
+
+    def test_b_primary_then_secondary(self, tmp_path):
+        # Test B.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        subprocess.run(
+            ["bash", str(self.PRIMARY_SCRIPT_PATH), "A", "reason A"],
+            cwd=work_dir, capture_output=True, text=True, check=True,
+        )
+        self._run(work_dir, "B", "reason B")
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "A"
+        secondary = (work_dir / "dist" / ".secondary_failures").read_text().splitlines()
+        assert secondary == ["B\treason B"]
+
+    def test_c_secondary_first_then_primary_the_exact_run_7_scenario(self, tmp_path):
+        # Test C - THE CRITICAL Run #7 scenario: a secondary/cleanup
+        # failure (artifact_release_failed) genuinely occurs FIRST
+        # chronologically, and the real installer_timeout blocker is
+        # only discovered afterward. Because the two recorders now
+        # write to entirely separate files, ordering must never matter
+        # - installer_timeout must still be primary.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        self._run(work_dir, "artifact_release_failed", "release-artifact.sh failed")
+        subprocess.run(
+            ["bash", str(self.PRIMARY_SCRIPT_PATH), "installer_timeout", "timed out at 3600s"],
+            cwd=work_dir, capture_output=True, text=True, check=True,
+        )
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "installer_timeout"
+        secondary = (work_dir / "dist" / ".secondary_failures").read_text().splitlines()
+        assert secondary == ["artifact_release_failed\trelease-artifact.sh failed"]
+
+    def test_d_multiple_secondary_before_primary(self, tmp_path):
+        # Test D.
+        work_dir = tmp_path / "work"
+        work_dir.mkdir()
+        self._run(work_dir, "B", "reason B")
+        self._run(work_dir, "C", "reason C")
+        subprocess.run(
+            ["bash", str(self.PRIMARY_SCRIPT_PATH), "A", "reason A"],
+            cwd=work_dir, capture_output=True, text=True, check=True,
+        )
+        assert (work_dir / "dist" / ".failure_stage").read_text().strip() == "A"
+        secondary = (work_dir / "dist" / ".secondary_failures").read_text().splitlines()
+        assert secondary == ["B\treason B", "C\treason C"]
 
 
 # ---------------------------------------------------------------------------
@@ -2665,6 +2780,143 @@ class TestExtractInstallerSignalsScript:
 
 
 # ---------------------------------------------------------------------------
+# S7.1R7 Objective A: installer/scripts/extract-bootstrap-milestones.sh
+# - real bash execution, purely host-side parsing of an already-
+# captured serial log. Real Run #7 (RUN_ID=34335197624) evidence is
+# used as the synthetic fixture content below, so these tests directly
+# reproduce the exact real timeline the corrective was written against.
+# ---------------------------------------------------------------------------
+
+
+class TestExtractBootstrapMilestonesScript:
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "extract-bootstrap-milestones.sh"
+
+    # A synthetic serial log reproducing the exact real Run #7 timeline
+    # (Section 3 of the S7.1R7 spec) - never fabricated numbers, these
+    # are the real, reported milestone timestamps.
+    _RUN_7_LIKE_LOG = (
+        "[    0.000000] Linux version 7.0.0-30-generic\n"
+        "[    5.178096] systemd[1]: systemd 259.5 running in system mode\n"
+        "[  120.000000] Starting snapd.service\n"
+        "[  437.540000] snapd.seeded.service: Starting...\n"
+        "[  597.930000] snap client: cannot communicate with server: "
+        "timeout exceeded while waiting for response\n"
+        "[  598.000000] snapd.seeded.service failed\n"
+        "[  613.000000] snapd.service: start operation timed out\n"
+        "[  703.000000] snapd.service failed, restarting\n"
+        "[  826.000000] snapd.service: start operation timed out\n"
+        "[  878.000000] snapd.service failed, restarting\n"
+        "[ 1047.000000] desktop-security-center configure hook failed\n"
+        "[ 1047.500000] sanity timeout expired\n"
+        "[ 1068.000000] RemoveSnapServices begin\n"
+        "[ 1516.000000] /snap/snapd/current: no such file or directory\n"
+        "[ 1946.000000] snap client: cannot communicate with server: "
+        "timeout exceeded while waiting for response\n"
+        "[ 3474.450000] snapd: no NTP sync after 10m0s, trying auto-refresh anyway\n"
+        "[ 3481.790000] Finished snapd.seeded.service\n"
+        "[ 3550.000000] subiquity: extract_autoinstall\n"
+        "[ 3552.000000] subiquity: load_autoinstall_config\n"
+        "[ 3555.000000] subiquity: apply_autoinstall_config\n"
+        "[ 3565.150000] subiquity: Install/install\n"
+        "[ 3579.000000] python3.12 -m curtin --showtrace -vvv\n"
+        "[ 3581.330000] curtin: apt-config begins\n"
+    )
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), *args], capture_output=True, text=True, timeout=15
+        )
+
+    def _outputs(self, tmp_path: Path, log_content: str, qemu_elapsed: str = "") -> dict[str, str]:
+        serial = tmp_path / "serial.log"
+        serial.write_text(log_content)
+        output = tmp_path / "milestones.env"
+        args = [str(serial), str(output)]
+        if qemu_elapsed:
+            args.append(qemu_elapsed)
+        result = self._run(args)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            k: v for k, v in (
+                line.split("=", 1) for line in output.read_text().splitlines()
+                if "=" in line and not line.startswith("#")
+            )
+        }
+
+    def test_reproduces_the_real_run_7_snapd_seed_duration(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_7_LIKE_LOG, qemu_elapsed="3600")
+        # Real Run #7: RUN_7_SNAPD_SEEDED_DURATION≈3044.25s.
+        assert outputs["snapd_seed_duration"] == "3044.25"
+
+    def test_reproduces_the_real_run_7_curtin_runtime_before_timeout(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_7_LIKE_LOG, qemu_elapsed="3600")
+        # Real Run #7: curtin had only ~19-21s before QEMU termination.
+        assert outputs["curtin_runtime_before_qemu_exit"] == "21.00"
+
+    def test_second_occurrence_milestones_are_genuinely_distinct(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_7_LIKE_LOG, qemu_elapsed="3600")
+        assert outputs["snapd_first_startup_timeout"] == "613.000000"
+        assert outputs["snapd_second_startup_timeout"] == "826.000000"
+        assert outputs["snapd_first_client_timeout"] == "597.930000"
+        assert outputs["snap_second_client_timeout"] == "1946.000000"
+
+    def test_all_named_milestones_from_run_7_are_captured(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_7_LIKE_LOG, qemu_elapsed="3600")
+        for key in (
+            "desktop_security_center_hook_failure", "desktop_security_center_sanity_timeout",
+            "snap_removal_begin", "snapd_current_missing", "ntp_10m_timeout",
+            "snapd_seeded_success", "subiquity_autoinstall_extract",
+            "subiquity_autoinstall_load", "subiquity_apply", "subiquity_install_enter",
+            "curtin_start", "curtin_apt_config",
+        ):
+            assert outputs[key] != "", f"{key} should have been observed"
+
+    def test_unobserved_milestone_is_empty_never_fabricated(self, tmp_path):
+        # A minimal log with none of the snapd-failure markers - those
+        # milestones must be genuinely empty, never a guessed value.
+        minimal_log = "[    0.000000] Linux version 7.0.0\n"
+        outputs = self._outputs(tmp_path, minimal_log)
+        assert outputs["snapd_first_client_timeout"] == ""
+        assert outputs["desktop_security_center_hook_failure"] == ""
+        assert outputs["ntp_10m_timeout"] == ""
+
+    def test_qemu_timeout_is_host_side_value_not_guest_log_matched(self, tmp_path):
+        # qemu's own "terminating on signal 15" message has no guest
+        # timestamp - the qemu_timeout milestone must come directly
+        # from the passed-in elapsed-seconds argument.
+        outputs = self._outputs(tmp_path, self._RUN_7_LIKE_LOG, qemu_elapsed="3600")
+        assert outputs["qemu_timeout"] == "3600"
+
+    def test_qemu_timeout_empty_when_not_provided(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_7_LIKE_LOG)
+        assert outputs["qemu_timeout"] == ""
+
+    def test_missing_serial_log_handled_honestly(self, tmp_path):
+        output = tmp_path / "milestones.env"
+        result = self._run([str(tmp_path / "does-not-exist.log"), str(output)])
+        assert result.returncode == 0
+        assert "no serial log present" in output.read_text()
+
+    def test_never_fails_the_job(self, tmp_path):
+        for content in ("", "no matches at all\n", self._RUN_7_LIKE_LOG):
+            serial = tmp_path / "serial.log"
+            serial.write_text(content)
+            output = tmp_path / "milestones.env"
+            result = self._run([str(serial), str(output)])
+            assert result.returncode == 0
+
+    def test_never_mutates_the_serial_log(self, tmp_path):
+        serial = tmp_path / "serial.log"
+        serial.write_text(self._RUN_7_LIKE_LOG)
+        before = serial.read_text()
+        output = tmp_path / "milestones.env"
+        self._run([str(serial), str(output), "3600"])
+        assert serial.read_text() == before
+
+
+# ---------------------------------------------------------------------------
 # installer/scripts/*.sh - static sanity + git-executable-bit correctness
 # ---------------------------------------------------------------------------
 
@@ -2831,9 +3083,12 @@ class TestIsoPrep:
         assert "console=ttyS0,115200n8" in qa_entry_body
         # -- S7.1R5 Objective C: journald forwarding chained on top. --
         assert "systemd.journald.forward_to_console=1" in qa_entry_body
+        # -- S7.1R7 Objective A: debug logging chained on top too. --
+        assert "systemd.log_level=debug" in qa_entry_body
         # The unrelated second entry must never be touched.
         other_entry_body = final_grub.split('menuentry "Try or Install Ubuntu"')[1]
         assert "autoinstall" not in other_entry_body
+        assert "systemd.log_level" not in other_entry_body
         assert "systemd.journald.forward_to_console" not in other_entry_body
 
     def test_missing_source_iso_fails_closed(self, tmp_path):
@@ -3022,6 +3277,43 @@ class TestJournaldConsoleForwardingOnQaEntry:
     def test_missing_entry_title_fails_closed(self):
         with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
             _enable_journald_console_forwarding_on_qa_entry(
+                _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
+            )
+
+
+class TestSystemdDebugLoggingOnQaEntry:
+    """S7.1R7 Objective A: real, direct regression coverage for the
+    new systemd.log_level=debug kernel-parameter addition - reuses the
+    exact same, already-tested core mechanism."""
+
+    def test_token_added_to_qa_entry_only(self):
+        patched = _enable_systemd_debug_logging_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert "systemd.log_level=debug" in qa_body
+        other_body = patched.split('menuentry "Try or Install Ubuntu"')[1]
+        assert "systemd.log_level" not in other_body
+
+    def test_idempotent_no_duplicate(self):
+        once = _enable_systemd_debug_logging_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        twice = _enable_systemd_debug_logging_on_qa_entry(once)
+        assert once == twice
+        qa_body = twice.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert qa_body.count("systemd.log_level=debug") == 1
+
+    def test_composes_with_autoinstall_and_journald_tokens_chained(self):
+        # The exact real usage in prepare_qa_install_iso.
+        step1 = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        step2 = _enable_journald_console_forwarding_on_qa_entry(step1)
+        step3 = _enable_systemd_debug_logging_on_qa_entry(step2)
+        qa_body = step3.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert "autoinstall" in qa_body
+        assert "systemd.journald.forward_to_console=1" in qa_body
+        assert "systemd.log_level=debug" in qa_body
+        assert "console=ttyS0,115200n8" in qa_body
+
+    def test_missing_entry_title_fails_closed(self):
+        with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
+            _enable_systemd_debug_logging_on_qa_entry(
                 _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
             )
 

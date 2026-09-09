@@ -331,8 +331,6 @@ jobs:
         if: always()
         run: |
           ./installer/scripts/release-artifact.sh build/work/extracted || {
-            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
-              "release-artifact.sh failed for build/work/extracted (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for build/work/extracted (secondary, non-blocking)"
           }
@@ -372,8 +370,6 @@ jobs:
         if: always()
         run: |
           ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64.iso || {
-            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
-              "release-artifact.sh failed for the production ISO (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for the production ISO (secondary, non-blocking)"
           }
@@ -464,8 +460,6 @@ jobs:
           ./installer/scripts/release-artifact.sh \
             dist/serein-alpha-26.04-amd64-qa.iso \
             build/installer-work/qa-install-extracted || {
-            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
-              "release-artifact.sh failed for the QA ISO/extraction tree (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for the QA ISO/extraction tree (secondary, non-blocking)"
           }
@@ -542,8 +536,6 @@ jobs:
         run: |
           ./installer/scripts/hash-disk-image.sh \
             dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
-            ./distribution/scripts/record-failure.sh "protected_disk_diagnostic_failed" \
-              "hash-disk-image.sh failed for the protected disk pre-install baseline (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "protected_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the protected disk pre-install baseline (secondary, non-blocking)"
           }
@@ -554,8 +546,6 @@ jobs:
         run: |
           ./installer/scripts/hash-disk-image.sh \
             dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
-            ./distribution/scripts/record-failure.sh "target_disk_diagnostic_failed" \
-              "hash-disk-image.sh failed for the target disk pre-install baseline (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "target_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the target disk pre-install baseline (secondary, non-blocking)"
           }
@@ -633,6 +623,25 @@ jobs:
             dist/installer-fixtures/qa-install-serial.log \
             dist/installer-fixtures/qa-install-subiquity-signals.log
 
+      # S7.1R7 Objective A: real Run #7 (RUN_ID=34335197624) revealed a
+      # ~3044s pre-Subiquity bootstrap window (snapd seeding, service
+      # restarts, a desktop-security-center hook/sanity timeout, mass
+      # snap service removal/remount, an NTP 10-minute wait) that
+      # consumed nearly the entire 3600s budget before curtin ever got
+      # meaningful runtime. This purely host-side, bounded parse of the
+      # already-captured serial log (surfaced in real detail thanks to
+      # S7.1R5's systemd.journald.forward_to_console=1 fix) turns that
+      # free-text evidence into a compact, machine-readable,
+      # run-to-run-comparable milestone record - zero guest-modification
+      # risk, never itself a gate.
+      - name: Extract bootstrap milestones from serial log
+        if: always()
+        run: |
+          ./installer/scripts/extract-bootstrap-milestones.sh \
+            dist/installer-fixtures/qa-install-serial.log \
+            dist/installer-fixtures/qa-install-bootstrap-milestones.env \
+            "${{ steps.run-install.outputs.qemu_elapsed_seconds }}"
+
       # S7.1 Section 47: remove the install ISO once the real install
       # has actually finished with it - never attached to any later
       # boot-check QEMU command anyway, but genuinely releasing the
@@ -642,8 +651,6 @@ jobs:
         if: always()
         run: |
           ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64-qa-install.iso || {
-            ./distribution/scripts/record-failure.sh "artifact_release_failed" \
-              "release-artifact.sh failed for the QA-install ISO (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
               "release-artifact.sh failed for the QA-install ISO (secondary, non-blocking)"
           }
@@ -686,8 +693,6 @@ jobs:
         run: |
           ./installer/scripts/hash-disk-image.sh \
             dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
-            ./distribution/scripts/record-failure.sh "protected_disk_diagnostic_failed" \
-              "hash-disk-image.sh failed for the protected disk post-install measurement (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "protected_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the protected disk post-install measurement (secondary, non-blocking)"
           }
@@ -698,8 +703,6 @@ jobs:
         run: |
           ./installer/scripts/hash-disk-image.sh \
             dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
-            ./distribution/scripts/record-failure.sh "target_disk_diagnostic_failed" \
-              "hash-disk-image.sh failed for the target disk post-install measurement (secondary, non-blocking)"
             ./installer/scripts/record-secondary-failure.sh "target_disk_diagnostic_failed" \
               "hash-disk-image.sh failed for the target disk post-install measurement (secondary, non-blocking)"
           }
@@ -944,6 +947,7 @@ jobs:
             dist/installer-fixtures/qa-install-qemu-stderr.log
             dist/installer-fixtures/qa-install-qemu-result.env
             dist/installer-fixtures/qa-install-subiquity-signals.log
+            dist/installer-fixtures/qa-install-bootstrap-milestones.env
             dist/installer-fixtures/protected-disk-diagnostic.env
             dist/installer-fixtures/target-disk-diagnostic.env
             dist/.secondary_failures

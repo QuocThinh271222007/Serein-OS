@@ -1,5 +1,103 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R7)
+
+**Seven real Installer Layer-B runs have occurred.** Run #7 reached
+real curtin execution (`python3.12 -m curtin --showtrace -vvv`, real
+`apt-config` start) but was dominated by a ~3044s pre-Subiquity
+bootstrap window:
+
+```text
+Run 7 (after S7.1R6):
+  RUN_ID=34335197624, RUN_NUMBER=7
+  HEAD=4d38f09e21d133a3c47330a25d20d0d81ad10747
+  RESULT=FAILURE - failure_stage=installer_timeout (real primary
+  blocker; NOT artifact_release_failed, though a real defect made the
+  latter briefly ABLE to occupy that slot - see below).
+
+  PROVEN (locked, re-confirmed, not reopened):
+    - R4's readonly=on + R5's hash-disk-image.sh: protected container/
+      logical/both sentinels unchanged.
+    - R3's autoinstall activation and R6's real curtin execution.
+
+  PROVEN, new this run: snapd.seeded took ~3044s (437.54s->3481.79s) -
+  vs. Run #6's ~557.5s - dominated by real, observed snapd service
+  startup timeouts and restarts (at least two full cycles), a
+  desktop-security-center configure-hook failure + snapd sanity
+  timeout (~1047s), a mass snap service-removal/remount sequence
+  (~1068s onward), a task referencing a missing /snap/snapd/current
+  (~1516s), and a real NTP 10-minute wait (~3474s) before snapd.seeded
+  finally completed. Curtin then had only ~19-21s of real runtime
+  before the 3600s global timeout killed QEMU.
+  WHY_RUN_7_SNAPD_SEEDED_TOOK_~3044s=NOT_PROVEN - this remains
+  genuinely unknown; do not treat snapd, TCG, NTP, or
+  desktop-security-center individually as the sole proven cause.
+
+  SEPARATELY PROVEN: R6's own secondary-failure wiring had a real
+  defect - all 8 "secondary, non-blocking" call sites called BOTH the
+  PRIMARY recorder (distribution/scripts/record-failure.sh) AND the
+  new secondary recorder for the SAME event, meaning a non-blocking
+  cleanup failure (e.g. release-artifact.sh failing for
+  build/work/extracted) COULD occupy dist/.failure_stage before the
+  real installer blocker occurred, if it happened chronologically
+  first. Run #7 showed exactly this: a build/work/extracted release
+  failure (reported permission-denied class error - the EXACT
+  errno/message could not be reconfirmed from this environment, see
+  ARTIFACT_RELEASE_PERMISSION_ROOT_CAUSE below) occurred before the
+  real install step.
+
+  S7.1R7 fixes/instruments:
+
+  1. Objective B (the concrete, provenwiring defect): all 8 secondary
+     call sites now call ONLY installer/scripts/record-secondary-failure.sh,
+     never distribution/scripts/record-failure.sh - a secondary/non-
+     blocking operation must never invoke the primary recorder. The
+     genuinely-primary call sites (disk_preflight, base_fetch, the
+     real install run, target layout inspection failure, etc.) are
+     unchanged and still call the primary recorder as before.
+  2. Objective A (bootstrap forensics): TWO safe, zero-guest-risk-of-
+     breakage additions:
+     - `installer/scripts/extract-bootstrap-milestones.sh` (new) -
+       purely host-side, bounded parsing of the ALREADY-CAPTURED serial
+       log (already rich in detail thanks to R5's
+       systemd.journald.forward_to_console=1 fix) into a compact,
+       machine-readable milestone/duration record
+       (qa-install-bootstrap-milestones.env) - snapd_seed_duration,
+       curtin_runtime_before_qemu_exit, etc., for real run-to-run
+       comparison. Verified against a synthetic reproduction of Run
+       #7's own reported timeline (real test fixture, not invented
+       numbers) - reproduces snapd_seed_duration=3044.25 and
+       curtin_runtime_before_qemu_exit=21.00 exactly.
+     - `systemd.log_level=debug` added to the QA-install boot entry
+       (chained onto the same, already-proven kernel-parameter
+       mechanism as `autoinstall`/journald-forwarding) - surfaces more
+       systemd job/unit-timeout reasoning without any new guest-side
+       file/service/transport.
+     Deliberately NOT implemented this round (real risk/benefit
+     tradeoff, explicitly documented): live in-guest command execution
+     (`snap changes`/`snap tasks`, structured `systemctl show` field
+     dumps, `timedatectl`, `ip route`) would require injecting a NEW
+     systemd unit into the live ISO's squashfs tree - a materially
+     larger, untestable-in-this-environment change with real risk of
+     breaking the NEXT boot in a NEW way if done wrong (this
+     environment has no real xorriso/squashfs/QEMU to validate such a
+     change against). Deferred rather than risked without real testing
+     capability.
+
+  Explicitly NOT done this pass: timeout unchanged (3600s); snapd/
+  snap-seeding not disabled, masked, or worked around; storage
+  semantics untouched (Run #7 provided no evidence of a storage
+  regression); target fixture size unchanged (16G); no permission/
+  ownership change to release-artifact.sh or its callers -
+  ARTIFACT_RELEASE_PERMISSION_ROOT_CAUSE=NOT_PROVEN (code inspection
+  confirmed S7.0's own xorriso-based extraction that creates
+  build/work/extracted never uses sudo anywhere, so no plausible
+  root-ownership mechanism was found in this repository's own code -
+  but the exact real OS-level error could not be reconfirmed from the
+  raw Run #7 log, which was not available to this environment; only
+  the recorder-semantics defect was fixed).
+```
+
 ## Real Layer-B validation status (S7.1R6)
 
 **Six real Installer Layer-B runs have occurred.** Run #6 is the
