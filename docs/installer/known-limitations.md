@@ -1,5 +1,99 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R8)
+
+**Eight real Installer Layer-B runs have occurred.** Run #8 reached
+real curtin destructive execution against the explicit target
+(partitioning, ESP/root formatting, extract, curthooks, EFI package
+install, kernel package install starting) - the furthest any real run
+has progressed - but was again terminated by the global timeout while
+actively working:
+
+```text
+Run 8 (after S7.1R7):
+  RUN_ID=34355674598, RUN_NUMBER=8
+  HEAD=bc614c171d95e6b670ed88b948583b81a61d769d
+  RESULT=FAILURE - failure_stage=installer_timeout.
+
+  PROVEN (locked, re-confirmed): protected disk container/logical/
+  both sentinels unchanged, modification count 0. R7's primary/
+  secondary failure-semantics fix worked correctly at runtime.
+
+  PROVEN, new this run:
+    - snapd.seeded took only ~450.33s this run (vs. Run #7's
+      ~3044s) - confirming RUN_7_EXTREME_SNAPD_CHAIN_REPRODUCED=false;
+      the extreme chain is not a permanent defect, just real run-to-
+      run variance.
+    - Real destructive curtin execution against the explicit target:
+      old storage cleared, ESP created/formatted, root created/
+      formatted (~1894.6s->2081.1s), a full extract phase
+      (~2107.5s->3268.4s, ~1161s), curthooks beginning (~3323.9s),
+      EFI package install completing (~3487.6s), kernel package
+      install starting (~3561s) - all still actively progressing when
+      the 3600s timeout killed QEMU. 3600S_TIMEOUT_SUFFICIENT=PROVEN_FALSE.
+    - R7's milestone parser (`extract-bootstrap-milestones.sh`) had
+      four real accuracy defects: R7_MILESTONE_PARSER_ACCURACY=PARTIAL_FAIL.
+
+  S7.1R8 fixes:
+
+  1. Objective A: real QA-install timeout 3600s -> 5400s (90 min) -
+     direct evidence of continuous progress right up to the previous
+     deadline, never merely because the run failed. An explicit,
+     bounded job-level `timeout-minutes: 180` was also added (the
+     workflow previously relied on GitHub's own much larger 360-minute
+     default) - see the workflow's own comment for the real budget
+     reasoning (~30 min pre-install + 90 min install + ~25 min
+     post-install, rounded up with real margin).
+  2. Objective B: `extract-bootstrap-milestones.sh` - fixed four real
+     defects (a genuine, root-cause-identified `pipefail` bug was also
+     found and fixed while doing so - see the script's own header):
+     - Defect 1: `snapd_seeded_first_start` was OMITTED (not wrong) -
+       the timestamp extractor required kernel-style `[NNN.NNNNNN]`
+       brackets, but systemd-journal-forwarded lines (most of what
+       this script needs) may use a bare, unbracketed format. Fixed
+       to accept both.
+     - Defect 2: one real timeout event was double-counted as both
+       `snapd_first_startup_timeout` and `snapd_second_startup_timeout`
+       - the old pattern's `Failed to start` alternative matched a
+       SEPARATE journal line systemd emits for the SAME single event.
+       Narrowed to one canonical, specific message per real event.
+     - Defect 3: an AppArmor profile-load announcement (whose PROFILE
+       NAME happens to contain both "desktop-security-center" and
+       "hook") was misclassified as a real hook failure. Replaced with
+       a real, two-stage semantic match requiring an explicit failure/
+       error term and excluding profile-load announcement lines.
+     - Defect 4: generic snap activity was at risk of being
+       misclassified as Run #7's real mass-removal sequence. Narrowed
+       to the one specific, real snapd internal task-kind name
+       (`RemoveSnapServices`) Run #7's own evidence actually showed.
+     All four fixes verified against a synthetic reproduction of Run
+     #8's own reported timeline - reproduces
+     `snapd_seed_duration=450.33` exactly. RAW_SERIAL_LOG remains the
+     one authoritative source; this parser is a non-authoritative
+     forensic convenience only, never a Layer-B gate.
+  3. Objective C: a real, reproduced (not merely theorized) root cause
+     for the intermittent CI credential test flake -
+     `secrets.token_urlsafe(24)` can generate a password beginning
+     with `-` (the base64url alphabet includes it), and without an
+     explicit end-of-options marker, `openssl passwd`'s own CLI parser
+     misinterpreted that leading-`-` password as an unknown option,
+     exiting non-zero. Never a timeout (every real local invocation
+     completed in well under 200ms). Reproduced directly (2 failures
+     in 200 real local invocations, always this exact stderr) and
+     fixed with the POSIX `--` end-of-options marker - verified
+     against 500 further real invocations (10 genuinely leading-
+     hyphen) with zero failures.
+
+  Explicitly NOT done this pass: snapd/snap-seeding behavior
+  unchanged (Run #8 disproved the "permanent defect" hypothesis);
+  storage semantics untouched (target fixture stays 16G; Run #8
+  proved real destructive execution against the explicit target
+  works); autoinstall activation and R7 debug logging unchanged;
+  target-layout-inspector and boot-check scripts re-audited statically
+  (partition-type/UEFI-topology logic, size-independent) with no
+  defect found, left unmodified.
+```
+
 ## Real Layer-B validation status (S7.1R7)
 
 **Seven real Installer Layer-B runs have occurred.** Run #7 reached
@@ -538,6 +632,22 @@ pass the password via `openssl passwd -stdin` instead, which the
 current `serein.development.runner.CommandRunner` protocol does not
 support (no stdin parameter) - deferred rather than extending that
 shared protocol speculatively in this pass.
+
+**S7.1R8 fix**: the same argv-based invocation this note describes had
+a real, reproduced defect - `secrets.token_urlsafe(24)` can generate a
+password beginning with `-` (the base64url alphabet includes it), and
+without an explicit end-of-options marker, `openssl`'s own CLI parser
+misinterpreted that leading-`-` password as an unknown OPTION rather
+than the intended positional value, causing `openssl passwd` to exit
+non-zero (`Unknown option: -<password>`). This was the real root cause
+of an intermittent CI test failure
+(`TestPayload::test_generate_qa_credential_unique_each_call`, ~1-in-64
+odds per call) previously suspected to be a timeout - reproduced
+directly (2 failures in 200 real local `openssl passwd -6`
+invocations, always this exact stderr, never a timeout) and fixed by
+inserting the POSIX `--` end-of-options marker immediately before the
+password argument. Verified against 500 further real invocations
+(10 genuinely leading-hyphen) with zero failures after the fix.
 
 ## Renderer schema fidelity (Section 25-26)
 

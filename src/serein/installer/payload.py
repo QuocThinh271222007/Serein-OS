@@ -97,11 +97,29 @@ def generate_qa_credential(
     accepted risk only inside the single-tenant, ephemeral Layer-B CI
     VM this function is intended for, never for interactive/production
     use.
+
+    S7.1R8 fix (real, reproduced defect - a genuine CI test flake
+    traced here, never merely assumed): ``secrets.token_urlsafe(24)``
+    draws from the URL-safe base64 alphabet, which includes ``-`` -
+    when the generated password happens to START with ``-``,
+    OpenSSL's own CLI argument parser previously misinterpreted it as
+    an unknown OPTION rather than the intended positional password
+    value, and ``openssl passwd`` exited non-zero
+    (``Unknown option: -<password>``). Reproduced directly (~1-in-64
+    real invocations, matching the leading-character odds of a
+    64-symbol alphabet): confirmed via 200 real, local
+    ``openssl passwd -6`` invocations, exactly 2 failed this way with
+    that exact stderr message - never a timeout (every real
+    invocation completed in well under 200ms locally). The explicit
+    POSIX ``--`` "end of options" marker before the password argument
+    fixes this unconditionally, regardless of the password's leading
+    character - verified directly against the exact failing value
+    reproduced above.
     """
     password = secrets.token_urlsafe(24)
     salt = secrets.token_hex(8)
 
-    result = runner.run(["openssl", "passwd", "-6", "-salt", salt, password])
+    result = runner.run(["openssl", "passwd", "-6", "-salt", salt, "--", password])
     if result is None or result.returncode != 0:
         return None
 

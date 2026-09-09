@@ -64,10 +64,13 @@ shift 3
 
 OVMF_CODE=""
 # S7.1R6 Objective A: default kept in sync with the real workflow's
-# own explicit --timeout 3600 - only matters for a manual/local
+# own explicit --timeout 5400 - only matters for a manual/local
 # invocation without --timeout; real Run #6 proved 1800s was too
-# tight (curtin was actively progressing at ~1769s).
-TIMEOUT_SECONDS=3600
+# tight (curtin was actively progressing at ~1769s), and real Run #8
+# then proved 3600s was ALSO too tight (curtin was actively
+# progressing through curthooks/EFI/kernel-package install right up
+# to the deadline).
+TIMEOUT_SECONDS=5400
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --ovmf-code) OVMF_CODE="$2"; shift 2 ;;

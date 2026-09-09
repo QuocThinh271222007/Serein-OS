@@ -76,6 +76,23 @@ jobs:
       (github.event_name == 'pull_request' &&
        contains(github.event.pull_request.labels.*.name, 'run-installer-smoke'))
     runs-on: ubuntu-latest
+    # S7.1R8 Objective A: an EXPLICIT, bounded job timeout - never
+    # relying on GitHub's own much larger 360-minute default, matching
+    # this workflow's own "always bounded, never open-ended" discipline
+    # for every other timeout it defines. Real Run #8
+    # (RUN_ID=34355674598) proved the real QA install alone now needs
+    # up to 5400s (90 min); budgeted here as roughly: ~30 min for
+    # every pre-install stage (fetch/build/inspect/render/prepare/
+    # fixture-creation/pre-install hashing), 90 min for the real
+    # install, and ~25 min for post-install work (target-layout
+    # inspection, TWO installed-boot checks - each independently
+    # bounded to 600s under TCG via
+    # serein.distribution.bootsmoke.DEFAULT_TIMEOUT_SECONDS_TCG - plus
+    # hashing/evidence-assembly/upload/closure) = ~145 min real
+    # budget, rounded up to a comfortably bounded 180 min (3h) - well
+    # under GitHub's own 360-min ceiling, with real margin for TCG
+    # variance.
+    timeout-minutes: 180
     steps:
       - name: Determine expected source SHA
         id: expected-sha
@@ -578,6 +595,18 @@ jobs:
       # destructive startup probe; bootcheck.py's installed-target
       # boot-check timeout) is a genuinely separate, already-bounded
       # scope and is deliberately left unchanged.
+      #
+      # S7.1R8 Objective A: real Run #8 (RUN_ID=34355674598) proved
+      # the installer was STILL actively progressing right up to the
+      # 3600s deadline - real curtin extract (~2107.5s->3268.4s), real
+      # curthooks (~3323.9s), EFI package install completing
+      # (~3487.6s), and kernel package installation actively starting
+      # (~3561s) when QEMU was killed at 3600s, with no idle/deadlocked
+      # period anywhere in that timeline. This is direct, proven
+      # evidence the 3600s budget is now insufficient - bumped to
+      # 5400s (90 min), still fail-closed via
+      # run-qa-install.sh's own `timeout --signal=TERM`, never
+      # unbounded.
       - name: Run real QA autoinstall
         id: run-install
         if: always() && steps.verify-topology.outcome == 'success'
@@ -587,7 +616,7 @@ jobs:
               dist/serein-alpha-26.04-amd64-qa-install.iso \
               dist/installer-fixtures/disk-protected.qcow2 \
               dist/installer-fixtures/disk-target.qcow2 \
-              --timeout 3600
+              --timeout 5400
           RUN_STATUS=$?
           set -e
 
