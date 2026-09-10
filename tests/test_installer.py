@@ -2892,8 +2892,18 @@ class TestExtractBootstrapMilestonesScript:
     def _run(self, args: list[str]) -> subprocess.CompletedProcess:
         if shutil.which("bash") is None:
             pytest.skip("bash not available in this environment")
+        # S7.1R10 Objective D: 30s, not 15s - this script's own
+        # per-candidate-line subprocess architecture (a real,
+        # pre-existing cost on this project's Windows/MSYS2
+        # development environment, unrelated to production Layer-B
+        # runners where fork/exec is far cheaper) was already close to
+        # the previous 15s bound before this round's semantic-dedup
+        # addition (Objective C); real local measurement showed the
+        # baseline already at ~6.6s with run-to-run variance up to
+        # ~7.7s - a real margin of safety, not a symptom this script
+        # hangs or loops.
         return subprocess.run(
-            ["bash", str(self.SCRIPT), *args], capture_output=True, text=True, timeout=15
+            ["bash", str(self.SCRIPT), *args], capture_output=True, text=True, timeout=30
         )
 
     def _outputs(self, tmp_path: Path, log_content: str, qemu_elapsed: str = "") -> dict[str, str]:
@@ -3237,6 +3247,99 @@ class TestExtractBootstrapMilestonesScript:
         # ~379.857s -> ~779.183s.
         outputs = self._r9_outputs(tmp_path, self._RUN_9_LIKE_LOG)
         assert outputs["snapd_seed_duration"] == "399.33"
+
+    # -- S7.1R10 Objective C/D: real Run #10 (RUN_ID=34432290533)
+    # proved `_nth_valid_timestamp_from_lines` could still count TWO
+    # SERIALIZED RENDERINGS of the exact same real event as separate
+    # ordinal occurrences - a duplicated 597.856803s timeout
+    # representation wrongly populated BOTH
+    # snapd_first_startup_timeout AND snapd_second_startup_timeout
+    # with the same value. Fixed with a conservative (timestamp +
+    # normalized content) semantic-identity rule, scoped to dedup
+    # WITHIN one milestone pattern's own matches only. --
+
+    def _r10_outputs(self, tmp_path: Path, log_content: str) -> dict[str, str]:
+        return self._outputs(tmp_path, log_content, qemu_elapsed="6600")
+
+    def test_two_byte_identical_duplicate_lines_count_as_one(self, tmp_path):
+        # Requirement 1.
+        log = (
+            "[  597.856803] snapd.service: start operation timed out.\n"
+            "[  597.856803] snapd.service: start operation timed out.\n"
+        )
+        outputs = self._r10_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "597.856803"
+        assert outputs["snapd_second_startup_timeout"] == ""
+
+    def test_same_event_with_harmless_prefix_difference_counts_as_one(self, tmp_path):
+        # Requirement 2 - the one real, proven "harmless rendering
+        # difference": identical message text, one bracketed
+        # kernel-style timestamp rendering and one bare-numeric
+        # journal-style rendering (also exercising the case-fold/
+        # whitespace-squeeze normalization).
+        log = (
+            "[  597.856803]   SNAPD.SERVICE: start   operation timed out.\n"
+            "597.856803 snapd.service: start operation timed out.\n"
+        )
+        outputs = self._r10_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "597.856803"
+        assert outputs["snapd_second_startup_timeout"] == ""
+
+    def test_same_event_class_at_two_distinct_timestamps_counts_as_two(self, tmp_path):
+        # Requirement 3.
+        log = (
+            "[  597.856803] snapd.service: start operation timed out.\n"
+            "[  900.123456] snapd.service: start operation timed out.\n"
+        )
+        outputs = self._r10_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "597.856803"
+        assert outputs["snapd_second_startup_timeout"] == "900.123456"
+
+    def test_two_distinct_events_sharing_a_timestamp_not_collapsed(self, tmp_path):
+        # Requirement 4 - exercised via snap_second_client_timeout's
+        # own broader pattern (matches two genuinely different real
+        # messages), since the narrower startup-timeout pattern would
+        # only ever match one canonical message shape.
+        log = (
+            "[  500.000000] cannot communicate with server: connection refused (client A).\n"
+            "[  500.000000] timeout exceeded while waiting for response (client B, "
+            "a different real event).\n"
+            "[  800.000000] cannot communicate with server: retry (client C).\n"
+        )
+        outputs = self._r10_outputs(tmp_path, log)
+        assert outputs["snapd_first_client_timeout"] == "500.000000"
+        assert outputs["snap_second_client_timeout"] == "500.000000"
+
+    def test_untimestamped_duplicate_then_timestamped_real_event_still_correct(self, tmp_path):
+        # Requirement 5 - existing R9 behavior must remain correct
+        # alongside the new R10 dedup logic.
+        log = (
+            "Starting snapd.seeded.service\n"
+            "[  379.857234] Starting snapd.seeded.service\n"
+            "[  779.182778] Finished snapd.seeded.service.\n"
+        )
+        outputs = self._r10_outputs(tmp_path, log)
+        assert outputs["snapd_seeded_first_start"] == "379.857234"
+
+    def test_missing_second_real_occurrence_stays_empty(self, tmp_path):
+        # Requirement 6 - never fabricated.
+        log = "[  597.856803] snapd.service: start operation timed out.\n"
+        outputs = self._r10_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "597.856803"
+        assert outputs["snapd_second_startup_timeout"] == ""
+
+    def test_run_10_style_regression_duplicate_597_856803_not_double_counted(self, tmp_path):
+        # Requirement 7 - the EXACT real Run #10 defect shape: a
+        # duplicated 597.856803s timeout representation must not
+        # produce both first and second fields for the same semantic
+        # event.
+        log = (
+            "[  597.856803] snapd.service: start operation timed out.\n"
+            "597.856803 snapd.service: start operation timed out.\n"
+        )
+        outputs = self._r10_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "597.856803"
+        assert outputs["snapd_second_startup_timeout"] == ""
 
     def _write(self, tmp_path: Path, content: str) -> Path:
         p = tmp_path / "serial.log"

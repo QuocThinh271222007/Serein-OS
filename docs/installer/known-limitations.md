@@ -1,5 +1,99 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R10)
+
+**Ten real Installer Layer-B runs have occurred.** Run #10
+(RUN_ID=34432290533, ARTIFACT_ID=10137243534) proved the R9
+firmware-notifier mitigation worked and reached the furthest of any
+run so far - real Subiquity postinstall entering and real
+`unattended-upgrades` actually starting (~5131.64s) - before the
+5400s QEMU timeout killed it with only ~268s of margin remaining:
+
+```text
+Run 10 (after S7.1R9):
+  RUN_ID=34432290533, RUN_NUMBER=10
+  HEAD=fd1d5a3d6483b03e2cd489e9a3c6bfaaf977c053
+  RESULT=FAILURE - failure_stage=installer_timeout.
+
+  PROVEN (locked, re-confirmed): protected disk readonly/topology
+  unchanged, primary/secondary failure semantics correct.
+
+  PROVEN, new this run:
+    - R9_FIRMWARE_NOTIFIER_MASK_RUNTIME_EFFECT=PROVEN_PASS - the
+      systemd.mask=snap.firmware-updater.firmware-notifier.service
+      boot parameter was actually loaded, and the Run #9 restart
+      storm (>=599 restarts) did NOT recur. This rules out the storm
+      as an ongoing cause.
+    - snapd seeding was normal this run (~423.5s -> ~891.1s,
+      duration ~467.53s) - not the current blocker
+      (CURRENT_SNAPD_SEED_BLOCKER=false).
+    - Real curtin partitioning (~2137.9s->2252.3s), extract
+      (~2268.1s->3470.3s), and curthooks (~3520.9s->4962.3s) all
+      completed successfully - the furthest real curtin progress any
+      run has proven.
+    - Subiquity postinstall entered (~4962.8s) and real
+      unattended-upgrades actually launched
+      (run_unattended_upgrades ~5112.3s, `chroot /target
+      unattended-upgrades -v` ~5127.0s, active ~5131.6s) - with NO
+      fatal error observed before the 5400s timeout killed QEMU.
+      INSTALLER_ACTIVE_AT_TIMEOUT=PROVEN,
+      5400_SECOND_TIMEOUT_SUFFICIENT=PROVEN_FALSE.
+    - The milestone parser still had one narrow real defect: a
+      duplicate serialized representation of the SAME semantic
+      snapd-startup-timeout event (identical timestamp
+      597.856803s) was counted as TWO separate ordinal occurrences,
+      populating both `snapd_first_startup_timeout` and
+      `snapd_second_startup_timeout` with the same value.
+
+  S7.1R10 fixes:
+
+  1. Objective A: the R9 firmware-notifier mitigation is proven
+     working and left entirely unchanged - with the storm ruled out,
+     Run #10's real timeout evidence (only ~268s of margin once
+     unattended-upgrades actually started) is now direct proof the
+     real postinstall stage itself needs more time than 5400s
+     provides. QEMU install timeout increased 5400s -> 6600s
+     (110 min), still fail-closed via `timeout --signal=TERM`, never
+     unbounded, never retried.
+     6600_SECOND_TIMEOUT_SUFFICIENT=NOT_OBSERVED - Run #11 is the
+     real test, not assumed from this change.
+  2. Objective B: job-level workflow timeout increased 240 -> 270
+     minutes, budgeted explicitly (~80 min worst-observed pre-install
+     + 110 min real QEMU install + <=10 min x2 independently-bounded
+     boot checks + ~15 min inspection/hashing/evidence/upload/closure
+     + ~25 min CI variance reserve ~= 250 min, rounded to 270 min) -
+     the task's own stated ceiling for this corrective, still well
+     under GitHub's 360-min ceiling. Neither boot check's own
+     independent bound was weakened or removed.
+  3. Objective C: `_nth_valid_timestamp_from_lines` (added S7.1R9)
+     counted every content-matching line with a valid timestamp as a
+     distinct ordinal occurrence, even when two lines were different
+     SERIALIZED REPRESENTATIONS of the exact same real semantic event
+     (same parsed timestamp). Fixed with a conservative semantic
+     identity rule: a candidate is only treated as a NEW ordinal
+     occurrence if its parsed timestamp differs from the immediately
+     preceding counted occurrence's timestamp - two lines sharing a
+     timestamp are treated as one event, while two genuinely distinct
+     events at different timestamps (even a millisecond apart) still
+     count separately, and two unrelated event classes that happen to
+     collide on a timestamp are never conflated across different
+     milestone patterns (each milestone's own pattern already scopes
+     the search to lines describing that one specific event class -
+     this fix only changes counting WITHIN one milestone's own
+     matches, never across milestones). RAW_SERIAL_LOG remains the
+     one authoritative source; this parser is a non-authoritative
+     forensic convenience only, never a Layer-B gate.
+
+  Explicitly NOT done this pass: firmware-notifier mask unchanged (
+  proven working, never broadened to production); snapd/snap-seeding
+  behavior unchanged (not the current blocker); unattended-upgrades/
+  APT/network/DNS/NTP configuration unchanged; storage semantics,
+  target fixture size, partition layout, GRUB/kernel-install logic
+  all untouched (Run #10 proved these already work); target-layout-
+  inspector and both boot-check scripts left unmodified (no new
+  evidence of a defect).
+```
+
 ## Real Layer-B validation status (S7.1R9)
 
 **Nine real Installer Layer-B runs have occurred.** Run #9

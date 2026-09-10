@@ -76,10 +76,11 @@ jobs:
       (github.event_name == 'pull_request' &&
        contains(github.event.pull_request.labels.*.name, 'run-installer-smoke'))
     runs-on: ubuntu-latest
-    # S7.1R8 Objective A / S7.1R9 Objective C: an EXPLICIT, bounded job
-    # timeout - never relying on GitHub's own much larger 360-minute
-    # default, matching this workflow's own "always bounded, never
-    # open-ended" discipline for every other timeout it defines.
+    # S7.1R8 Objective A / S7.1R9 Objective C / S7.1R10 Objective B: an
+    # EXPLICIT, bounded job timeout - never relying on GitHub's own
+    # much larger 360-minute default, matching this workflow's own
+    # "always bounded, never open-ended" discipline for every other
+    # timeout it defines.
     #
     # Real Run #9 (RUN_ID=34371427617) proved R8's 180-minute budget
     # was ALSO too tight - real observed timing:
@@ -93,28 +94,40 @@ jobs:
     #   ANY of the downstream closure steps (target-layout inspection,
     #   both boot checks) because the install itself did not finish -
     #   those steps' own real time still has to be added on top of the
-    #   observed 174 min, not folded into it.
+    #   observed total, not folded into it.
     #
-    # Revised, evidence-based budget:
-    #   worst observed pre-install setup (Run #9):      ~80 min
-    #   real QEMU installer budget (Objective D: 5400s): ~90 min
-    #   boot check A (self-contained, <=600s TCG bound): <=10 min
-    #   boot check B (with protected disk, same bound):  <=10 min
+    # Real Run #10 (RUN_ID=34432290533) reached real Subiquity
+    # postinstall and started real `unattended-upgrades` at
+    # ~5131.64s, with the R9 firmware-notifier storm mitigation
+    # confirmed working (no recurrence) - yet still timed out at the
+    # previous 5400s QEMU budget, leaving only ~268s for the real
+    # security-update postinstall stage. This is now direct, proven
+    # evidence 5400s is empirically insufficient (never merely because
+    # the run failed) - see the "Run real QA autoinstall" step's own
+    # comment for the full Objective A rationale behind the 5400s ->
+    # 6600s (110 min) QEMU budget increase.
+    #
+    # Revised, evidence-based job-level budget:
+    #   worst observed pre-install setup (Run #9):        ~80 min
+    #   real QEMU installer budget (R10 Objective A: 6600s): 110 min
+    #   boot check A (self-contained, <=600s TCG bound):   <=10 min
+    #   boot check B (with protected disk, same bound):    <=10 min
     #   target-layout inspection + hashing/evidence/
-    #     upload/closure:                                ~15 min
+    #     upload/closure:                                  ~15 min
     #   CI variance reserve (network/runner contention,
     #     base-image-fetch variance beyond Run #9's own
-    #     observed ~68 min):                              ~25 min
-    #   -----------------------------------------------------------
-    #   total:                                            ~230 min
+    #     observed ~68 min):                                ~25 min
+    #   -------------------------------------------------------------
+    #   total:                                              ~250 min
     #
-    # Rounded up to a comfortably bounded 240 min (4h) - within the
-    # task's own preferred 240-270 min range, well under GitHub's own
+    # Rounded up to a comfortably bounded 270 min (4.5h) - the task's
+    # own stated ceiling for this corrective, well under GitHub's own
     # 360-min ceiling, with real margin. Not an unbounded/arbitrary
     # increase - every component of this budget is either a real
-    # observed Run #9 duration or an independently-bounded downstream
-    # step's own documented timeout.
-    timeout-minutes: 240
+    # observed run duration or an independently-bounded downstream
+    # step's own documented timeout (neither boot check's own bound is
+    # weakened or removed by this job-level change).
+    timeout-minutes: 270
     steps:
       - name: Determine expected source SHA
         id: expected-sha
@@ -643,15 +656,27 @@ jobs:
       # serein.installer.isoprep._mask_firmware_notifier_on_qa_entry
       # (S7.1R9 Objective A), which neutralizes it QA-side-only via a
       # transient, this-boot-only systemd.mask= kernel parameter.
-      # DECISION: KEEP 5400s for this pass rather than increase it
-      # further - a safe, narrowly-scoped corrective for the storm was
-      # found and applied, so Run #10 becomes the real empirical test
-      # of whether removing that contention is sufficient, rather than
-      # this pass guessing a larger number without new evidence
-      # isolating the storm's actual cost. This is an explicit,
-      # falsifiable bet, not a claim that 5400s is proven sufficient -
-      # if Run #10 again times out with the storm gone, that is new,
-      # clean evidence a real (non-contention) increase is needed.
+      # DECISION at R9: KEEP 5400s, letting Run #10 be the real
+      # empirical test of whether removing the storm alone was
+      # sufficient.
+      #
+      # S7.1R10 Objective A: real Run #10 (RUN_ID=34432290533) PROVED
+      # that bet correct on the storm (the mask was actually loaded,
+      # confirmed via boot-parameter evidence, and the R9 restart
+      # storm did NOT recur) - but the installer STILL timed out.
+      # Run #10 reached real Subiquity postinstall and started real
+      # `unattended-upgrades` at ~5131.64s, leaving only ~268s
+      # (5400 - 5131.64) before the 5400s deadline killed QEMU, with
+      # no fatal unattended-upgrades error observed before that -
+      # INSTALLER_ACTIVE_AT_TIMEOUT=PROVEN,
+      # 5400_SECOND_TIMEOUT_SUFFICIENT=PROVEN_FALSE. With the storm
+      # ruled out as the (sole) cause, this is now direct evidence
+      # that the real security-update postinstall stage itself simply
+      # needs more real time than 5400s provides - bumped to 6600s
+      # (110 min), still fail-closed via run-qa-install.sh's own
+      # `timeout --signal=TERM`, never unbounded, never retried.
+      # 6600S_TIMEOUT_SUFFICIENT is NOT_OBSERVED until a real Run #11
+      # - this corrective does not claim it is proven sufficient.
       - name: Run real QA autoinstall
         id: run-install
         if: always() && steps.verify-topology.outcome == 'success'
@@ -661,7 +686,7 @@ jobs:
               dist/serein-alpha-26.04-amd64-qa-install.iso \
               dist/installer-fixtures/disk-protected.qcow2 \
               dist/installer-fixtures/disk-target.qcow2 \
-              --timeout 5400
+              --timeout 6600
           RUN_STATUS=$?
           set -e
 

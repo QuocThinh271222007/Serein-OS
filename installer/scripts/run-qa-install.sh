@@ -64,7 +64,7 @@ shift 3
 
 OVMF_CODE=""
 # S7.1R6 Objective A: default kept in sync with the real workflow's
-# own explicit --timeout 5400 - only matters for a manual/local
+# own explicit --timeout value - only matters for a manual/local
 # invocation without --timeout; real Run #6 proved 1800s was too
 # tight (curtin was actively progressing at ~1769s), and real Run #8
 # then proved 3600s was ALSO too tight (curtin was actively
@@ -73,15 +73,21 @@ OVMF_CODE=""
 #
 # S7.1R9 Objective D: real Run #9 reached curthooks completion
 # (~5049.98s) and unattended-upgrades starting (~5320.23s) - only
-# ~80s of margin remained at the 5400s deadline. Kept at 5400s this
+# ~80s of margin remained at the 5400s deadline. Kept at 5400s that
 # pass rather than increased further: Run #9 also exposed a real,
 # pathological firmware-notifier restart storm running concurrently
 # with curthooks/postinstall, now neutralized QA-side-only
-# (serein.installer.isoprep._mask_firmware_notifier_on_qa_entry) - see
-# the workflow's own "Run real QA autoinstall" step comment for the
-# full rationale. Not a claim 5400s is proven sufficient; Run #10 is
-# the real test.
-TIMEOUT_SECONDS=5400
+# (serein.installer.isoprep._mask_firmware_notifier_on_qa_entry).
+#
+# S7.1R10 Objective A: real Run #10 proved the R9 storm mitigation
+# worked (the mask loaded, no recurrence) - but the installer still
+# timed out at 5400s, having started real unattended-upgrades at only
+# ~5131.64s (~268s of margin left). With the storm ruled out, this is
+# now direct evidence the real postinstall stage itself needs more
+# time than 5400s - bumped to 6600s. See the workflow's own "Run real
+# QA autoinstall" step comment for the full rationale. Not a claim
+# 6600s is proven sufficient; Run #11 is the real test.
+TIMEOUT_SECONDS=6600
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --ovmf-code) OVMF_CODE="$2"; shift 2 ;;

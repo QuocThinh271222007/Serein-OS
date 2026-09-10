@@ -173,18 +173,82 @@ _first_valid_timestamp_from_lines() {
     return 0
 }
 
+# _normalize_event_content - reads ONE line on stdin and prints a
+# normalized form of its MESSAGE content: the leading timestamp token
+# (kernel-bracket or bare style) and a common syslog/journal
+# "process[pid]:" metadata prefix are stripped, then the remainder is
+# case-folded and internal whitespace collapsed. Two DIFFERENT
+# serialized renderings of the exact same real event (S7.1R10's proven
+# real defect - a genuine timeout event appearing twice in the raw log
+# with identical content but under a different console/journal
+# rendering) normalize to the SAME string; two genuinely different
+# events never do, even if one happens to share a timestamp with the
+# other (used only for within-one-milestone-pattern dedup - see
+# _nth_valid_timestamp_from_lines - never to match content across
+# different milestone patterns, each of which already scopes its own
+# search to one specific event class).
+_normalize_event_content() {
+    local line
+    IFS= read -r line
+    # Deliberately narrow: strips ONLY the leading timestamp token
+    # (kernel-bracket or bare style - the one, real, PROVEN source of
+    # "harmless rendering difference" between two rederings of the
+    # same real event, e.g. `[  597.856803] msg` vs `597.856803 msg`),
+    # then case-folds and collapses whitespace. Earlier drafts of this
+    # function also tried to strip an assumed leading
+    # "process[pid]:"-style syslog/journal prefix - removed after
+    # direct testing proved it unsafe: a real message's own content
+    # can itself look exactly like "word:" (e.g. the genuine message
+    # text "snapd.service: start operation timed out." starts with
+    # "snapd.service:"), so that heuristic could strip REAL message
+    # content instead of actual metadata noise, silently treating two
+    # DIFFERENT real messages as identical - exactly the
+    # false-positive-with-wrong-fact failure mode this script's own
+    # header says is never acceptable. A conservative rule that
+    # sometimes fails to merge two prefix-different renderings of one
+    # real event (an honest FALSE_NEGATIVE_WITH_UNKNOWN, i.e. an extra
+    # counted occurrence when unsure) is always preferable to one that
+    # can silently merge two real, distinct events.
+    printf '%s\n' "${line}" \
+        | sed -E 's/^[[:space:]]*\[?[[:space:]]*[0-9]+\.[0-9]+\]?[[:space:]]*//' \
+        | tr '[:upper:]' '[:lower:]' \
+        | tr -s '[:space:]' ' '
+}
+
 # _nth_valid_timestamp_from_lines <n> - the same skip-untimestamped-
 # candidates discipline as _first_valid_timestamp_from_lines, but
 # returns the Nth (1-indexed) candidate that actually has a valid
-# timestamp - an untimestamped candidate line is never counted toward
-# n, so a splash/journal duplicate can never consume a real event's
-# ordinal slot (this is also how a genuine second occurrence of the
-# same event class stays correctly distinguished from the first).
+# timestamp AND represents a genuinely NEW semantic occurrence - an
+# untimestamped candidate line is never counted toward n (S7.1R9), and
+# S7.1R10 Objective C: a candidate whose (timestamp, normalized
+# content) pair is IDENTICAL to the immediately preceding counted
+# occurrence is treated as a duplicate SERIALIZED RENDERING of that
+# SAME real event, never a distinct new occurrence - real Run #10
+# evidence proved a single real timeout event, logged twice at the
+# identical timestamp 597.856803s, was wrongly counted as both the
+# first AND second occurrence. Requiring BOTH the timestamp AND the
+# normalized content to match (never timestamp alone) is the
+# conservative guard against accidentally collapsing two genuinely
+# distinct events that merely happen to share a timestamp - their
+# differing content keeps them counted separately.
 _nth_valid_timestamp_from_lines() {
-    local n="$1" line ts count=0
+    local n="$1" line ts count=0 prev_ts="" prev_line=""
     while IFS= read -r line; do
         ts="$(printf '%s\n' "${line}" | _extract_timestamp)"
         if [ -n "${ts}" ]; then
+            # The (comparatively expensive) semantic-identity check
+            # only ever runs when two candidates' TIMESTAMPS actually
+            # collide - a rare case in practice - never on every
+            # candidate line, so the common (non-colliding) path stays
+            # as cheap as it was before Objective C.
+            if [ "${ts}" = "${prev_ts}" ]; then
+                if [ "$(printf '%s\n' "${line}" | _normalize_event_content)" \
+                     = "$(printf '%s\n' "${prev_line}" | _normalize_event_content)" ]; then
+                    continue
+                fi
+            fi
+            prev_ts="${ts}"
+            prev_line="${line}"
             count=$((count + 1))
             if [ "${count}" -eq "${n}" ]; then
                 printf '%s\n' "${ts}"
