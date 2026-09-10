@@ -1,5 +1,128 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R9)
+
+**Nine real Installer Layer-B runs have occurred.** Run #9
+(RUN_ID=34371427617) reached the furthest of any run so far - real
+curtin curthooks completing (~5049.98s), Subiquity postinstall
+entering (~5050.86s), and real unattended-upgrades actually starting
+(~5320.23s) - before the 5400s QEMU timeout killed it with only ~80s
+of margin remaining:
+
+```text
+Run 9 (after S7.1R8):
+  RUN_ID=34371427617, RUN_NUMBER=9
+  HEAD=a28c9e46200913852f724a08cb2f207e23827bfc
+  RESULT=FAILURE - failure_stage=installer_timeout.
+
+  PROVEN (locked, re-confirmed): protected disk container/logical/
+  both sentinels unchanged, modification count 0. Primary/secondary
+  failure semantics correct. R8's QA-credential fix held.
+
+  PROVEN, new this run:
+    - Real destructive curtin execution all the way through
+      curthooks completion (~5049.98s), well past R8's own furthest
+      point (curthooks BEGINNING at ~3323.9s).
+    - Subiquity postinstall entered (~5050.86s) and real
+      unattended-upgrades actually started (~5296.87s/~5320.23s) -
+      the first real evidence any run reached this far.
+    - A pathological restart storm of
+      snap.firmware-updater.firmware-notifier.service - >=599
+      observed restarts from ~3730.94s onward, each failing with
+      "Sorry, home directories outside of /home needs configuration."
+      - a known, real Ubuntu snapd home-dirs-confinement message tied
+      to the LIVE installer session, never anything Serein's own code
+      introduces (confirmed: zero repository references to
+      firmware-updater/firmware-notifier outside this one
+      corrective).
+    - R8's milestone parser (`extract-bootstrap-milestones.sh`) was
+      STILL partially defective:
+      R9_MILESTONE_PARSER_ACCURACY=PARTIAL_FAIL.
+
+  S7.1R9 fixes:
+
+  1. Objective A: `snap.firmware-updater.firmware-notifier.service` is
+     part of Ubuntu's own stock desktop snap set (present on the base
+     ISO before Serein ever touches it), and its real failure mode is
+     a documented live-session/installer-environment artifact of
+     snapd's confinement home-dirs check - not a defect in the
+     eventually-installed target (the real end user's real `/home` is
+     correctly configured; only this notifier's live-session autostart
+     entry is affected). Neutralized QA-install-boot-session-ONLY via
+     a new `systemd.mask=snap.firmware-updater.firmware-notifier.service`
+     kernel parameter, added through the same already-proven,
+     generalized kernel-token mechanism as R3's `autoinstall`/R5's
+     journald-forwarding/R7's debug-logging tokens
+     (`serein.installer.isoprep._mask_firmware_notifier_on_qa_entry`).
+     `systemd.mask=` is a real, documented systemd kernel
+     command-line option that masks a unit for THIS BOOT ONLY, purely
+     in-memory - never touches the installed target's package set or
+     unit files, never touches the production boot entry, never
+     disables firmware-update functionality on the shipped Serein
+     product.
+  2. Objective B: `extract-bootstrap-milestones.sh` had ONE remaining
+     real root cause across all its extraction helpers
+     (PROVEN): every helper took the unconditional FIRST content
+     match and only THEN tried to extract a timestamp
+     (`grep -m1`/`head`-truncated before any timestamp check) - a
+     real, untimestamped splash/console-duplicate line matching a
+     milestone's pattern BEFORE any real, timestamped occurrence
+     masked that later, real occurrence entirely
+     (`snapd_seeded_first_start` came back empty despite a real,
+     later, timestamped ``[379.857234] Starting snapd.seeded.service``
+     line existing in the log). Fixed: every extraction helper now
+     searches ALL matching lines and returns the first (or Nth) one
+     that actually HAS a parseable timestamp, skipping timestamp-less
+     candidates entirely (this also correctly prevents a
+     timestamp-less duplicate line from ever consuming a real event's
+     Nth-occurrence ordinal slot). A `pipefail` regression introduced
+     while writing this fix (the new per-line reader always exits 0,
+     but a genuinely-empty `grep` upstream still poisons the pipeline
+     under `pipefail`, since it is "last non-zero stage", not merely
+     "last stage") was caught and fixed in the same pass, restoring
+     the required `|| true` on every outer extraction pipeline.
+     Verified against a synthetic reproduction of Run #9's own proven
+     defect shape. RAW_SERIAL_LOG remains the one authoritative
+     source; this parser is a non-authoritative forensic convenience
+     only, never a Layer-B gate.
+  3. Objective C: Run #9's real observed timing (job start
+     ~15:37:17 UTC, QEMU start ~16:57:46 UTC - ~80.5 min pre-QEMU,
+     ~68 min of that spent fetching the pinned base image - QEMU end
+     ~18:27:54 UTC, job end ~18:31:38 UTC - ~174 min total, even
+     though the run never reached ANY downstream closure step)
+     proved R8's 180-minute job-level timeout was ALSO too tight.
+     Increased to 240 minutes with explicit, evidence-based budget
+     arithmetic in the workflow's own comment (~80 min worst-observed
+     pre-install + ~90 min real QEMU install + <=10 min each for two
+     independently-bounded boot checks + ~15 min inspection/hashing/
+     evidence/upload/closure + ~25 min CI variance reserve = ~230 min,
+     rounded to a comfortably bounded 240 min) - still well under
+     GitHub's own 360-min ceiling.
+  4. Objective D: real QA-install QEMU timeout KEPT at 5400s this
+     pass, not increased further. Rationale: a safe, narrowly-scoped
+     QA-only corrective for the firmware-notifier storm was found and
+     applied (Objective A), and that storm plausibly consumed real
+     scheduling/CPU resources during exactly the window
+     (~3730.94s-5400s) that ultimately starved unattended-upgrades of
+     its remaining ~80s of margin. Run #10 is the real empirical test
+     of whether removing that contention is sufficient - not a claim
+     that 5400s is proven sufficient; if Run #10 again times out with
+     the storm gone, that is new, clean evidence a real
+     (non-contention) increase is needed next.
+
+  Explicitly NOT done this pass: snapd/snap-seeding behavior
+  unchanged; storage semantics untouched; target fixture stays 16G;
+  autoinstall activation and R7 debug logging unchanged;
+  target-layout-inspector and both boot-check scripts re-audited
+  statically (confirmed byte-for-byte unchanged since before R8, and
+  their partition-type/UEFI-topology logic remains disk-size-
+  independent) with no defect found, left unmodified;
+  `firmware-updater` itself is never removed from Serein, and no
+  firmware-update functionality is disabled on the installed target -
+  only the ONE pathological live-session restart loop is masked, on
+  the QA boot entry only.
+```
+
 ## Real Layer-B validation status (S7.1R8)
 
 **Eight real Installer Layer-B runs have occurred.** Run #8 reached

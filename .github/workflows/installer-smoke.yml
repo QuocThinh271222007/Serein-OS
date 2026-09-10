@@ -76,23 +76,45 @@ jobs:
       (github.event_name == 'pull_request' &&
        contains(github.event.pull_request.labels.*.name, 'run-installer-smoke'))
     runs-on: ubuntu-latest
-    # S7.1R8 Objective A: an EXPLICIT, bounded job timeout - never
-    # relying on GitHub's own much larger 360-minute default, matching
-    # this workflow's own "always bounded, never open-ended" discipline
-    # for every other timeout it defines. Real Run #8
-    # (RUN_ID=34355674598) proved the real QA install alone now needs
-    # up to 5400s (90 min); budgeted here as roughly: ~30 min for
-    # every pre-install stage (fetch/build/inspect/render/prepare/
-    # fixture-creation/pre-install hashing), 90 min for the real
-    # install, and ~25 min for post-install work (target-layout
-    # inspection, TWO installed-boot checks - each independently
-    # bounded to 600s under TCG via
-    # serein.distribution.bootsmoke.DEFAULT_TIMEOUT_SECONDS_TCG - plus
-    # hashing/evidence-assembly/upload/closure) = ~145 min real
-    # budget, rounded up to a comfortably bounded 180 min (3h) - well
-    # under GitHub's own 360-min ceiling, with real margin for TCG
-    # variance.
-    timeout-minutes: 180
+    # S7.1R8 Objective A / S7.1R9 Objective C: an EXPLICIT, bounded job
+    # timeout - never relying on GitHub's own much larger 360-minute
+    # default, matching this workflow's own "always bounded, never
+    # open-ended" discipline for every other timeout it defines.
+    #
+    # Real Run #9 (RUN_ID=34371427617) proved R8's 180-minute budget
+    # was ALSO too tight - real observed timing:
+    #   job start  ~15:37:17 UTC
+    #   QEMU start ~16:57:46 UTC  (pre-QEMU: ~80.5 min - a major
+    #                              contributor was fetching the pinned
+    #                              base image, ~68 min of that alone)
+    #   QEMU end   ~18:27:54 UTC  (90 min - the real install budget)
+    #   job end    ~18:31:38 UTC
+    #   total observed: ~174 min, even though the run never reached
+    #   ANY of the downstream closure steps (target-layout inspection,
+    #   both boot checks) because the install itself did not finish -
+    #   those steps' own real time still has to be added on top of the
+    #   observed 174 min, not folded into it.
+    #
+    # Revised, evidence-based budget:
+    #   worst observed pre-install setup (Run #9):      ~80 min
+    #   real QEMU installer budget (Objective D: 5400s): ~90 min
+    #   boot check A (self-contained, <=600s TCG bound): <=10 min
+    #   boot check B (with protected disk, same bound):  <=10 min
+    #   target-layout inspection + hashing/evidence/
+    #     upload/closure:                                ~15 min
+    #   CI variance reserve (network/runner contention,
+    #     base-image-fetch variance beyond Run #9's own
+    #     observed ~68 min):                              ~25 min
+    #   -----------------------------------------------------------
+    #   total:                                            ~230 min
+    #
+    # Rounded up to a comfortably bounded 240 min (4h) - within the
+    # task's own preferred 240-270 min range, well under GitHub's own
+    # 360-min ceiling, with real margin. Not an unbounded/arbitrary
+    # increase - every component of this budget is either a real
+    # observed Run #9 duration or an independently-bounded downstream
+    # step's own documented timeout.
+    timeout-minutes: 240
     steps:
       - name: Determine expected source SHA
         id: expected-sha
@@ -607,6 +629,29 @@ jobs:
       # 5400s (90 min), still fail-closed via
       # run-qa-install.sh's own `timeout --signal=TERM`, never
       # unbounded.
+      #
+      # S7.1R9 Objective D: real Run #9 (RUN_ID=34371427617) reached
+      # much further - real curtin curthooks completing (~5049.98s),
+      # Subiquity postinstall entering (~5050.86s), and real-server
+      # unattended-upgrades actually starting (~5320.23s) - only ~80s
+      # before the 5400s deadline. Run #9 ALSO exposed a real,
+      # pathological restart storm of
+      # snap.firmware-updater.firmware-notifier.service (>=599
+      # observed restarts, from ~3730.94s onward, running concurrently
+      # with curthooks/postinstall) that plausibly consumed real
+      # scheduling/CPU resources during exactly this window - see
+      # serein.installer.isoprep._mask_firmware_notifier_on_qa_entry
+      # (S7.1R9 Objective A), which neutralizes it QA-side-only via a
+      # transient, this-boot-only systemd.mask= kernel parameter.
+      # DECISION: KEEP 5400s for this pass rather than increase it
+      # further - a safe, narrowly-scoped corrective for the storm was
+      # found and applied, so Run #10 becomes the real empirical test
+      # of whether removing that contention is sufficient, rather than
+      # this pass guessing a larger number without new evidence
+      # isolating the storm's actual cost. This is an explicit,
+      # falsifiable bet, not a claim that 5400s is proven sufficient -
+      # if Run #10 again times out with the storm gone, that is new,
+      # clean evidence a real (non-contention) increase is needed.
       - name: Run real QA autoinstall
         id: run-install
         if: always() && steps.verify-topology.outcome == 'success'

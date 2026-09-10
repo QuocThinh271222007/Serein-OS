@@ -70,6 +70,17 @@ OVMF_CODE=""
 # then proved 3600s was ALSO too tight (curtin was actively
 # progressing through curthooks/EFI/kernel-package install right up
 # to the deadline).
+#
+# S7.1R9 Objective D: real Run #9 reached curthooks completion
+# (~5049.98s) and unattended-upgrades starting (~5320.23s) - only
+# ~80s of margin remained at the 5400s deadline. Kept at 5400s this
+# pass rather than increased further: Run #9 also exposed a real,
+# pathological firmware-notifier restart storm running concurrently
+# with curthooks/postinstall, now neutralized QA-side-only
+# (serein.installer.isoprep._mask_firmware_notifier_on_qa_entry) - see
+# the workflow's own "Run real QA autoinstall" step comment for the
+# full rationale. Not a claim 5400s is proven sufficient; Run #10 is
+# the real test.
 TIMEOUT_SECONDS=5400
 while [ "$#" -gt 0 ]; do
     case "$1" in

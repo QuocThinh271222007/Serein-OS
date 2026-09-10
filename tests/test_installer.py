@@ -72,6 +72,7 @@ from serein.installer.isoprep import (
     _enable_autoinstall_on_qa_entry,
     _enable_journald_console_forwarding_on_qa_entry,
     _enable_systemd_debug_logging_on_qa_entry,
+    _mask_firmware_notifier_on_qa_entry,
     prepare_qa_install_iso,
 )
 from serein.installer.models import (
@@ -3108,6 +3109,135 @@ class TestExtractBootstrapMilestonesScript:
         result = self._run([str(self._write(tmp_path, log)), str(tmp_path / "out.env")])
         assert result.returncode == 0
 
+    # -- S7.1R9 Objective B: real Run #9 (RUN_ID=34371427617) proved
+    # the R8 parser was STILL partially defective -
+    # R9_MILESTONE_PARSER_ACCURACY=PARTIAL_FAIL. Root cause (PROVEN):
+    # every extraction helper took the unconditional FIRST content
+    # match and only THEN tried to extract a timestamp - a real,
+    # untimestamped splash/console duplicate line matching a
+    # milestone's pattern BEFORE any real, timestamped occurrence
+    # masked that later, real occurrence entirely. Fixed: every helper
+    # now searches ALL matching lines and returns the first (or Nth)
+    # one that actually HAS a parseable timestamp, skipping
+    # timestamp-less candidates. --
+
+    # A realistic reproduction of Run #9's proven defect shape: an
+    # untimestamped duplicate "Starting snapd.seeded.service" line
+    # appears BEFORE the real, timestamped occurrence.
+    _RUN_9_LIKE_LOG = (
+        "[    0.000000] Linux version 7.0.0-30-generic\n"
+        "[    5.178096] systemd[1]: systemd 259.5 running in system mode\n"
+        "Starting snapd.seeded.service\n"
+        "[  379.857234] Starting snapd.seeded.service\n"
+        "[  779.182778] Finished snapd.seeded.service.\n"
+    )
+
+    def _r9_outputs(self, tmp_path: Path, log_content: str) -> dict[str, str]:
+        return self._outputs(tmp_path, log_content, qemu_elapsed="5400")
+
+    def test_first_content_match_without_timestamp_is_skipped(self, tmp_path):
+        # Requirement 1/2: the first matching line has no timestamp;
+        # the second matching line has a real bracketed timestamp -
+        # the parser must reach past the first to find it.
+        outputs = self._r9_outputs(tmp_path, self._RUN_9_LIKE_LOG)
+        assert outputs["snapd_seeded_first_start"] == "379.857234"
+
+    def test_second_matching_line_with_bare_numeric_timestamp_reached(self, tmp_path):
+        # Requirement 3: the timestamped match uses the bare,
+        # unbracketed numeric style rather than kernel brackets.
+        log = (
+            "Starting snapd.seeded.service\n"
+            "379.857234 Starting snapd.seeded.service\n"
+            "779.182778 Finished snapd.seeded.service.\n"
+        )
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["snapd_seeded_first_start"] == "379.857234"
+
+    def test_absent_milestone_returns_empty_and_script_succeeds(self, tmp_path):
+        # Requirement 4.
+        log = "[    0.000000] Linux version 7.0.0\n"
+        serial = self._write(tmp_path, log)
+        result = self._run([str(serial), str(tmp_path / "o.env")])
+        assert result.returncode == 0
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["snapd_seeded_first_start"] == ""
+
+    def test_one_semantic_timeout_event_still_one_milestone(self, tmp_path):
+        # Requirement 5 - re-verified under the new skip-untimestamped
+        # search, not merely the R8 pattern-narrowing fix.
+        log = "[  600.000000] snapd.service: start operation timed out.\n"
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "600.000000"
+        assert outputs["snapd_second_startup_timeout"] == ""
+
+    def test_two_genuinely_distinct_timeout_events_remain_two_milestones(self, tmp_path):
+        # Requirement 6.
+        log = (
+            "[  600.000000] snapd.service: start operation timed out.\n"
+            "[  826.000000] snapd.service: start operation timed out.\n"
+        )
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "600.000000"
+        assert outputs["snapd_second_startup_timeout"] == "826.000000"
+
+    def test_untimestamped_duplicate_never_consumes_nth_ordinal_slot(self, tmp_path):
+        # An untimestamped duplicate of the SECOND timeout event must
+        # not itself be counted as a distinct third occurrence, and
+        # must not shift the real second occurrence's ordinal slot.
+        log = (
+            "[  600.000000] snapd.service: start operation timed out.\n"
+            "snapd.service: start operation timed out.\n"
+            "[  826.000000] snapd.service: start operation timed out.\n"
+        )
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["snapd_first_startup_timeout"] == "600.000000"
+        assert outputs["snapd_second_startup_timeout"] == "826.000000"
+
+    def test_apparmor_profile_load_line_not_classified_as_hook_failure(self, tmp_path):
+        # Requirement 7.
+        log = (
+            'audit(1788870172.228:47): apparmor="STATUS" operation="profile_load" '
+            'profile="unconfined" name="snap.desktop-security-center.hook.configure" '
+            'pid=1358 comm="apparmor_parser"\n'
+        )
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["desktop_security_center_hook_failure"] == ""
+
+    def test_real_hook_failure_still_matches(self, tmp_path):
+        # Requirement 8.
+        log = (
+            "1050.000000 desktop-security-center hook configure failed "
+            "with error: exit status 1\n"
+        )
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["desktop_security_center_hook_failure"] == "1050.000000"
+
+    def test_generic_snap_activity_not_mass_removal(self, tmp_path):
+        # Requirement 9.
+        log = (
+            "1000.000000 Mounted snap-firefox-8763.mount - Mount unit for firefox.\n"
+            "1001.000000 Started snapd.apparmor.service.\n"
+        )
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["snap_removal_begin"] == ""
+
+    def test_real_remove_snap_services_event_still_matches(self, tmp_path):
+        # Requirement 10.
+        log = '1068.000000 snapd: task "RemoveSnapServices" for snap "firefox" begin\n'
+        outputs = self._r9_outputs(tmp_path, log)
+        assert outputs["snap_removal_begin"] == "1068.000000"
+
+    def test_run_9_like_sequence_yields_non_empty_seeded_first_start(self, tmp_path):
+        # Requirement 11 - the exact real defect this pass fixes.
+        outputs = self._r9_outputs(tmp_path, self._RUN_9_LIKE_LOG)
+        assert outputs["snapd_seeded_first_start"] != ""
+
+    def test_run_9_like_sequence_yields_expected_seed_duration(self, tmp_path):
+        # Requirement 12 - real given Run #9 evidence:
+        # ~379.857s -> ~779.183s.
+        outputs = self._r9_outputs(tmp_path, self._RUN_9_LIKE_LOG)
+        assert outputs["snapd_seed_duration"] == "399.33"
+
     def _write(self, tmp_path: Path, content: str) -> Path:
         p = tmp_path / "serial.log"
         p.write_text(content)
@@ -3283,11 +3413,17 @@ class TestIsoPrep:
         assert "systemd.journald.forward_to_console=1" in qa_entry_body
         # -- S7.1R7 Objective A: debug logging chained on top too. --
         assert "systemd.log_level=debug" in qa_entry_body
+        # -- S7.1R9 Objective A: firmware-notifier masking chained on
+        # top too. --
+        assert (
+            "systemd.mask=snap.firmware-updater.firmware-notifier.service" in qa_entry_body
+        )
         # The unrelated second entry must never be touched.
         other_entry_body = final_grub.split('menuentry "Try or Install Ubuntu"')[1]
         assert "autoinstall" not in other_entry_body
         assert "systemd.log_level" not in other_entry_body
         assert "systemd.journald.forward_to_console" not in other_entry_body
+        assert "systemd.mask" not in other_entry_body
 
     def test_missing_source_iso_fails_closed(self, tmp_path):
         with pytest.raises(IsoPrepError):
@@ -3514,6 +3650,80 @@ class TestSystemdDebugLoggingOnQaEntry:
             _enable_systemd_debug_logging_on_qa_entry(
                 _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
             )
+
+
+class TestFirmwareNotifierMaskingOnQaEntry:
+    """S7.1R9 Objective A: real, direct regression coverage for the
+    new systemd.mask=snap.firmware-updater.firmware-notifier.service
+    kernel-parameter addition - reuses the exact same, already-tested
+    core mechanism. Real Run #9 evidence: a restart storm of this
+    exact unit (>=599 observed restarts) starting ~3730.94s, never
+    caused by any Serein-introduced code (confirmed: no repository
+    reference to firmware-updater/firmware-notifier outside this one
+    corrective)."""
+
+    def test_token_added_to_qa_entry_only(self):
+        patched = _mask_firmware_notifier_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert (
+            "systemd.mask=snap.firmware-updater.firmware-notifier.service" in qa_body
+        )
+        other_body = patched.split('menuentry "Try or Install Ubuntu"')[1]
+        assert "systemd.mask" not in other_body
+
+    def test_inserted_before_init_arg_separator(self):
+        patched = _mask_firmware_notifier_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        before_sep, _, after_sep = linux_line.partition("---")
+        assert "systemd.mask=" in before_sep
+        assert "systemd.mask=" not in after_sep
+
+    def test_idempotent_no_duplicate(self):
+        once = _mask_firmware_notifier_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        twice = _mask_firmware_notifier_on_qa_entry(once)
+        assert once == twice
+        qa_body = twice.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert (
+            qa_body.count("systemd.mask=snap.firmware-updater.firmware-notifier.service") == 1
+        )
+
+    def test_composes_with_all_prior_tokens_chained(self):
+        # The exact real usage in prepare_qa_install_iso.
+        step1 = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        step2 = _enable_journald_console_forwarding_on_qa_entry(step1)
+        step3 = _enable_systemd_debug_logging_on_qa_entry(step2)
+        step4 = _mask_firmware_notifier_on_qa_entry(step3)
+        qa_body = step4.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert "autoinstall" in qa_body
+        assert "systemd.journald.forward_to_console=1" in qa_body
+        assert "systemd.log_level=debug" in qa_body
+        assert (
+            "systemd.mask=snap.firmware-updater.firmware-notifier.service" in qa_body
+        )
+        assert "console=ttyS0,115200n8" in qa_body
+
+    def test_missing_entry_title_fails_closed(self):
+        with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
+            _mask_firmware_notifier_on_qa_entry(
+                _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
+            )
+
+    def test_never_touches_installed_target_package_set(self):
+        # Structural proof this is a kernel-boot-parameter-only
+        # mechanism - the function body (excluding its own docstring,
+        # which discusses curtin only as contrast/rationale) never
+        # invokes any package-list, seed, or curtin in-target
+        # operation; the installed target's own systemd units/
+        # packages are entirely untouched by this function.
+        import inspect
+
+        source = inspect.getsource(_mask_firmware_notifier_on_qa_entry)
+        body = source.split('"""', 2)[-1]
+        assert "curtin" not in body
+        assert "apt" not in body
+        assert "in-target" not in body
+        assert "return _add_kernel_token_to_qa_entry(" in body
 
 
 # ---------------------------------------------------------------------------

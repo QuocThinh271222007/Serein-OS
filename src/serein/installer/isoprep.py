@@ -216,6 +216,58 @@ def _enable_systemd_debug_logging_on_qa_entry(
     return _add_kernel_token_to_qa_entry(grub_cfg_text, "systemd.log_level=debug", entry_title)
 
 
+def _mask_firmware_notifier_on_qa_entry(
+    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
+) -> str:
+    """S7.1R9 Objective A: add
+    ``systemd.mask=snap.firmware-updater.firmware-notifier.service`` to
+    the named menuentry.
+
+    Real Run #9 evidence (RUN_ID=34371427617) - the first run to reach
+    real Subiquity postinstall/curthooks completion and enter
+    unattended-upgrades - showed a pathological restart storm of
+    ``snap.firmware-updater.firmware-notifier.service`` starting around
+    ~3730.94s and continuing to at least the 599th observed restart,
+    each attempt failing with "Sorry, home directories outside of
+    /home needs configuration." (a well-known real Ubuntu snapd
+    home-dirs confinement message, not anything Serein's own code
+    introduces or references - confirmed absent from this repository
+    outside this one corrective).
+
+    ``firmware-updater`` is part of Ubuntu's own stock desktop snap
+    set (present on the base ISO before Serein ever touches it, per
+    this module's own docstring on the extracted tree's provenance),
+    and this specific failure mode is a documented live-session/
+    installer-environment artifact of snapd's confinement home-dirs
+    check, not a defect in the eventually-installed target system
+    (the real end user's real ``/home`` is correctly configured on
+    the installed system - this notifier's live-session autostart
+    entry is the only thing affected).
+
+    Masking is QA-install-boot-session-only, via the SAME
+    already-proven, generalized kernel-token mechanism used for R3's
+    ``autoinstall``/R5's journald-forwarding/R7's debug-logging
+    tokens - ``systemd.mask=<unit>`` is a real, documented systemd
+    kernel command-line option (see systemd's own
+    ``kernel-command-line(7)``) that masks a unit for THIS BOOT ONLY,
+    entirely in-memory - it never writes anything to the ISO's
+    persisted unit files, never touches the installed target's
+    package set or unit files (which come from ``curtin in-target``/
+    the target's own debootstrap seed, not from live-boot kernel
+    parameters), and never disables firmware-update functionality on
+    the shipped Serein product. This is the narrowest available
+    corrective: it suppresses only the one specific pathological
+    restart loop, on the QA boot entry only, leaving the production
+    boot entry (which never carries any of these QA-only tokens)
+    completely untouched.
+    """
+    return _add_kernel_token_to_qa_entry(
+        grub_cfg_text,
+        "systemd.mask=snap.firmware-updater.firmware-notifier.service",
+        entry_title,
+    )
+
+
 def prepare_qa_install_iso(
     qa_iso_path: Path,
     work_dir: Path,
@@ -274,6 +326,9 @@ def prepare_qa_install_iso(
         # grub.cfg parse/write cycle.
         patched_grub_text = _enable_journald_console_forwarding_on_qa_entry(patched_grub_text)
         patched_grub_text = _enable_systemd_debug_logging_on_qa_entry(patched_grub_text)
+        # S7.1R9 Objective A: chained onto the same already-patched
+        # text, same discipline as the two lines above.
+        patched_grub_text = _mask_firmware_notifier_on_qa_entry(patched_grub_text)
     except AutoinstallBootError as exc:
         raise IsoPrepError(f"cannot enable autoinstall boot: {exc}") from exc
     with _temporarily_owner_writable(grub_path):

@@ -70,6 +70,36 @@
 #   FALSE_NEGATIVE_WITH_UNKNOWN (an empty field) is always preferable
 #   to FALSE_POSITIVE_WITH_WRONG_FACT.
 #
+# S7.1R9 Objective B (real Run #9, RUN_ID=34371427617): R8's parser
+# was STILL partially defective - R9_MILESTONE_PARSER_ACCURACY=PARTIAL_FAIL.
+#
+#   Root cause (PROVEN): the old `_first_timestamp_for`/
+#   `_nth_timestamp_for`/hook-failure helpers all used
+#   `grep -m1 <pattern> | extract-timestamp` (or an equivalent
+#   content-then-head pipeline) - i.e. FIRST_CONTENT_MATCH, THEN try
+#   to extract a timestamp. Real Run #9 evidence proved the guest
+#   serial log can contain an UNTIMESTAMPED line (console/splash
+#   duplication of the same underlying event, carrying no leading
+#   `[NNN.NNNNNN]`/`NNN.NNNNNN` prefix at all) that matches a
+#   milestone's content pattern BEFORE any real, timestamped
+#   occurrence of that same milestone - `grep -m1` locks onto that
+#   first, timestamp-less line and never looks further, so the field
+#   was left empty even though a real, later, timestamped line
+#   existed (`snapd_seeded_first_start=` empty, despite the real
+#   ``[379.857234] Starting snapd.seeded.service`` line existing
+#   further down the log).
+#
+#   Fix: every extraction helper below now searches ALL matching
+#   lines (never `-m1`/`head`-truncated before a timestamp check) and
+#   returns the FIRST (or Nth, for indexed milestones) one that
+#   actually carries a parseable timestamp - a content match with no
+#   timestamp is skipped entirely, never counted as an "occurrence"
+#   for Nth-indexing purposes either (this is also the correct fix
+#   for "do not count splash/journal duplication as a separate real
+#   event" - an untimestamped duplicate line can never consume a
+#   real event's ordinal slot). Never fabricates or interpolates a
+#   timestamp for a line that has none.
+#
 # RAW_SERIAL_LOG=AUTHORITATIVE. DERIVED_MILESTONES (this file) are a
 # NON_AUTHORITATIVE forensic convenience summary only - if a derived
 # field ever disagrees with the raw serial log, the raw serial log
@@ -121,32 +151,80 @@ _extract_timestamp() {
         | head -n1 || true
 }
 
+# _first_valid_timestamp_from_lines - reads candidate (already
+# content-filtered) lines on stdin and returns the timestamp of the
+# FIRST one that actually HAS a valid, parseable timestamp - a
+# candidate line that matched on CONTENT but carries no timestamp
+# (S7.1R9's proven root cause: a splash/console echo duplicate of a
+# real, timestamped event elsewhere in the log) is skipped entirely,
+# never treated as if it settled the search. Always returns 0 (via the
+# explicit trailing `return 0`) regardless of whether a timestamp was
+# ultimately found, so callers piping `grep ... | _first_valid_timestamp_from_lines`
+# are inherently `pipefail`-safe without needing a separate `|| true`.
+_first_valid_timestamp_from_lines() {
+    local line ts
+    while IFS= read -r line; do
+        ts="$(printf '%s\n' "${line}" | _extract_timestamp)"
+        if [ -n "${ts}" ]; then
+            printf '%s\n' "${ts}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# _nth_valid_timestamp_from_lines <n> - the same skip-untimestamped-
+# candidates discipline as _first_valid_timestamp_from_lines, but
+# returns the Nth (1-indexed) candidate that actually has a valid
+# timestamp - an untimestamped candidate line is never counted toward
+# n, so a splash/journal duplicate can never consume a real event's
+# ordinal slot (this is also how a genuine second occurrence of the
+# same event class stays correctly distinguished from the first).
+_nth_valid_timestamp_from_lines() {
+    local n="$1" line ts count=0
+    while IFS= read -r line; do
+        ts="$(printf '%s\n' "${line}" | _extract_timestamp)"
+        if [ -n "${ts}" ]; then
+            count=$((count + 1))
+            if [ "${count}" -eq "${n}" ]; then
+                printf '%s\n' "${ts}"
+                return 0
+            fi
+        fi
+    done
+    return 0
+}
+
 # _first_timestamp_for <pattern> - the timestamp of the FIRST line
-# matching <pattern> (grep -Ei), or empty if no match - never
-# fabricated.
-#
-# The trailing `|| true` is REQUIRED, not decorative: under
-# `pipefail`, a pipeline's exit status is the rightmost NON-ZERO stage
-# - `_extract_timestamp`'s own internal `|| true` only rescues ITS
-# OWN internal pipe, it does NOT retroactively rescue an EARLIER
-# stage's failure in THIS outer pipe (a genuinely-absent milestone's
-# `grep -Eim1` correctly exits 1 when it finds nothing, which would
-# otherwise abort the whole script under `set -e` - a real bug this
-# corrective fixes: a milestone genuinely absent from the log must
-# produce an EMPTY field, never terminate the entire extraction).
+# matching <pattern> (grep -Ei) that actually HAS a valid timestamp,
+# or empty if no such match - never fabricated. Never `grep -m1`
+# (S7.1R9's proven root cause of a real defect - see this script's own
+# header) - searches ALL matching lines, so a timestamp-less first
+# content match can never mask a real, later, timestamped occurrence.
 _first_timestamp_for() {
     local pattern="$1"
-    grep -Eim1 -- "${pattern}" "${SERIAL_LOG}" 2>/dev/null | _extract_timestamp || true
+    # `|| true` is REQUIRED even though _first_valid_timestamp_from_lines
+    # itself always returns 0: under `pipefail`, the pipeline's status
+    # is the LAST NON-ZERO stage's status if ANY stage failed, not
+    # merely the rightmost stage's status - a genuinely-absent
+    # milestone's `grep` correctly exits 1 when it finds nothing,
+    # which would otherwise abort the whole script under `set -e`
+    # even though the reader function itself handled the empty input
+    # correctly.
+    grep -Ei -- "${pattern}" "${SERIAL_LOG}" 2>/dev/null \
+        | _first_valid_timestamp_from_lines || true
 }
 
 # _nth_timestamp_for <pattern> <n> - the Nth (1-indexed) matching
-# line's timestamp - used for "second occurrence" milestones
-# (snap_second_client_timeout) so a genuine second event is never
-# conflated with the first. See _first_timestamp_for's own comment for
-# why the trailing `|| true` is required under `pipefail`.
+# line's timestamp, counting only lines that actually have one - used
+# for "second occurrence" milestones (snap_second_client_timeout) so a
+# genuine second event is never conflated with the first, and a
+# timestamp-less duplicate line is never miscounted as an occurrence.
 _nth_timestamp_for() {
     local pattern="$1" n="$2"
-    grep -Ei -- "${pattern}" "${SERIAL_LOG}" 2>/dev/null | sed -n "${n}p" | _extract_timestamp || true
+    # See _first_timestamp_for's comment on why `|| true` is required.
+    grep -Ei -- "${pattern}" "${SERIAL_LOG}" 2>/dev/null \
+        | _nth_valid_timestamp_from_lines "${n}" || true
 }
 
 # _desktop_security_center_hook_failure_timestamp - S7.1R8 Defect 3:
@@ -159,17 +237,14 @@ _nth_timestamp_for() {
 # announcement lines, which legitimately mention both words as part of
 # a normal, SUCCESSFUL profile name (e.g.
 # profile="snap.desktop-security-center.hook.configure") and are never
-# evidence of a real failure on their own.
+# evidence of a real failure on their own. Uses the same S7.1R9
+# skip-untimestamped-candidates discipline as every other helper here.
 _desktop_security_center_hook_failure_timestamp() {
-    # Trailing `|| true` required - see _first_timestamp_for's comment
-    # on why (pipefail propagates ANY earlier stage's non-zero exit,
-    # e.g. when the hook genuinely succeeded and no failure-term line
-    # exists at all).
+    # See _first_timestamp_for's comment on why `|| true` is required.
     grep -Ei -- 'desktop-security-center.*hook' "${SERIAL_LOG}" 2>/dev/null \
         | grep -Ei -- 'fail|error|denied|non-zero' \
         | grep -Eiv -- 'apparmor_parser|profile_load|operation="profile_load"' \
-        | head -n1 \
-        | _extract_timestamp || true
+        | _first_valid_timestamp_from_lines || true
 }
 
 # Fixed, deterministic milestone order (Section 16) - a plain ordered
