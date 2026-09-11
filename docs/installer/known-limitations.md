@@ -1,5 +1,133 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R11)
+
+**Eleven real Installer Layer-B runs have occurred.** Run #11
+(RUN_ID=34489050155, ARTIFACT_ID=10162450136) reproduced a
+catastrophic snap-lifecycle pathology closely matching Run #7's real,
+earlier evidence - CATASTROPHIC_SNAP_LIFECYCLE_RECURRENCE=PROVEN:
+
+```text
+Run 11 (after S7.1R10):
+  RUN_ID=34489050155, RUN_NUMBER=11
+  HEAD=3c5971c806584e32033b8ea44395fa073a74aaab
+  RESULT=FAILURE - failure_stage=installer_timeout (qemu_exit_status=124,
+  qemu_elapsed_seconds=6600).
+
+  Historical stable-seed comparison (RUN_7_ONLY_OUTLIER=PROVEN_FALSE):
+    Run #6  ~557.5s        (normal)
+    Run #7  ~3044s         (pathological)
+    Run #8  ~450s          (normal)
+    Run #9  ~399s          (normal)
+    Run #10 ~467.5s        (normal)
+    Run #11 ~3943s         (pathological)
+
+  PROVEN, this run: real, given evidence shows a genuine 3-attempt
+  snapd.seeded lifecycle (attempt 1 ~454.619s->~622.204s fail;
+  attempt 2 ~1881.540s->~2693.021s fail; attempt 3 ~2959.030s->
+  ~4397.845s SUCCESS) - a desktop-security-center configure-hook
+  sanity-timeout failure (~1062.944s->~1108.681s, "Change 1" per the
+  given evidence), a real mass RemoveSnapServices sequence
+  (~1118.784s onward), a `/snap/snapd/current` missing window
+  (~1895.777s), and eventual real stable recovery (ubuntu-desktop-
+  bootstrap/subiquity-server restored ~4378.547s, snapd.seeded
+  finally succeeding ~4397.845s) before Subiquity/curtin ever started
+  - TOTAL_UNSTABLE_SEED_WINDOW≈3943.226s (≈65m43s).
+
+  R9's firmware-notifier QA-only mitigation continued to work - the
+  599-restart storm did NOT recur.
+
+  DESKTOP_SECURITY_CENTER_HOOK_FAILURE=PROVEN,
+  SANITY_TIMEOUT=PROVEN, SNAPD_SERVICE_STARTUP_TIMEOUTS=PROVEN,
+  SNAPD_SERVICE_RESTARTS=PROVEN, REMOVE_SNAP_SERVICES_SEQUENCE=PROVEN,
+  MASS_SNAP_SERVICE_REMOVAL=PROVEN, /snap/snapd/current_MISSING=PROVEN,
+  SNAPD_FINAL_STABLE_SEED_SUCCESS=PROVEN.
+  HOOK_FAILURE_TO_UNDO_ROLLBACK_RELATIONSHIP=STRONGLY_SUPPORTED (the
+  hook failure and the RemoveSnapServices/current-missing/restoration
+  sequence occur in immediate temporal succession, consistent with a
+  snapd Change-undo path, but NOT_PROVEN in the strict sense - this
+  environment has no raw serial log or snapd Change/Task API access
+  to directly confirm an explicit "Undo"/"Undoing" state transition).
+  DESKTOP_SECURITY_CENTER_IS_SOLE_ROOT_CAUSE=NOT_PROVEN,
+  SNAPD_HOLD_IS_ROOT_CAUSE=NOT_PROVEN, NTP_IS_ROOT_CAUSE=NOT_PROVEN,
+  TCG_IS_ROOT_CAUSE=NOT_PROVEN, NETWORK_IS_ROOT_CAUSE=NOT_PROVEN - none
+  promoted from inference to proof.
+
+  PATHOLOGY_SCOPE=LIVE_INSTALLER_ENVIRONMENT_ONLY (STRONGLY SUPPORTED,
+  not directly proven from a raw log this environment lacks): a
+  full-repository search confirms ZERO Serein code (as opposed to
+  forensic-comment/docstring mentions of OBSERVED evidence) creates,
+  configures, or depends on `desktop-security-center`,
+  `snapd.hold.service`, `ubuntu-desktop-bootstrap`, or
+  `RemoveSnapServices` - these are entirely part of Ubuntu's own
+  stock live-ISO desktop-bootstrap snap ecosystem, activated by the
+  LIVE session itself (independently of, and concurrently with,
+  Subiquity/curtin's own install work), never something Serein
+  introduces, configures, or that persists into the installed
+  target's own first-boot context (S7.2's own first-boot
+  provisioning is a completely separate systemd/session context that
+  never re-runs the live-ISO's casper-specific configure hooks).
+
+  QA_ONLY_MITIGATION_ACCEPTABLE=false this round: the S7.1R9-R10-style
+  QA-only kernel-token masking approach requires PROVING a specific,
+  narrow, deterministic trigger for the pathological Change before it
+  can be safely neutralized (Section 10's 9-point checklist,
+  particularly QA_ONLY_SCOPE and a genuine causal understanding of
+  WHAT starts the Change) - this environment has no raw serial log,
+  no snapd Change/Task API access, and no local real-QEMU
+  reproduction capability (LOCAL_REAL_QEMU=BLOCKED, as in every prior
+  round) to establish that proof. Per this corrective's own explicit
+  decision principle, a forensics-only pass that does not hide the
+  pathology behind a speculative, unproven workaround is preferable
+  to an unsafe one - QA_ONLY_SNAP_MITIGATION_IMPLEMENTED=false.
+
+  S7.1R11 fixes (forensics-only, no snap-lifecycle mitigation):
+
+  1. Fixed a real, PROVEN `snapd_seeded_success` false-positive: the
+     old pattern (`Finished snapd\.seeded|Reached target.*Cloud-init`)
+     could match a GENERIC, UNRELATED `Reached target Cloud-init...`
+     systemd boot-target line as if it were a real snapd.seeded
+     success - Run #11's own derived output wrongly reported
+     `snapd_seeded_success≈984.407227` while the real, final, stable
+     `Finished snapd.seeded.service` event was at ≈4397.845s. Fixed:
+     narrowed to ONLY `Finished snapd\.seeded` - never inferred from
+     any later, unrelated boot-target reached-event.
+  2. Added a genuine multi-attempt seed-lifecycle model
+     (`_extract_seed_attempts`) - a single, chronological state
+     machine over every real "Starting snapd.seeded.service"/
+     "Finished snapd.seeded.service"/snapd.seeded-failure line,
+     emitting `seed_attempt_<n>_start`/`_finish`/`_result` for
+     however many real attempts actually occurred (`seed_attempt_count`,
+     never hardcoded), `final_stable_seed_success` (the LAST attempt's
+     own finish timestamp, but ONLY if that last attempt's own result
+     is "success" - so an earlier, non-final success can never be
+     mistaken for the stable end of the lifecycle, exactly the real
+     Run #7/#11 proof pattern), and `unstable_seed_window_duration`
+     (first attempt's start -> final_stable_seed_success) - reproduces
+     the given Run #11 evidence's own
+     `TOTAL_UNSTABLE_SEED_WINDOW≈3943.226s` essentially exactly via a
+     synthetic fixture built from the task's own given evidence.
+  3. Added `snapd_hold_finish` (captured as a plain forensic data
+     point only - this script never asserts or implies causality for
+     it), `snap_removal_last` and `snap_removal_event_count` (an
+     honest RAW LINE-MATCH count, never claimed to be a verified count
+     of distinct affected snap names, which this script has no
+     reliable way to determine from timestamps/patterns alone).
+
+  Explicitly NOT done this pass: QEMU timeout (6600s) and job timeout
+  (270min) both UNCHANGED - Run #11 spent ~3943s in an abnormal snap
+  lifecycle before meaningful installer progress, so it did NOT
+  fairly test whether 6600s is sufficient for the normal Run #10-like
+  path; changing either timeout now would hide the real pathology
+  behind a larger number rather than address it.
+  R11_QEMU_TIMEOUT_CHANGED=false, R11_JOB_TIMEOUT_CHANGED=false. No new
+  QA-only snap-lifecycle mitigation implemented (see
+  QA_ONLY_MITIGATION_ACCEPTABLE=false above). Firmware-notifier QA
+  mask, snapd/snap-seeding behavior, storage semantics, target fixture
+  size, autoinstall activation, and primary/secondary failure-recorder
+  scripts all unchanged.
+```
+
 ## Real Layer-B validation status (S7.1R10)
 
 **Ten real Installer Layer-B runs have occurred.** Run #10

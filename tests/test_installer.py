@@ -3341,6 +3341,170 @@ class TestExtractBootstrapMilestonesScript:
         assert outputs["snapd_first_startup_timeout"] == "597.856803"
         assert outputs["snapd_second_startup_timeout"] == ""
 
+    # -- S7.1R11 Objective D/Section 17-19: real Run #11
+    # (RUN_ID=34489050155) reproduced a catastrophic, Run #7-like snap
+    # lifecycle - a genuine 3-attempt snapd.seeded sequence spanning
+    # ~3943s, and proved the old two-field
+    # snapd_seeded_first_start/snapd_seeded_success model both
+    # collapses real multi-attempt data AND can false-positive-match
+    # an unrelated "Reached target Cloud-init" line as seed success.
+    # A synthetic reproduction of Run #11's own given evidence, built
+    # from the real, confirmed serial-console line formats already
+    # established in this script's own R8-R10 history (never
+    # invented text). --
+
+    _RUN_11_LIKE_LOG = (
+        "[    0.000000] Linux version 7.0.0-30-generic\n"
+        "[    5.178096] systemd[1]: systemd 259.5 running in system mode\n"
+        "[  454.619000] Starting snapd.seeded.service\n"
+        "[  622.204000] snapd.seeded.service failed (attempt 1)\n"
+        "[  637.802000] snapd.service: start operation timed out\n"
+        "[  727.494000] snapd.service failed, restarting\n"
+        "[  851.844000] snapd.service: start operation timed out\n"
+        "[  942.509000] snapd.service failed, restarting\n"
+        "[ 1007.610000] Finished snapd.hold.service\n"
+        "[ 1062.944000] desktop-security-center configure hook starting\n"
+        "[ 1108.681000] desktop-security-center hook configure failed "
+        "with error: sanity timeout expired\n"
+        "[ 1108.698000] sanity timeout expired\n"
+        '[ 1118.784000] snapd: task "RemoveSnapServices" for snap "firefox" begin\n'
+        '[ 1200.000000] snapd: task "RemoveSnapServices" for snap "gnome-3-38-2004" begin\n'
+        '[ 1300.000000] snapd: task "RemoveSnapServices" for snap "core22" begin\n'
+        "[ 1881.540000] Starting snapd.seeded.service\n"
+        "[ 1895.777000] readlink /snap/snapd/current: no such file or directory\n"
+        "[ 2693.021000] snapd.seeded.service failed (attempt 2)\n"
+        "[ 2959.030000] Starting snapd.seeded.service\n"
+        "[ 4390.843000] snapd: no NTP sync after 10m0s, trying auto-refresh anyway\n"
+        "[ 4397.845000] Finished snapd.seeded.service\n"
+    )
+
+    def _r11_outputs(self, tmp_path: Path, log_content: str) -> dict[str, str]:
+        return self._outputs(tmp_path, log_content, qemu_elapsed="6600")
+
+    def test_run_11_first_seed_attempt_starts_then_fails(self, tmp_path):
+        # Requirement 1.
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["seed_attempt_1_start"] == "454.619000"
+        assert outputs["seed_attempt_1_finish"] == "622.204000"
+        assert outputs["seed_attempt_1_result"] == "fail"
+
+    def test_run_11_multiple_seed_attempts_represented_independently(self, tmp_path):
+        # Requirement 2.
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["seed_attempt_count"] == "3"
+        assert outputs["seed_attempt_2_start"] == "1881.540000"
+        assert outputs["seed_attempt_2_finish"] == "2693.021000"
+        assert outputs["seed_attempt_2_result"] == "fail"
+        assert outputs["seed_attempt_3_start"] == "2959.030000"
+        assert outputs["seed_attempt_3_finish"] == "4397.845000"
+        assert outputs["seed_attempt_3_result"] == "success"
+
+    def test_run_11_final_successful_attempt_selected_as_final_stable(self, tmp_path):
+        # Requirement 3.
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["final_stable_seed_success"] == "4397.845000"
+
+    def test_unrelated_cloud_init_line_cannot_count_as_seed_success(self, tmp_path):
+        # Requirement 4 - the exact real Run #11 false-positive shape:
+        # a "Reached target Cloud-init" line sitting between a real
+        # start and a real finish must never itself be matched.
+        log = (
+            "[  454.619000] Starting snapd.seeded.service\n"
+            "[  984.407000] Reached target Cloud-init target.\n"
+            "[ 4397.845000] Finished snapd.seeded.service\n"
+        )
+        outputs = self._r11_outputs(tmp_path, log)
+        assert outputs["snapd_seeded_success"] == "4397.845000"
+        assert outputs["snapd_seeded_success"] != "984.407000"
+
+    def test_early_finish_followed_by_later_failure_not_final_stable(self, tmp_path):
+        # Requirement 5 - real Run #7/#11 proof: an EARLY
+        # "Finished snapd.seeded.service" can be followed by a LATER
+        # real failure/restart - the early finish must never be
+        # treated as the end of the unstable lifecycle.
+        log = (
+            "[  454.619000] Starting snapd.seeded.service\n"
+            "[  600.000000] Finished snapd.seeded.service\n"
+            "[  700.000000] Starting snapd.seeded.service\n"
+            "[  750.000000] snapd.seeded.service failed\n"
+        )
+        # The lifecycle ends on a FAILED (not successful) attempt -
+        # final_stable_seed_success must be empty, never the early
+        # 600.000000 finish.
+        outputs = self._r11_outputs(tmp_path, log)
+        assert outputs["final_stable_seed_success"] == ""
+        assert outputs["seed_attempt_1_finish"] == "600.000000"
+        assert outputs["seed_attempt_1_result"] == "success"
+        assert outputs["seed_attempt_2_result"] == "fail"
+
+    def test_final_stable_seed_duration_uses_first_start_to_final_stable(self, tmp_path):
+        # Requirement 6 - real given Run #11 evidence:
+        # TOTAL_UNSTABLE_SEED_WINDOW≈3943.226s
+        # (454.619 -> 4397.845 = 3943.226).
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["unstable_seed_window_duration"] == "3943.23"
+
+    def test_remove_snap_services_events_extracted_accurately(self, tmp_path):
+        # Requirement 7.
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["snap_removal_begin"] == "1118.784000"
+        assert outputs["snap_removal_last"] == "1300.000000"
+        assert outputs["snap_removal_event_count"] == "3"
+
+    def test_snapd_current_missing_event_classified_accurately(self, tmp_path):
+        # Requirement 8.
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["snapd_current_missing"] == "1895.777000"
+
+    def test_hook_failure_tied_to_explicit_error_evidence(self, tmp_path):
+        # Requirement 9 - "starting" alone (no failure term) must never
+        # be classified as a failure; only the explicit failure line
+        # is.
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["desktop_security_center_hook_failure"] == "1108.681000"
+
+    def test_successful_configure_hook_not_classified_as_failure(self, tmp_path):
+        # Requirement 10.
+        log = (
+            "500.000000 desktop-security-center configure hook starting\n"
+            "510.000000 desktop-security-center configure hook completed successfully\n"
+        )
+        outputs = self._r11_outputs(tmp_path, log)
+        assert outputs["desktop_security_center_hook_failure"] == ""
+
+    def test_snapd_hold_finish_captured_without_causal_classification(self, tmp_path):
+        # Requirement 11 - captured as a plain data point only; this
+        # script itself never emits any "causal" field for it (no
+        # snapd_hold_causal_root key exists at all - causality
+        # classification is a human/report-level judgment, never
+        # something this forensic script asserts on its own).
+        outputs = self._r11_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["snapd_hold_finish"] == "1007.610000"
+        assert "snapd_hold_causal_root" not in outputs
+
+    def test_seed_attempt_left_open_at_log_end_is_unknown_not_fabricated(self, tmp_path):
+        # Additional coverage: an attempt that opens but never reaches
+        # an observed finish/fail before the log ends must be honestly
+        # recorded as result=unknown with an empty finish - never
+        # fabricated as success or failure.
+        log = (
+            "[  454.619000] Starting snapd.seeded.service\n"
+            "[  622.204000] snapd.seeded.service failed\n"
+            "[ 1881.540000] Starting snapd.seeded.service\n"
+        )
+        outputs = self._r11_outputs(tmp_path, log)
+        assert outputs["seed_attempt_count"] == "2"
+        assert outputs["seed_attempt_2_finish"] == ""
+        assert outputs["seed_attempt_2_result"] == "unknown"
+        assert outputs["final_stable_seed_success"] == ""
+
+    def test_no_seed_activity_yields_honest_zero_never_fabricated(self, tmp_path):
+        log = "[    0.000000] Linux version 7.0.0\n"
+        outputs = self._r11_outputs(tmp_path, log)
+        assert outputs["seed_attempt_count"] == "0"
+        assert outputs["final_stable_seed_success"] == ""
+        assert outputs["snap_removal_event_count"] == "0"
+
     def _write(self, tmp_path: Path, content: str) -> Path:
         p = tmp_path / "serial.log"
         p.write_text(content)
