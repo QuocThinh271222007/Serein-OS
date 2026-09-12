@@ -398,10 +398,34 @@ _desktop_security_center_hook_failure_timestamp() {
 # ("Finished snapd.seeded...", a genuine successful completion), or
 # fail (any other snapd.seeded line containing "fail"), using a plain
 # substring search (never a regex) so no line's real content can be
-# misread. A consecutive duplicate (same timestamp, same
-# classification) is treated as a duplicate SERIALIZED RENDERING of
-# the same real event (S7.1R10's own established principle), never a
-# new attempt boundary.
+# misread.
+#
+# S7.1R12 Objective B (real Run #12, RUN_ID=34547988878, proved a real
+# defect - R11_SEED_ATTEMPT_DEDUP=PROVEN_FALSE): the R11 dedup logic
+# only compared each candidate to the IMMEDIATELY PRECEDING accepted
+# line (`last_ts`/`last_kind`) - a duplicate SERIALIZED RENDERING of
+# the exact same real event (identical timestamp, identical content)
+# is only safely recognized as a duplicate when the two renderings are
+# STRICTLY ADJACENT in the raw log. Real Run #12 evidence proved a
+# duplicate rendering can have ANOTHER real snapd.seeded-matching line
+# interleaved between the two renderings (the kernel-echoed and
+# journal-forwarded copies of the same console line do not always
+# arrive back-to-back), so the adjacent-only check missed it and
+# wrongly counted the same real attempt twice
+# (`seed_attempt_count=4` instead of the real `3`).
+#
+# Fixed with a GLOBAL semantic-identity set, checked against EVERY
+# previously-seen candidate (never just the immediately preceding
+# one): identity = (event_type, timestamp, normalized content) - see
+# `_normalize_event_content`'s own docstring for why normalization
+# stays deliberately narrow (timestamp-prefix stripping plus case/
+# whitespace folding only, never an assumed metadata-prefix strip that
+# could eat real message content). Two lines are treated as the SAME
+# real event only when ALL THREE of event_type, timestamp, AND
+# normalized content match exactly - sharing only a timestamp, or
+# only a kind, is never sufficient, so two genuinely distinct state
+# transitions (start vs. failure vs. restart) or two distinct real
+# events that merely happen to share a timestamp are never collapsed.
 #
 # Emits one start/finish/result triple per real attempt actually
 # observed - N is never hardcoded. An attempt that opens but never
@@ -413,12 +437,15 @@ _extract_seed_attempts() {
         {
             line = $0
             ts = ""
+            rest = ""
             if (match(line, /\[[ \t]*[0-9]+\.[0-9]+\]/)) {
                 ts = substr(line, RSTART, RLENGTH)
                 gsub(/[^0-9.]/, "", ts)
+                rest = substr(line, RSTART + RLENGTH)
             } else if (match(line, /^[ \t]*[0-9]+\.[0-9]+/)) {
                 ts = substr(line, RSTART, RLENGTH)
                 gsub(/^[ \t]+/, "", ts)
+                rest = substr(line, RSTART + RLENGTH)
             }
             if (ts == "") next
 
@@ -429,9 +456,19 @@ _extract_seed_attempts() {
             if (!is_start && !is_finish && !is_fail) next
 
             kind = is_start ? "start" : (is_finish ? "finish" : "fail")
-            if (ts == last_ts && kind == last_kind) next
-            last_ts = ts
-            last_kind = kind
+
+            # S7.1R12: global (kind, timestamp, normalized-content)
+            # semantic identity - deliberately narrow normalization
+            # (leading-whitespace trim, lowercase, whitespace
+            # collapse only), mirroring the documented, tested-safe
+            # scope of the bash _normalize_event_content helper above.
+            content = rest
+            gsub(/^[ \t]+/, "", content)
+            content = tolower(content)
+            gsub(/[ \t]+/, " ", content)
+            key = kind SUBSEP ts SUBSEP content
+            if (key in seen) next
+            seen[key] = 1
 
             if (is_start) {
                 if (have_open) {

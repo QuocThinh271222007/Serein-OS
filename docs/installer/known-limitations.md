@@ -1,5 +1,125 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R12)
+
+**Twelve real Installer Layer-B runs have occurred.** Run #12
+(RUN_ID=34547988878, ARTIFACT_ID unavailable to this environment)
+reproduced the same catastrophic snap-lifecycle pathology as Runs #7
+and #11 - CONSECUTIVE_PATHOLOGICAL_RUNS_11_12=PROVEN, i.e. this is no
+longer explainable as a rare outlier:
+
+```text
+Run 12 (after S7.1R11):
+  RUN_ID=34547988878, RUN_NUMBER=12
+  HEAD=77e7c263a91b5db4b5424921fa2b76292243bfc9
+  RESULT=FAILURE - failure_stage=installer_timeout
+  (qemu_elapsed_seconds=6600, installer_userspace_reached=true).
+
+  Given real evidence: a genuine 3-attempt snapd.seeded lifecycle
+  (attempt 1 ~436.447s->~595.544s fail; attempt 2 ~1688.742s->
+  ~2135.624s fail; attempt 3 ~2791.869s->~4031.859s SUCCESS), a
+  desktop-security-center configure-hook sanity-timeout failure
+  (~1033.269s, "Change 1" per the given evidence), a real mass
+  RemoveSnapServices sequence (~1052.857s onward), a
+  `/snap/snapd/current` missing window (~1701.211s, itself tied to a
+  second Change-1 task failure: "Prepare snap \"snapd\" for security
+  profile setup"), and eventual real stable recovery before
+  Subiquity/curtin ever started - unstable_seed_window≈3595.41s
+  (≈59m55s). Historical comparison (Run #8 ~450s, #9 ~399s,
+  #10 ~468s, #11 ~3943s pathological, #12 ~3595s pathological)
+  confirms RUN_7_ONLY_OUTLIER=PROVEN_FALSE and
+  RUN_11_ONLY_OUTLIER=PROVEN_FALSE.
+
+  S7.1R12 fixes (forensics/parser-corrective only - see the R12
+  decision principle below for why no mitigation was attempted):
+
+  1. Objective B: `_extract_seed_attempts` (added S7.1R11) had ONE
+     remaining real defect - its dedup logic only compared each
+     candidate line to the IMMEDIATELY PRECEDING accepted line
+     (`last_ts`/`last_kind`), which only catches a duplicate
+     serialized rendering of the same real event when the two
+     renderings are strictly ADJACENT in the raw log. Real Run #12
+     evidence proved a real, unrelated snapd.seeded-matching line can
+     interleave between the two duplicate renderings, so the
+     adjacent-only check missed it and wrongly reported
+     `seed_attempt_count=4` instead of the real 3
+     (R11_SEED_ATTEMPT_DEDUP=PROVEN_FALSE). Fixed with a GLOBAL
+     (event_type, timestamp, normalized content) semantic-identity
+     set, checked against EVERY previously-seen candidate rather than
+     just the immediately preceding one - verified against a
+     synthetic reproduction of Run #12's own given evidence
+     (reproduces `unstable_seed_window_duration=3595.41` exactly).
+  2. Objectives C-G: a new script,
+     `installer/scripts/extract-snap-change-forensics.sh`, adds
+     bounded, host-side, read-only extraction of snap Change/Task,
+     snapd.hold, `/snap/snapd/current`, and desktop-portal forensic
+     evidence - Change IDs are discovered DYNAMICALLY (never
+     hardcoded to "1"), and every numeric/text field is explicitly
+     bounded (max 20 distinct Change IDs, max 200 chars per captured
+     summary, with `truncated=true` recorded whenever a bound is hit
+     - Section 18, never silent truncation). Wired into
+     `run-qa-install.sh`'s workflow step and the uploaded Layer-B
+     artifact manifest (`qa-install-snap-change-forensics.env`), with
+     a direct static test proving the wiring (producer step exists,
+     runs unconditionally, and its exact output path is in the
+     artifact manifest - Section 19's own "a wiring bug is
+     unacceptable" requirement).
+
+  **Architectural note** (read before assuming a "live sampler" is
+  what Objectives D/E/F/G describe): this project's ONLY established,
+  tested QA-install-medium mutation mechanism is boot-parameter
+  patching of one GRUB menuentry - there is no squashfs-modification
+  tooling anywhere in this repository or its CI dependencies (no
+  unsquashfs/mksquashfs in the workflow's own tool-install list), so
+  injecting a NEW live-session runtime sampler (a systemd
+  service/timer that periodically runs `snap changes`/`snap tasks`/
+  `systemctl show` INSIDE the guest and reports back) is not
+  achievable without a materially larger architecture change than one
+  corrective round justifies. `extract-snap-change-forensics.sh`
+  therefore extracts real Change/Task/portal/snapd.hold/
+  snapd-current EVIDENCE FROM THE SAME raw serial log
+  `extract-bootstrap-milestones.sh` already parses - real Run #12's
+  own given evidence (systemd/snapd Change/Task failure text,
+  xdg-desktop-portal activity) already appears on that console thanks
+  to S7.1R5's `systemd.journald.forward_to_console=1` fix, so no NEW
+  guest-side instrumentation is required to surface it.
+  `T0`-`T6`-style "checkpoints" (Objective D) are therefore raw-log
+  timestamp ANCHORS (snapd_hold_start/finish, hook-failure timestamp,
+  first RemoveSnapServices timestamp, snapd/current-missing
+  timestamp, final stable seed), never a live systemctl/journalctl
+  snapshot - `portal_live_state_snapshot_supported=false` is recorded
+  explicitly in every run's output, honest about this gap rather than
+  fabricating live-sampling capability that does not exist.
+
+  **Static review (Section 20)**: a full-repository search confirms
+  Serein's own code contains zero functional logic touching
+  `snapd.hold`, `desktop-security-center`, or `ubuntu-desktop-bootstrap`
+  - `src/serein/installer/renderer.py` (the autoinstall.yaml
+  renderer) never references any snap package/configuration at all,
+  and `src/serein/installer/isoprep.py`'s only real mutation in this
+  space remains the R9 firmware-notifier `systemd.mask=` kernel
+  token, which is order-independent with every other chained token
+  (autoinstall/journald-forwarding/debug-logging) and touches an
+  entirely unrelated unit. SEREIN_OWNED_TRIGGER=NOT_OBSERVED.
+
+  QA_ONLY_MITIGATION_ACCEPTABLE=false this round, for the same reason
+  as R11: this environment has no raw serial log, no snapd Change/
+  Task API access, and no local real-QEMU reproduction capability to
+  independently verify a specific, narrow, deterministic trigger for
+  the pathological Change before any mitigation could be safely
+  proposed. QA_ONLY_SNAP_MITIGATION_IMPLEMENTED=false.
+
+  Explicitly NOT done this pass: QEMU timeout (6600s) and job timeout
+  (270min) both UNCHANGED - Run #12 does not fairly test either
+  budget, since ~3595s was consumed by the pathological snap
+  lifecycle before meaningful installer progress; changing either
+  timeout now would hide the pathology rather than address it.
+  Storage semantics, target fixture size, autoinstall activation,
+  firmware-notifier QA mask, and primary/secondary failure-recorder
+  scripts all unchanged - confirmed via diff against the exact
+  pre-head commit.
+```
+
 ## Real Layer-B validation status (S7.1R11)
 
 **Eleven real Installer Layer-B runs have occurred.** Run #11

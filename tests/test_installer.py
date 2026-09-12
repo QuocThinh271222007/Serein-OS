@@ -1535,6 +1535,23 @@ class TestInstallerSmokeWorkflow:
         assert ".qcow2" not in paths
         assert "*.iso" not in paths
 
+    def test_snap_change_forensics_step_present_and_wired_to_artifact(self, workflow):
+        # S7.1R12 Section 19: the absence of a forensic file due to a
+        # wiring bug is unacceptable - a real, direct static check the
+        # producing step exists, runs unconditionally (always(), never
+        # gated on install success), and its exact output path is
+        # actually included in the uploaded artifact manifest.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        expected_name = "Extract snap Change/Task forensics from serial log"
+        producer = next(s for s in steps if s.get("name") == expected_name)
+        assert producer.get("if") == "always()"
+        assert "extract-snap-change-forensics.sh" in producer["run"]
+        output_path = "dist/installer-fixtures/qa-install-snap-change-forensics.env"
+        assert output_path in producer["run"]
+
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        assert output_path in upload["with"]["path"]
+
     def test_failure_sites_use_canonical_record_failure_helper(self, workflow):
         steps = workflow["jobs"]["installer-smoke"]["steps"]
         for step in steps:
@@ -3505,10 +3522,354 @@ class TestExtractBootstrapMilestonesScript:
         assert outputs["final_stable_seed_success"] == ""
         assert outputs["snap_removal_event_count"] == "0"
 
+    # -- S7.1R12 Objective B: real Run #12 (RUN_ID=34547988878) proved
+    # the R11 `_extract_seed_attempts` dedup logic only compared each
+    # candidate to the IMMEDIATELY PRECEDING accepted line - a
+    # duplicate serialized rendering of the same real event is only
+    # caught when the two renderings are strictly ADJACENT. Real
+    # Run #12 evidence proved a real, unrelated snapd.seeded-matching
+    # line can interleave between the two duplicate renderings,
+    # wrongly producing seed_attempt_count=4 instead of the real 3.
+    # Fixed with a GLOBAL (event_type, timestamp, normalized content)
+    # semantic-identity set. --
+
+    def _r12_outputs(self, tmp_path: Path, log_content: str) -> dict[str, str]:
+        return self._outputs(tmp_path, log_content, qemu_elapsed="6600")
+
+    def test_run_12_duplicate_serialized_seed_start_deduplicated(self, tmp_path):
+        # Requirement 1 - the exact real Run #12 defect shape: the
+        # duplicate rendering is NOT adjacent to the original (another
+        # real matching line sits between them).
+        log = (
+            "[  436.446603] Starting snapd.seeded.service\n"
+            "[  500.000000] snapd.seeded.service: some unrelated status, fail\n"
+            "436.446603 Starting snapd.seeded.service\n"
+        )
+        outputs = self._r12_outputs(tmp_path, log)
+        # Only ONE real start exists - the duplicate rendering must
+        # never open a second attempt.
+        assert outputs["seed_attempt_1_start"] == "436.446603"
+        assert outputs["seed_attempt_1_finish"] == "500.000000"
+        assert outputs["seed_attempt_count"] == "1"
+
+    def test_run_12_duplicate_serialized_seed_failure_deduplicated(self, tmp_path):
+        # Requirement 2.
+        log = (
+            "[  436.446603] Starting snapd.seeded.service\n"
+            "[  595.544437] snapd.seeded.service failed\n"
+            "[  600.000000] unrelated snapd.seeded status line, fail\n"
+            "595.544437 snapd.seeded.service failed\n"
+        )
+        outputs = self._r12_outputs(tmp_path, log)
+        assert outputs["seed_attempt_1_finish"] == "595.544437"
+        assert outputs["seed_attempt_count"] == "1"
+
+    def test_run_12_three_semantic_attempts_remain_three(self, tmp_path):
+        # Requirement 3 - the exact real Run #12 evidence, with BOTH
+        # duplicate renderings adjacent this time (the simpler,
+        # already-covered case) plus the real 3-attempt structure.
+        log = (
+            "[  436.446603] Starting snapd.seeded.service\n"
+            "436.446603 Starting snapd.seeded.service\n"
+            "[  595.544437] snapd.seeded.service failed\n"
+            "595.544437 snapd.seeded.service failed\n"
+            "[ 1688.741525] Starting snapd.seeded.service\n"
+            "[ 2135.623635] snapd.seeded.service failed\n"
+            "[ 2791.869477] Starting snapd.seeded.service\n"
+            "[ 4031.858591] Finished snapd.seeded.service\n"
+        )
+        outputs = self._r12_outputs(tmp_path, log)
+        assert outputs["seed_attempt_count"] == "3"
+        assert outputs["seed_attempt_1_start"] == "436.446603"
+        assert outputs["seed_attempt_1_finish"] == "595.544437"
+        assert outputs["seed_attempt_1_result"] == "fail"
+        assert outputs["seed_attempt_2_start"] == "1688.741525"
+        assert outputs["seed_attempt_2_finish"] == "2135.623635"
+        assert outputs["seed_attempt_2_result"] == "fail"
+        assert outputs["seed_attempt_3_start"] == "2791.869477"
+        assert outputs["seed_attempt_3_finish"] == "4031.858591"
+        assert outputs["seed_attempt_3_result"] == "success"
+        assert outputs["final_stable_seed_success"] == "4031.858591"
+        # Real given Run #12 evidence: unstable_seed_window≈3595.41s.
+        assert outputs["unstable_seed_window_duration"] == "3595.41"
+
+    def test_two_distinct_events_sharing_one_timestamp_not_collapsed(self, tmp_path):
+        # Requirement 4 - a fail-then-restart at the SAME timestamp
+        # must never be collapsed merely because the timestamp
+        # matches; they are different event kinds (fail vs. start).
+        log = (
+            "[  100.000000] Starting snapd.seeded.service\n"
+            "[  200.000000] snapd.seeded.service failed\n"
+            "[  200.000000] Starting snapd.seeded.service\n"
+            "[  300.000000] Finished snapd.seeded.service\n"
+        )
+        outputs = self._r12_outputs(tmp_path, log)
+        assert outputs["seed_attempt_count"] == "2"
+        assert outputs["seed_attempt_1_finish"] == "200.000000"
+        assert outputs["seed_attempt_1_result"] == "fail"
+        assert outputs["seed_attempt_2_start"] == "200.000000"
+        assert outputs["seed_attempt_2_finish"] == "300.000000"
+        assert outputs["seed_attempt_2_result"] == "success"
+
+    def test_same_event_content_timestamp_duplicate_is_collapsed(self, tmp_path):
+        # Requirement 5.
+        log = (
+            "[  100.000000] Starting snapd.seeded.service\n"
+            "100.000000 Starting snapd.seeded.service\n"
+            "[  200.000000] Finished snapd.seeded.service\n"
+        )
+        outputs = self._r12_outputs(tmp_path, log)
+        assert outputs["seed_attempt_count"] == "1"
+
+    def test_untimestamped_duplicate_behavior_remains_correct(self, tmp_path):
+        # Requirement 6 - R9's own established behavior must survive
+        # the R12 rewrite.
+        log = (
+            "Starting snapd.seeded.service\n"
+            "[  436.446603] Starting snapd.seeded.service\n"
+            "[  595.544437] Finished snapd.seeded.service\n"
+        )
+        outputs = self._r12_outputs(tmp_path, log)
+        assert outputs["seed_attempt_1_start"] == "436.446603"
+        assert outputs["seed_attempt_count"] == "1"
+
+    def test_open_attempt_with_no_finish_remains_unknown(self, tmp_path):
+        # Requirement 7.
+        log = "[  436.446603] Starting snapd.seeded.service\n"
+        outputs = self._r12_outputs(tmp_path, log)
+        assert outputs["seed_attempt_1_finish"] == ""
+        assert outputs["seed_attempt_1_result"] == "unknown"
+
+    def test_final_success_followed_by_later_failure_not_stable(self, tmp_path):
+        # Requirement 8.
+        log = (
+            "[  100.000000] Starting snapd.seeded.service\n"
+            "[  200.000000] Finished snapd.seeded.service\n"
+            "[  300.000000] Starting snapd.seeded.service\n"
+            "[  400.000000] snapd.seeded.service failed\n"
+        )
+        outputs = self._r12_outputs(tmp_path, log)
+        assert outputs["final_stable_seed_success"] == ""
+
+    def test_final_stable_success_detection_remains_correct(self, tmp_path):
+        # Requirement 9.
+        outputs = self._r12_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["final_stable_seed_success"] == "4397.845000"
+
+    def test_run_11_multi_attempt_regression_remains_correct(self, tmp_path):
+        # Requirement 10 - the R11-established fixture must still
+        # produce the exact same result under the R12 rewrite.
+        outputs = self._r12_outputs(tmp_path, self._RUN_11_LIKE_LOG)
+        assert outputs["seed_attempt_count"] == "3"
+        assert outputs["seed_attempt_3_result"] == "success"
+        assert outputs["unstable_seed_window_duration"] == "3943.23"
+
     def _write(self, tmp_path: Path, content: str) -> Path:
         p = tmp_path / "serial.log"
         p.write_text(content)
         return p
+
+
+# ---------------------------------------------------------------------------
+# S7.1R12 Objectives C-G - installer/scripts/extract-snap-change-forensics.sh
+# ---------------------------------------------------------------------------
+
+
+class TestExtractSnapChangeForensicsScript:
+    """Real bash execution against fixtures reproducing (or deliberately
+    varying from) real Run #12's own given evidence - see this
+    script's own header for the architectural note on why this is
+    raw-serial-log extraction rather than a live in-guest sampler."""
+
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "extract-snap-change-forensics.sh"
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), *args], capture_output=True, text=True, timeout=30
+        )
+
+    def _outputs(self, tmp_path: Path, log_content: str) -> dict[str, str]:
+        serial = tmp_path / "serial.log"
+        serial.write_text(log_content)
+        output = tmp_path / "snap-change-forensics.env"
+        result = self._run([str(serial), str(output)])
+        assert result.returncode == 0, result.stdout + result.stderr
+        return {
+            k: v for k, v in (
+                line.split("=", 1) for line in output.read_text().splitlines()
+                if "=" in line and not line.startswith("#")
+            )
+        }
+
+    # A synthetic reproduction of real Run #12's own given sequence
+    # (Section 2.1/8 of the S7.1R12 spec) - never invented text.
+    _RUN_12_LIKE_LOG = (
+        "[    0.000000] Linux version 7.0.0-30-generic\n"
+        "[  436.446603] Starting snapd.seeded.service\n"
+        "[  595.544437] snapd.seeded.service failed\n"
+        "[  913.000000] GNOME idle monitor proxy timeout\n"
+        "[  918.471000] Starting snapd.hold.service\n"
+        "[  926.000000] org.freedesktop.portal.Desktop request\n"
+        "[  951.387000] Finished snapd.hold.service\n"
+        "[  951.500000] GNOME screencast: Cannot get portal Settings version: Timeout\n"
+        "[  956.000000] Starting xdg-desktop-portal.service\n"
+        "[  965.000000] Starting xdg-desktop-portal-gnome.service\n"
+        "[  986.890000] desktop-security-center configure hook starting\n"
+        '[ 1033.269000] Change 1 task fails: Run configure hook of "desktop-security-center"\n'
+        "[ 1033.287000] sanity timeout expired: Interrupted system call\n"
+        "[ 1033.299000] Broken pipe\n"
+        "[ 1045.000000] xdg-desktop-portal startup timeout\n"
+        "[ 1046.000000] DBus activation timeout for portal service\n"
+        '[ 1052.857000] snapd: task "RemoveSnapServices" for snap "firefox" begin, Change 1\n'
+        "[ 1688.741525] Starting snapd.seeded.service\n"
+        '[ 1701.211000] Change 1 task fails: Prepare snap "snapd" for security profile setup '
+        "readlink /snap/snapd/current: no such file or directory\n"
+        "[ 2135.623635] snapd.seeded.service failed\n"
+        "[ 2791.869477] Starting snapd.seeded.service\n"
+        "[ 4025.290000] snapd: no NTP sync after 10m0s\n"
+        "[ 4031.858591] Finished snapd.seeded.service\n"
+    )
+
+    def test_no_snap_command_available_never_fails_the_job(self, tmp_path):
+        # There is no "snap" command invoked by this script at all -
+        # it is pure host-side text extraction - so a log with zero
+        # snap-related content must still succeed cleanly (Section 17
+        # "no snap command available" - the closest analogue this
+        # architecture has: no snap-related evidence in the log).
+        log = "[    0.000000] Linux version 7.0.0\n"
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["change_count"] == "0"
+        assert outputs["change_ids"] == ""
+
+    def test_snap_changes_returns_no_changes(self, tmp_path):
+        log = "[    0.000000] Linux version 7.0.0\n[  10.000000] systemd start\n"
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["change_ids"] == ""
+        assert outputs["change_count"] == "0"
+        assert outputs["portal_forensics_status"] == "NOT_OBSERVED"
+
+    def test_one_relevant_failed_change(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_12_LIKE_LOG)
+        assert outputs["change_ids"] == "1"
+        assert outputs["change_count"] == "1"
+        assert outputs["change_1_first_failure_timestamp"] == "1033.269000"
+        assert outputs["change_1_last_failure_timestamp"] == "1701.211000"
+        assert outputs["change_1_mentions_desktop_security_center"] == "true"
+        assert outputs["change_1_mentions_security_profile_setup"] == "true"
+
+    def test_multiple_simultaneous_changes(self, tmp_path):
+        log = (
+            "[  100.000000] Change 3 task fails: some error\n"
+            "[  150.000000] Change 7 task fails: some other error\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["change_ids"] == "3,7"
+        assert outputs["change_count"] == "2"
+
+    def test_dynamic_change_ids_never_hardcoded_to_one(self, tmp_path):
+        # Real Run #12 happened to use Change 1 - this script must
+        # never assume that.
+        log = '[  100.000000] Change 99 task fails: Run configure hook of "dsc"\n'
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["change_ids"] == "99"
+        assert "change_99_first_failure_timestamp" in outputs
+        assert "change_1_first_failure_timestamp" not in outputs
+
+    def test_change_id_not_equal_to_one(self, tmp_path):
+        log = '[  100.000000] Change 42 task fails: security profile setup\n'
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["change_ids"] == "42"
+        assert outputs["change_42_mentions_security_profile_setup"] == "true"
+
+    def test_task_retrieval_failure_never_fatal(self, tmp_path):
+        # A "Change N" reference with no further failure/error text at
+        # all (task detail unobtainable from raw-log text alone) must
+        # never abort extraction - the per-Change fields are honestly
+        # left empty/zero, not fabricated, and the script still exits
+        # 0 with every other field populated normally.
+        log = "[  100.000000] Change 5 status update, nothing else\n"
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["change_ids"] == "5"
+        assert outputs["change_5_first_failure_timestamp"] == ""
+        assert outputs["change_5_failure_line_count"] == "0"
+
+    def test_hook_failure_task_captured(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_12_LIKE_LOG)
+        assert "desktop-security-center" in outputs["change_1_first_failure_summary"]
+
+    def test_remove_snap_services_task_correlated(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_12_LIKE_LOG)
+        assert outputs["remove_snap_services_associated_change_id"] == "1"
+
+    def test_snapd_current_missing_captured(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_12_LIKE_LOG)
+        assert outputs["snapd_current_missing_first"] == "1701.211000"
+        assert outputs["snapd_current_missing_count"] == "1"
+        assert outputs["snapd_current_missing_associated_change_id"] == "1"
+
+    def test_portal_state_unavailable_yields_honest_not_observed(self, tmp_path):
+        log = "[    0.000000] Linux version 7.0.0\n"
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["portal_forensics_status"] == "NOT_OBSERVED"
+        assert outputs["portal_live_state_snapshot_supported"] == "false"
+        for key in (
+            "portal_idle_monitor_timeout",
+            "portal_desktop_request",
+            "portal_xdg_desktop_portal_start",
+        ):
+            assert outputs[key] == ""
+
+    def test_portal_state_observed_when_present(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_12_LIKE_LOG)
+        assert outputs["portal_forensics_status"] == "OBSERVED"
+        assert outputs["portal_idle_monitor_timeout"] == "913.000000"
+        assert outputs["portal_xdg_desktop_portal_gnome_start"] == "965.000000"
+
+    def test_command_never_times_out_bounded_execution(self, tmp_path):
+        # Structural proof of Section 11's BOUNDED/FINITE/LOW_OVERHEAD
+        # requirements - this call itself already enforces a 30s
+        # subprocess timeout (see self._run); a real pass proves the
+        # script terminates well within that bound even against a
+        # log containing many Change references.
+        lines = [f'[  {i * 10}.000000] Change {i} task fails: error {i}' for i in range(1, 30)]
+        log = "\n".join(lines) + "\n"
+        outputs = self._outputs(tmp_path, log)
+        # Section 18: bounded to MAX_CHANGE_IDS=20, never unbounded.
+        assert outputs["change_count"] == "20"
+        assert outputs["change_ids_truncated"] == "true"
+
+    def test_output_truncation_is_explicitly_recorded(self, tmp_path):
+        long_text = "x" * 300
+        log = f"[  100.000000] Change 5 task fails: {long_text}\n"
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["change_5_first_failure_summary_truncated"] == "true"
+        assert len(outputs["change_5_first_failure_summary"]) <= 200
+
+    def test_no_truncation_recorded_when_within_bound(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_12_LIKE_LOG)
+        assert outputs["change_1_first_failure_summary_truncated"] == "false"
+
+    def test_snapd_hold_forensics_captured_without_causal_claim(self, tmp_path):
+        outputs = self._outputs(tmp_path, self._RUN_12_LIKE_LOG)
+        assert outputs["snapd_hold_start"] == "918.471000"
+        assert outputs["snapd_hold_finish"] == "951.387000"
+        # This script itself never asserts causality - no field name
+        # implying a causal verdict exists in its output at all.
+        assert not any("causal" in k for k in outputs)
+        assert not any("root_cause" in k for k in outputs)
+
+    def test_missing_serial_log_never_fails_the_job(self, tmp_path):
+        result = self._run([str(tmp_path / "does-not-exist.log"), str(tmp_path / "out.env")])
+        assert result.returncode == 0
+
+    def test_never_mutates_the_serial_log(self, tmp_path):
+        serial = tmp_path / "serial.log"
+        serial.write_text(self._RUN_12_LIKE_LOG)
+        before = serial.read_text()
+        self._run([str(serial), str(tmp_path / "out.env")])
+        assert serial.read_text() == before
 
 
 # ---------------------------------------------------------------------------
