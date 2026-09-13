@@ -1,5 +1,146 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R16)
+
+**Sixteen real Installer Layer-B runs have occurred.** Run #16
+(RUN_ID=34768219149, JOB_ID=103752927606,
+HEAD=44e3ee72ce9503fbac9a102fb23c7c084c04e244 - the S7.1R15 dual-path
+evidence commit) reproduced the SAME catastrophic snap/bootstrap
+pathology as Runs #7/#11/#12/#15, while storage again progressed
+cleanly through filesystem apply, partitioning, and extract:
+
+```text
+Run 16 (after S7.1R15):
+  RUN_ID=34768219149, RUN_NUMBER=16
+  HEAD=44e3ee72ce9503fbac9a102fb23c7c084c04e244
+  RESULT=FAILURE - failure_stage=installer_timeout
+  (qemu_timeout_seconds=6600).
+
+  RUN16_RAW_ARTIFACT_DIRECTLY_READ=BLOCKED - this environment has no
+  `gh` CLI and no local copy of ARTIFACT_ID=10322778412; the figures
+  below are the task's own given, authoritative Run #16 summary, never
+  an independent read.
+
+  PROVEN (as given): storage again progressed cleanly -
+  Filesystem apply ~4497.249s->~4522.504s PASS, partitioning
+  ~4786.801s->~4835.988s PASS, extract ~4950.800s->~6513.177s PASS,
+  curthooks starting ~6569.701s before the 6600s host timeout.
+  RUN16_BLOCK_PROBE_PATHOLOGY=PROVEN_FALSE. This is now the SECOND
+  consecutive run (after #15) with a clean storage path, further
+  reinforcing that the R13/R14 block-probe pathology is not
+  deterministic.
+
+  PROVEN (as given): a genuine 3-attempt snapd.seeded lifecycle -
+  attempt 1 ~446.911s->~610.211s FAIL, attempt 2
+  ~1787.025s->~2476.805s FAIL, attempt 3 ~2784.058s->~4193.690s
+  SUCCESS (seed_attempt_count=3, unstable_seed_window≈3746.78s
+  ≈62m27s). Critically, the given Run #16 timeline places the FIRST
+  observed abnormality at snapd.service's own startup (~519s estimated
+  timeout, ~610s "timeout exceeded while waiting for response",
+  ~624.759s/~714.560s/~837.443s/~909.052s snapd.service start-timeout/
+  restart cycle) - HUNDREDS of seconds BEFORE the
+  desktop-security-center hook failure (~1073.763s). This directly
+  overturns this project's own prior working assumption:
+  DESKTOP_SECURITY_CENTER_IS_INITIAL_TRIGGER=PROVEN_FALSE. The current
+  earliest known abnormal area is snapd startup/initialization itself;
+  SNAPD_STARTUP_ROOT_CAUSE=NOT_OBSERVED (why snapd fails to complete
+  startup in time remains genuinely unknown from evidence available in
+  this environment).
+
+  PROVEN (as given): R15's dual-path telemetry DID run in the real QA
+  session and DID execute real snap-state inspection (`snap changes`
+  returned 5 real Changes, Change 1 = Error/"Initialize system state",
+  Changes 2-5 = Done) - GUEST_EVIDENCE_TRANSPORT=PROVEN_PASS. But the
+  exported frame only appeared at ~4269.64s (autoinstall extraction/
+  load themselves only occurred at ~4259.922s/~4266.617s, i.e. AFTER
+  the ~446s-4193s pathology had already resolved) -
+  REALTIME_SNAP_PATHOLOGY_WATCHING=PROVEN_FALSE. Collection was
+  retrospective, not real-time - the root motivation for this round.
+
+  S7.1R16 fixes (still observability-only - no functional snap
+  mitigation implemented):
+
+  1. Objective A: the guest evidence watcher is no longer launched via
+     Subiquity autoinstall early-commands at all -
+     AUTOINSTALL_EARLY_COMMAND_DEPENDENCY_REMOVED=true. It is now
+     embedded as a real, executable file at the QA-install ISO's own
+     root (`serein.installer.isoprep` - the SAME "outer ISO
+     filesystem, never the squashfs" placement `autoinstall.yaml`
+     already uses) and started via a new, single-word
+     `systemd.run=/cdrom/serein-qa-early-watcher.sh` kernel token on
+     the QA boot entry only - the same proven, generalized
+     kernel-token mechanism as every prior QA-only boot customization
+     (R3's `autoinstall`, R5's journald-forwarding, R7's debug
+     logging, R9's firmware-notifier mask). A new
+     `SEREIN_EVIDENCE_WATCHER_STARTED` boot marker (with the guest's
+     own monotonic timestamp) is the mechanism by which Run #17 proves
+     or disproves whether this actually starts early enough - never
+     assumed merely because the token exists. **Caveat honestly
+     carried forward**: whether the real Ubuntu 26.04 live
+     environment's systemd actually supports/honors `systemd.run=` at
+     a point early enough to precede the first snapd failure is NOT
+     validated in this development environment (no real QEMU/live-ISO
+     boot here) - Run #17's own boot-marker timestamp is the real
+     test, not assumed true.
+  2. Objective B: dynamic, bounded failed-Change task-graph capture
+     (`QA_EVIDENCE_MAX_FAILED_CHANGE_IDS=5`) - `snap changes`' own
+     Status column is scanned for Error-like entries (never hardcoded
+     to Change ID 1), and `snap tasks <id>` is captured for each,
+     bounded.
+  3. Objective C: narrow `systemctl show snapd.service` property
+     capture (ActiveState/SubState/Result/NRestarts/ExecMainPID/
+     ExecMainCode/ExecMainStatus/*TimestampMonotonic/TimeoutStartUSec)
+     plus a bounded `journalctl -u snapd.service` window.
+  4. Objective D: a best-effort "last snapd-tagged journal line before
+     the first timeout-style message" reconstruction - never asserts
+     this proves a deadlock, a plain bounded observation.
+  5. Objective E: a narrow, read-only `ps` process snapshot of
+     `snapd` (PID/state/elapsed/CPU time) - no ptrace, no memory dump,
+     no debugger attach.
+  6. Objectives F/G: explicit ordering timestamps
+     (hold_start_ts/hold_finish_ts/portal_failure_ts/dsc_failure_ts/
+     snapd_failure_ts) recorded in every frame, with
+     `installer/scripts/extract-guest-evidence.sh` now computing
+     honest ordering booleans (`unknown` whenever either side was
+     never observed, never guessed) across every parsed frame -
+     `snapd_failure_precedes_hold`,
+     `snapd_failure_precedes_portal_failure`,
+     `snapd_failure_precedes_desktop_security_center_failure`. Purely
+     temporal observations, never promoted to a causal claim.
+  7. Objective I: a real, proven case-sensitivity defect in the R14/
+     R15 storage-probe semantic state machine - `line ~ pattern` in
+     awk is case-SENSITIVE, but the real upstream finish-line format
+     capitalizes SUCCESS ("finish: ...SUCCESS: restricted=False"),
+     which this script only ever matched as lowercase "success"
+     (relying on the OUTER grep's case-insensitivity, which never
+     covered these four per-line checks). A real Run #16 unrestricted
+     probe start followed by that finish line was silently MISCOUNTED
+     as a SECOND start rather than closing the first attempt as a
+     success. Fixed via `tolower()` on both the line and every pattern,
+     rather than enumerating case variants - reproduced exactly
+     against the real Run #16 timestamps (start ~4497.249s, finish
+     ~4522.488660s) before and after the fix.
+  8. Section 16 follow-through: Section 16's exists/nonempty split
+     (R15) is unchanged and confirmed still correct this round.
+
+  No functional snap-lifecycle mitigation implemented -
+  SNAP_MITIGATION_IMPLEMENTED=false. The mitigation-eligibility
+  checklist (Section 10 of this round's own corrective) is not met:
+  this environment still has no raw serial log, no snapd Change/Task
+  API access, and no local real-QEMU reproduction capability to
+  establish WHY snapd's own startup exceeds its expected deadline
+  before any corrective could be safely proposed.
+
+  Explicitly NOT done this pass: QEMU timeout (6600s) and job timeout
+  (270min) both UNCHANGED - Run #16 spent ~3746s in the snap pathology
+  before meaningful storage progress, so it does not fairly test
+  either budget; changing either would hide the pathology rather than
+  address it. Storage selection, protected-disk visibility, target
+  fixture layout, storage YAML grammar, and the R14 block-probe
+  evidence path are all unchanged - confirmed via diff against the
+  exact pre-head commit.
+```
+
 ## Real Layer-B validation status (S7.1R15)
 
 **Fifteen real Installer Layer-B runs have occurred.** Run #15

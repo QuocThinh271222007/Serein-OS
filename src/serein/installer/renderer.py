@@ -70,12 +70,18 @@ QA_EVIDENCE_PORT_PATH = "/dev/virtio-ports/org.serein.qa.evidence"
 # of the five known signals is observed, never more than once per
 # signal per run (Section 6 - observation only, never a trigger for
 # any corrective action, never a control channel).
-QA_EVIDENCE_MAX_SNAP_FRAMES = 5
-QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME = 8192
-# S7.1R15: the port now carries two independent bounded evidence kinds
-# (crash content and snap frames) - the shared total ceiling is raised
-# accordingly, still small and explicit, never unbounded.
-QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES = 131072
+QA_EVIDENCE_MAX_SNAP_FRAMES = 6
+QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME = 16384
+# S7.1R16 Objective B: dynamic, bounded capture of the actual failed
+# snap Change task graph (never hardcoded to Change ID 1 - Run #16's
+# own Change 1 was real, but a future run may fail on any other ID).
+QA_EVIDENCE_MAX_FAILED_CHANGE_IDS = 5
+# S7.1R16: frames now carry substantially more per-item detail (the
+# failed-Change task graph, snapd.service properties/journal context,
+# last-progress-before-timeout, and a process snapshot) - the shared
+# total ceiling is raised again accordingly, still small, explicit,
+# and never unbounded.
+QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES = 262144
 
 
 class RendererError(ValueError):
@@ -167,35 +173,70 @@ def _install_state_late_command(marker: InstallStateMarker) -> str:
     )
 
 
-def _qa_evidence_watcher_script() -> str:
+def build_qa_evidence_watcher_script() -> str:
     """The guest-side bounded evidence producer for BOTH recurring
     pathology families this project has observed (S7.1R14 Objective A
-    + S7.1R15 Objective B). A POSIX ``/bin/sh`` script (no bashisms -
-    the live ISO's default shell is dash) that:
+    + S7.1R15 Objective B + S7.1R16 Objectives A-G). A POSIX ``/bin/sh``
+    script (no bashisms - the live ISO's default shell is dash) that:
 
-    1. watches for new ``/var/crash/*block_probe_fail*.crash`` files
+    1. emits a single ``SEREIN_EVIDENCE_WATCHER_STARTED`` marker with a
+       monotonic timestamp the moment it starts (S7.1R16 Objective A/8) -
+       the only way to actually PROVE this watcher started earlier than
+       the pathology, rather than merely asserting it exists;
+    2. watches for new ``/var/crash/*block_probe_fail*.crash`` files
        (the Run #13/#14 block-probe pathology) and exports bounded
        metadata + truncated content;
-    2. watches the guest's own systemd journal for five known signals
-       of the recurring Run #7/#11/#12/#15 snap/bootstrap pathology
-       (desktop-security-center configure-hook failure, a sanity
-       timeout, ``RemoveSnapServices`` beginning, ``/snap/snapd/current``
-       going missing, a ``snapd.seeded`` failure) and exports one
-       bounded diagnostic frame the FIRST time each signal is seen.
+    3. watches the guest's own systemd journal for six known signals of
+       the recurring Run #7/#11/#12/#15/#16 snap/bootstrap pathology
+       (a snapd.service start timeout, desktop-security-center
+       configure-hook failure, a sanity timeout, ``RemoveSnapServices``
+       beginning, ``/snap/snapd/current`` going missing, a
+       ``snapd.seeded`` failure) and exports one bounded diagnostic
+       frame the FIRST time each signal is seen - now including the
+       actual failed snap Change task graph (Objective B), narrow
+       snapd.service state/journal context (Objective C), a best-effort
+       last-progress-before-timeout reconstruction (Objective D), a
+       narrow process snapshot (Objective E), and explicit ordering
+       timestamps for the snapd/portal/desktop-security-center/
+       snapd.hold sequence (Objectives F/G) - each is filled in only
+       from what this run's own bounded journal window actually shows,
+       never guessed.
+
+    S7.1R16 Objective A: this watcher is no longer launched via
+    Subiquity autoinstall early-commands (real Run #15/#16 evidence
+    proved Subiquity does not even reach early-commands until WELL
+    after the pathology has already recovered - Run #16's own
+    autoinstall extraction/load occurred at ~4259s/~4266s, entirely
+    after the ~446s-4193s snap pathology window). It is instead started
+    independently of Subiquity, during live-session boot itself, via a
+    QA-only kernel command-line token
+    (``serein.installer.isoprep``'s own ``systemd.run=`` wiring) -
+    exactly the same "kernel-parameter-only, zero squashfs
+    modification" mechanism this project has used since R3's
+    ``autoinstall`` token, R5's journald-forwarding, R7's debug
+    logging, and R9's firmware-notifier mask. Whether the real Ubuntu
+    live environment's systemd actually honors ``systemd.run=`` at a
+    point early enough to precede the first snapd failure is NOT
+    provable from this development environment (no real QEMU/Subiquity
+    here) - the boot marker above is the mechanism by which a real run
+    proves or disproves it, never assumed.
 
     Both evidence kinds are exported through the same QA-only,
     structurally one-way virtio-serial port ``run-qa-install.sh`` wires
     up (``QA_EVIDENCE_PORT_PATH``) - observation only, in both
     directions: this watcher never intentionally triggers either
-    pathology, and never takes any corrective action of its own.
+    pathology, and never takes any corrective action of its own (never
+    restarts snapd, never retries/acknowledges a snap Change, never
+    mutates snap state, never installs/removes a snap).
 
-    Guest-side contract (Section 6's absolute requirements, all held by
-    construction here, never by convention):
+    Guest-side contract (Section 6/12's absolute requirements, all held
+    by construction here, never by convention):
 
     - reads ONLY ``/var/crash/*block_probe_fail*.crash`` and the
-      guest's own local systemd journal/snap state (via ``journalctl``,
-      run against the guest's OWN journal, never any host resource) -
-      never any host path, never any other guest path;
+      guest's own local systemd journal/snap/process state (via
+      ``journalctl``/``snap``/``systemctl``/``ps``, run against the
+      guest's OWN state, never any host resource) - never any host
+      path, never any other guest path;
     - writes ONLY to the named virtio-serial port - never any other
       file, device, or network socket;
     - never executes a host command, never opens a network connection,
@@ -208,12 +249,20 @@ def _qa_evidence_watcher_script() -> str:
     - bounded: at most ``MAX_CRASH_FILES`` distinct crash files and at
       most ``MAX_SNAP_FRAMES`` distinct snap-pathology frames are ever
       exported, each capped at its own per-item byte limit, under one
-      shared ``MAX_TOTAL_EVIDENCE_BYTES`` ceiling - every truncation is
-      recorded explicitly (``truncated=true``/``false``), never silent;
+      shared ``MAX_TOTAL_EVIDENCE_BYTES`` ceiling; at most
+      ``MAX_FAILED_CHANGE_IDS`` failed-Change task graphs are ever
+      captured per frame, never hardcoded to Change ID 1 - every
+      truncation is recorded explicitly (``truncated=true``/``false``),
+      never silent;
     - deduplicated: an in-memory ``seen`` list keyed by crash filename
       or ``snap:<trigger>``, so the same crash file or the same snap
       signal is exported at most once per run, even though the watcher
-      polls repeatedly.
+      polls repeatedly;
+    - a failing diagnostic command (``snap``/``systemctl``/
+      ``journalctl``/``ps`` unavailable, or erroring) reads as
+      ``NOT_OBSERVED`` and never aborts the watcher (no ``set -e``) -
+      forensic failure is always secondary, never promoted to installer
+      primary failure.
     """
     lines = [
         "#!/bin/sh",
@@ -223,6 +272,7 @@ def _qa_evidence_watcher_script() -> str:
         f"MAX_BYTES_PER_CRASH={QA_EVIDENCE_MAX_BYTES_PER_CRASH}",
         f"MAX_SNAP_FRAMES={QA_EVIDENCE_MAX_SNAP_FRAMES}",
         f"MAX_BYTES_PER_SNAP_FRAME={QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME}",
+        f"MAX_FAILED_CHANGE_IDS={QA_EVIDENCE_MAX_FAILED_CHANGE_IDS}",
         f"MAX_TOTAL_EVIDENCE_BYTES={QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES}",
         f"MAX_ITERATIONS={QA_EVIDENCE_WATCHER_MAX_ITERATIONS}",
         f"SLEEP_SECONDS={QA_EVIDENCE_WATCHER_SLEEP_SECONDS}",
@@ -231,6 +281,72 @@ def _qa_evidence_watcher_script() -> str:
         "snap_frame_count=0",
         "total_bytes=0",
         "i=0",
+        "",
+        "# S7.1R16 Section 8: order-independent AND-chain timestamp",
+        "# lookup against the CURRENT journal window - never a single",
+        "# combined regex (a real message may put its tokens in either",
+        "# order). Returns the first monotonic timestamp among matching",
+        "# lines, or nothing if none match (caller defaults to",
+        "# NOT_OBSERVED) - never guessed.",
+        "_ts_for_all() {",
+        '    acc="$recent_journal"',
+        '    for pat in "$@"; do',
+        '        acc=$(printf "%s\\n" "$acc" | grep -Ei -- "$pat") || acc=""',
+        '        [ -n "$acc" ] || { printf "%s" ""; return 0; }',
+        "    done",
+        '    printf "%s\\n" "$acc" | head -n1 | '
+        'sed -nE "s/^\\[[[:space:]]*([0-9]+\\.[0-9]+)\\].*/\\1/p"',
+        "}",
+        "",
+        "# S7.1R16 Objective D: best-effort reconstruction of the last",
+        "# snapd-tagged journal line seen before the FIRST timeout-style",
+        "# message in the current window - never claims this proves a",
+        "# deadlock, purely a bounded observation.",
+        "_last_snapd_progress() {",
+        '    printf "%s\\n" "$recent_journal" | awk \'',
+        '        BEGIN { last_line = ""; last_ts = ""; timeout_ts = ""; found = 0 }',
+        "        {",
+        '            ts = ""',
+        '            if (match($0, /\\[[ \\t]*[0-9]+\\.[0-9]+\\]/)) {',
+        "                ts = substr($0, RSTART, RLENGTH); gsub(/[^0-9.]/, \"\", ts)",
+        "            }",
+        "            line_lc = tolower($0)",
+        '            if (!found && (line_lc ~ /timed out/ || line_lc ~ /timeout/)) {',
+        "                found = 1; timeout_ts = ts",
+        "            }",
+        '            if (!found && line_lc ~ /snapd/ && ts != "") { last_line = $0; last_ts = ts }',
+        "        }",
+        "        END {",
+        '            if (last_line == "") { '
+        'print "last_snapd_message_before_timeout=NOT_OBSERVED" }',
+        '            else { gsub(/\\n/, " ", last_line)',
+        '                   print "last_snapd_message_before_timeout=" last_line }',
+        '            if (last_ts == "") { print "last_snapd_message_timestamp=NOT_OBSERVED" }',
+        '            else { print "last_snapd_message_timestamp=" last_ts }',
+        '            if (last_ts != "" && timeout_ts != "") {',
+        '                print "time_from_last_snapd_message_to_timeout=" (timeout_ts - last_ts)',
+        "            } else {",
+        '                print "time_from_last_snapd_message_to_timeout=NOT_OBSERVED"',
+        "            }",
+        "        }",
+        "    '",
+        "}",
+        "",
+        "# S7.1R16 Objective A/8: the boot marker - written ONCE, before",
+        "# anything else, so a real run's own monotonic timestamp is the",
+        "# proof (or disproof) that this watcher actually started before",
+        "# the first snapd failure - never merely inferred from this",
+        "# mechanism existing in source code.",
+        'if [ -e "$PORT" ] && [ -w "$PORT" ]; then',
+        '    boot_ts=$(cut -d" " -f1 /proc/uptime 2>/dev/null || echo "")',
+        "    {",
+        '        echo "SEREIN_EVIDENCE_WATCHER_STARTED"',
+        '        echo "watcher_start_monotonic_ts=$boot_ts"',
+        '    } >> "$PORT" 2>/dev/null || true',
+        '    boot_ts_len=${#boot_ts}',
+        "    total_bytes=$((total_bytes + boot_ts_len + 48))",
+        "fi",
+        "",
         'while [ "$i" -lt "$MAX_ITERATIONS" ]; do',
         '    if [ -e "$PORT" ] && [ -w "$PORT" ]; then',
         "        for f in /var/crash/*block_probe_fail*.crash; do",
@@ -266,19 +382,26 @@ def _qa_evidence_watcher_script() -> str:
         "            total_bytes=$((total_bytes + take))",
         "        done",
         "",
-        "        # S7.1R15 Objective B: recurring snap/bootstrap pathology",
-        "        # signals (Runs #7/#11/#12/#15) - a single bounded",
-        "        # journal fetch per iteration, checked against all five",
-        "        # known signals, never a fresh journalctl invocation per",
-        "        # signal (Section 11 - low overhead).",
-        '        recent_journal=$(journalctl --no-pager -n 200 2>/dev/null) || '
-        'recent_journal=""',
+        "        # S7.1R15/R16: recurring snap/bootstrap pathology signals",
+        "        # (Runs #7/#11/#12/#15/#16) - a single bounded journal",
+        "        # fetch per iteration in monotonic-timestamp form (the",
+        "        # SAME `[ NNN.NNNNNN]` convention every other host-side",
+        "        # parser in this project already understands), checked",
+        "        # against all six known signals, never a fresh",
+        "        # journalctl invocation per signal (Section 11/12 - low",
+        "        # overhead, secondary/non-blocking on failure).",
+        '        recent_journal=$(journalctl --no-pager -o short-monotonic -n 200 '
+        '2>/dev/null) || recent_journal=""',
         '        if [ -n "$recent_journal" ] && '
         '[ "$snap_frame_count" -lt "$MAX_SNAP_FRAMES" ]; then',
         '            trigger=""',
         '            key=""',
-        '            if printf "%s" "$recent_journal" | grep -qi \'desktop-security-center\' && '
-        'printf "%s" "$recent_journal" | grep -qiE \'hook|configure\' && '
+        '            if printf "%s" "$recent_journal" | grep -qi \'snapd.service\' && '
+        'printf "%s" "$recent_journal" | grep -qiE \'start operation timed out|timed out\'; '
+        'then',
+        '                trigger="snapd_service_timeout"; key="snap:service_timeout"',
+        '            elif printf "%s" "$recent_journal" | grep -qi \'desktop-security-center\' '
+        '&& printf "%s" "$recent_journal" | grep -qiE \'hook|configure\' && '
         'printf "%s" "$recent_journal" | grep -qiE \'fail|error\'; then',
         '                trigger="desktop_security_center_hook_failure"; key="snap:hook_failure"',
         '            elif printf "%s" "$recent_journal" | grep -qi \'sanity timeout\'; then',
@@ -301,12 +424,73 @@ def _qa_evidence_watcher_script() -> str:
         '                seen="$seen $key"',
         "                snap_frame_count=$((snap_frame_count + 1))",
         '                ts=$(cut -d" " -f1 /proc/uptime 2>/dev/null || echo "")',
+        "",
+        "                # S7.1R16 Objectives F/G: ordering timestamps -",
+        "                # a plain observation of what THIS bounded",
+        "                # journal window shows, never a causal claim.",
+        '                hold_start_ts=$(_ts_for_all \'snapd\\.hold\' \'start\')',
+        '                hold_finish_ts=$(_ts_for_all \'snapd\\.hold\' \'finish\')',
+        '                portal_failure_ts=$(_ts_for_all \'portal\' \'timeout\')',
+        '                dsc_failure_ts=$(_ts_for_all \'desktop-security-center\' \'fail\')',
+        '                snapd_failure_ts=$(_ts_for_all \'snapd\' \'timeout|timed out\')',
+        '                [ -z "$hold_start_ts" ] && hold_start_ts="NOT_OBSERVED"',
+        '                [ -z "$hold_finish_ts" ] && hold_finish_ts="NOT_OBSERVED"',
+        '                [ -z "$portal_failure_ts" ] && portal_failure_ts="NOT_OBSERVED"',
+        '                [ -z "$dsc_failure_ts" ] && dsc_failure_ts="NOT_OBSERVED"',
+        '                [ -z "$snapd_failure_ts" ] && snapd_failure_ts="NOT_OBSERVED"',
+        "",
         '                snap_state=$(snap changes 2>/dev/null | head -n 20)',
         '                [ -z "$snap_state" ] && snap_state="NOT_OBSERVED"',
+        "",
+        "                # S7.1R16 Objective B: dynamic failed-Change",
+        "                # discovery - never hardcoded to Change ID 1.",
+        '                failed_change_tasks="NOT_OBSERVED"',
+        '                if [ "$snap_state" != "NOT_OBSERVED" ]; then',
+        '                    failed_ids=$(printf "%s\\n" "$snap_state" | '
+        "awk 'NR>1 && $2 ~ /^[Ee]rror/ {print $1}')",
+        '                    if [ -n "$failed_ids" ]; then',
+        '                        fc_count=0',
+        '                        failed_change_tasks=""',
+        '                        for cid in $failed_ids; do',
+        '                            [ "$fc_count" -ge "$MAX_FAILED_CHANGE_IDS" ] && break',
+        "                            fc_count=$((fc_count + 1))",
+        '                            task_out=$(snap tasks "$cid" 2>/dev/null)',
+        '                            [ -z "$task_out" ] && task_out="NOT_OBSERVED"',
+        '                            failed_change_tasks="$failed_change_tasks--- change '
+        '$cid ---'
+        '\n$task_out'
+        '\n\n"',
+        "                        done",
+        "                    fi",
+        "                fi",
+        "",
         '                snapd_state=$(systemctl is-active snapd.service 2>/dev/null '
         '|| echo "NOT_OBSERVED")',
+        "",
+        "                # S7.1R16 Objective C: narrow snapd.service",
+        "                # metadata + journal context.",
+        '                snapd_props=$(systemctl show snapd.service --no-pager '
+        '-p ActiveState -p SubState -p Result -p NRestarts -p ExecMainPID '
+        '-p ExecMainCode -p ExecMainStatus -p ExecMainStartTimestampMonotonic '
+        '-p ActiveEnterTimestampMonotonic -p InactiveEnterTimestampMonotonic '
+        '-p TimeoutStartUSec 2>/dev/null)',
+        '                [ -z "$snapd_props" ] && snapd_props="NOT_OBSERVED"',
+        '                snapd_journal=$(journalctl -u snapd.service --no-pager '
+        '-o short-monotonic -n 40 2>/dev/null)',
+        '                [ -z "$snapd_journal" ] && snapd_journal="NOT_OBSERVED"',
+        "",
+        "                # S7.1R16 Objective D.",
+        '                last_progress=$(_last_snapd_progress)',
+        "",
+        "                # S7.1R16 Objective E: a narrow, read-only",
+        "                # process snapshot - no ptrace, no memory dump,",
+        "                # no debugger attach, no scheduling change.",
+        '                snapd_proc=$(ps -o pid,stat,etime,time -C snapd 2>/dev/null | '
+        "awk 'NR==2')",
+        '                [ -z "$snapd_proc" ] && snapd_proc="NOT_OBSERVED"',
+        "",
         "                dsc_state=$(journalctl -u 'snap.desktop-security-center*' "
-        '--no-pager -n 20 2>/dev/null)',
+        '--no-pager -o short-monotonic -n 20 2>/dev/null)',
         '                [ -z "$dsc_state" ] && dsc_state="NOT_OBSERVED"',
         '                hold_state=$(systemctl show snapd.hold.service --no-pager '
         '-p ActiveState 2>/dev/null)',
@@ -323,12 +507,41 @@ def _qa_evidence_watcher_script() -> str:
         '                journal_ctx=$(printf "%s" "$recent_journal" | '
         "grep -iE 'snapd|desktop-security-center|RemoveSnapServices' | tail -n 30)",
         '                [ -z "$journal_ctx" ] && journal_ctx="NOT_OBSERVED"',
-        '                frame=$(printf \'=== SEREIN SNAP FAILURE FRAME ===\\n'
-        'timestamp=%s\\ntrigger=%s\\n\\n[SNAP_STATE]\\n%s\\n\\n[SNAPD]\\n%s\\n\\n'
-        '[DESKTOP_SECURITY_CENTER]\\n%s\\n\\n[SNAPD_HOLD]\\n%s\\n\\n[PORTAL_STATE]\\n%s\\n\\n'
-        '[SNAP_CURRENT]\\n%s\\n\\n[JOURNAL_CONTEXT]\\n%s\\n=== END FRAME ===\\n\' '
-        '"$ts" "$trigger" "$snap_state" "$snapd_state" "$dsc_state" "$hold_state" '
-        '"$portal_state" "$snap_current" "$journal_ctx")',
+        "",
+        "                frame=$(",
+        '                    echo "=== SEREIN SNAP FAILURE FRAME ==="',
+        '                    echo "timestamp=$ts"',
+        '                    echo "trigger=$trigger"',
+        '                    echo "hold_start_ts=$hold_start_ts"',
+        '                    echo "hold_finish_ts=$hold_finish_ts"',
+        '                    echo "portal_failure_ts=$portal_failure_ts"',
+        '                    echo "dsc_failure_ts=$dsc_failure_ts"',
+        '                    echo "snapd_failure_ts=$snapd_failure_ts"',
+        '                    echo ""',
+        '                    echo "[SNAP_STATE]"; echo "$snap_state"',
+        '                    echo ""',
+        '                    echo "[FAILED_CHANGE_TASKS]"; echo "$failed_change_tasks"',
+        '                    echo "[SNAPD]"; echo "$snapd_state"',
+        '                    echo ""',
+        '                    echo "[SNAPD_SERVICE_PROPERTIES]"; echo "$snapd_props"',
+        '                    echo ""',
+        '                    echo "[SNAPD_SERVICE_JOURNAL]"; echo "$snapd_journal"',
+        '                    echo ""',
+        '                    echo "[SNAPD_LAST_PROGRESS]"; echo "$last_progress"',
+        '                    echo ""',
+        '                    echo "[SNAPD_PROCESS_SNAPSHOT]"; echo "$snapd_proc"',
+        '                    echo ""',
+        '                    echo "[DESKTOP_SECURITY_CENTER]"; echo "$dsc_state"',
+        '                    echo ""',
+        '                    echo "[SNAPD_HOLD]"; echo "$hold_state"',
+        '                    echo ""',
+        '                    echo "[PORTAL_STATE]"; echo "$portal_state"',
+        '                    echo ""',
+        '                    echo "[SNAP_CURRENT]"; echo "$snap_current"',
+        '                    echo ""',
+        '                    echo "[JOURNAL_CONTEXT]"; echo "$journal_ctx"',
+        '                    echo "=== END FRAME ==="',
+        "                )",
         '                frame=$(printf "%s" "$frame" | head -c "$MAX_BYTES_PER_SNAP_FRAME")',
         '                flen=${#frame}',
         "                remaining=$((MAX_TOTAL_EVIDENCE_BYTES - total_bytes))",
@@ -348,20 +561,6 @@ def _qa_evidence_watcher_script() -> str:
         "",
     ]
     return "\n".join(lines)
-
-
-def _qa_evidence_early_command() -> str:
-    """One ``early-commands`` shell one-liner that base64-decodes and
-    launches :func:`_qa_evidence_watcher_script` detached in the
-    background (Section 27 escaping discipline, matching
-    ``_install_state_late_command``'s own base64 round-trip). Returns
-    almost instantly - ``early-commands`` entries run synchronously and
-    must never block on the watcher's own ~6600s bounded lifetime; the
-    inner ``&`` backgrounds the decode-and-run pipeline before the
-    outer ``sh -c`` returns. ``|| true`` ensures a QA-only diagnostic
-    convenience can never itself fail the real install."""
-    encoded = base64.b64encode(_qa_evidence_watcher_script().encode("utf-8")).decode("ascii")
-    return f"sh -c 'echo {encoded} | base64 -d | sh >/dev/null 2>&1 &' || true"
 
 
 def render_autoinstall_yaml(
@@ -401,7 +600,18 @@ def render_autoinstall_yaml(
             },
             "ssh": {"install-server": False, "allow-pw": False},
             "storage": storage,
-            "early-commands": [_qa_evidence_early_command()],
+            # S7.1R16 Objective A: the QA guest-evidence watcher is no
+            # longer launched via early-commands - real Run #15/#16
+            # evidence proved Subiquity does not even reach
+            # early-commands until WELL after the snap/bootstrap
+            # pathology has already recovered (Run #16's own autoinstall
+            # extraction/load only occurred at ~4259s/~4266s, after the
+            # ~446s-4193s pathology window), making early-commands-based
+            # evidence collection retrospective rather than real-time.
+            # The watcher is now started independently of Subiquity
+            # entirely - see serein.installer.isoprep's own
+            # `systemd.run=` kernel-token wiring, which starts it during
+            # live-session boot itself.
             "late-commands": [_install_state_late_command(install_state)],
         }
     }

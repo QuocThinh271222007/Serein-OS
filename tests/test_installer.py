@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -67,10 +68,12 @@ from serein.installer.identity import (
     resolve_target,
 )
 from serein.installer.isoprep import (
+    QA_EVIDENCE_WATCHER_ISO_FILENAME,
     AutoinstallBootError,
     IsoPrepError,
     _enable_autoinstall_on_qa_entry,
     _enable_journald_console_forwarding_on_qa_entry,
+    _enable_qa_evidence_watcher_on_qa_entry,
     _enable_systemd_debug_logging_on_qa_entry,
     _mask_firmware_notifier_on_qa_entry,
     prepare_qa_install_iso,
@@ -92,12 +95,14 @@ from serein.installer.renderer import (
     QA_EVIDENCE_MAX_BYTES_PER_CRASH,
     QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME,
     QA_EVIDENCE_MAX_CRASH_FILES,
+    QA_EVIDENCE_MAX_FAILED_CHANGE_IDS,
     QA_EVIDENCE_MAX_SNAP_FRAMES,
     QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES,
     QA_EVIDENCE_PORT_PATH,
     QA_EVIDENCE_WATCHER_MAX_ITERATIONS,
     QA_EVIDENCE_WATCHER_SLEEP_SECONDS,
     RendererError,
+    build_qa_evidence_watcher_script,
     render_autoinstall_storage_config,
     render_autoinstall_yaml,
 )
@@ -737,72 +742,62 @@ class TestRenderer:
 
 
 # ---------------------------------------------------------------------------
-# S7.1R14 Objective A - guest-side bounded crash-evidence watcher
-# (serein.installer.renderer._qa_evidence_watcher_script /
-# _qa_evidence_early_command)
+# S7.1R14/R15/R16 - guest-side bounded evidence watcher
+# (serein.installer.renderer.build_qa_evidence_watcher_script)
 # ---------------------------------------------------------------------------
 
 
 class TestQaEvidenceGuestProducer:
-    def _rendered_doc(self):
+    """S7.1R16 Objective A: the watcher script is no longer embedded in
+    autoinstall.yaml's early-commands - it is now written directly by
+    :func:`build_qa_evidence_watcher_script` and embedded onto the ISO
+    itself (see TestIsoPrepQaEvidenceWatcher for the isoprep.py-level
+    wiring). These tests exercise the script's own content directly."""
+
+    def _script(self) -> str:
+        return build_qa_evidence_watcher_script()
+
+    def test_render_autoinstall_yaml_no_longer_carries_early_commands(self):
+        # S7.1R16 Objective A: real Run #15/#16 evidence proved
+        # Subiquity does not reach early-commands until well after the
+        # snap pathology has already recovered - the watcher is no
+        # longer launched this way at all.
         plan, cred, marker = _valid_plan_and_credential()
         rendered = render_autoinstall_yaml(plan, cred, marker, qa_mode=True)
-        return json.loads(rendered)
-
-    def _decoded_watcher_script(self, doc) -> str:
-        early_command = doc["autoinstall"]["early-commands"][0]
-        encoded = early_command.split("echo ")[1].split(" | base64")[0]
-        return base64.b64decode(encoded).decode("utf-8")
-
-    def test_early_commands_present_with_one_bounded_entry(self):
-        doc = self._rendered_doc()
-        early_commands = doc["autoinstall"]["early-commands"]
-        assert isinstance(early_commands, list)
-        assert len(early_commands) == 1
-
-    def test_early_command_backgrounds_and_never_blocks(self):
-        # Non-blocking (Section 4/11): the decode-and-run pipeline is
-        # itself backgrounded with `&` inside the outer `sh -c`, so
-        # early-commands returns almost instantly rather than waiting
-        # on the watcher's own ~6600s bounded lifetime.
-        doc = self._rendered_doc()
-        early_command = doc["autoinstall"]["early-commands"][0]
-        assert "base64 -d | sh" in early_command
-        assert "&" in early_command
-        assert early_command.rstrip().endswith("|| true")
+        doc = json.loads(rendered)
+        assert "early-commands" not in doc["autoinstall"]
 
     def test_watcher_script_watches_only_block_probe_fail_crash_files(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert "/var/crash/*block_probe_fail*.crash" in script
 
     def test_watcher_script_writes_only_to_named_evidence_port(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert f'PORT="{QA_EVIDENCE_PORT_PATH}"' in script
         # every redirection into a real sink targets $PORT (or
         # /dev/null for discarded stdout/stderr) - never any other
-        # file path.
+        # file path. Filters out awk's own `>`/`>=` COMPARISON
+        # operators (e.g. `NR>1`), which this same regex cannot tell
+        # apart from a shell redirect by punctuation alone - a real
+        # redirect target here is never a bare integer.
         redirect_targets = re.findall(r">>?\s*\"?([^\s\"]+)\"?", script)
+        redirect_targets = [t for t in redirect_targets if not t.isdigit()]
         assert redirect_targets
         assert all(t in ("$PORT",) or t.startswith("/dev/null") for t in redirect_targets)
 
     def test_watcher_script_never_executes_host_commands_or_network(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         forbidden = ("curl", "wget", "nc ", "ssh ", "scp ", "ftp ", "python", "eval ")
         for token in forbidden:
             assert token not in script, f"forbidden token {token!r} found in watcher script"
 
     def test_watcher_script_never_references_arbitrary_host_paths(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         for forbidden_path in ("/home", "/etc", "/root", "/dev/sda", "/dev/vda", "/dev/vdb"):
             assert forbidden_path not in script
 
     def test_watcher_bounded_finite_loop_never_while_true(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert "while true" not in script
         assert 'while [ "$i" -lt "$MAX_ITERATIONS" ]' in script
         assert f"MAX_ITERATIONS={QA_EVIDENCE_WATCHER_MAX_ITERATIONS}" in script
@@ -817,48 +812,59 @@ class TestQaEvidenceGuestProducer:
         assert total_seconds == 6600
 
     def test_watcher_enforces_crash_file_and_byte_caps(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert f"MAX_CRASH_FILES={QA_EVIDENCE_MAX_CRASH_FILES}" in script
         assert f"MAX_BYTES_PER_CRASH={QA_EVIDENCE_MAX_BYTES_PER_CRASH}" in script
         assert f"MAX_TOTAL_EVIDENCE_BYTES={QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES}" in script
 
     def test_watcher_dedups_within_one_run(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert 'case " $seen " in' in script
         assert 'seen="$seen $f"' in script
 
     def test_watcher_records_truncation_explicitly(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert 'trunc="false"' in script
         assert 'trunc="true"' in script
         assert "truncated=$trunc" in script
 
     def test_watcher_script_is_posix_sh_not_bash(self):
         # The live ISO's default shell is dash - no bashisms (arrays,
-        # [[, local without a POSIX-safe form) may be relied upon.
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        # the `[[` conditional keyword, `local`) may be relied upon.
+        # Real POSIX bracket-expression character classes
+        # (`[[:space:]]` etc., used inside sed/grep/awk regexes below,
+        # sometimes preceded by an escaped literal `\[` producing a
+        # run of two or three literal `[` characters) are a completely
+        # different, fully POSIX construct - bash's own `[[` keyword is
+        # always written as a standalone token with a space on both
+        # sides (` [[ ... ]] `), which this check looks for instead of
+        # a bare substring match.
+        script = self._script()
         assert script.startswith("#!/bin/sh")
-        assert "[[" not in script
+        assert not re.search(r"(?:^|\s)\[\[\s", script)
 
-    def test_watcher_script_bash_syntax_check(self):
+    def test_watcher_script_bash_syntax_check(self, tmp_path):
         if shutil.which("bash") is None:
             pytest.skip("bash not available in this environment")
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        # Written to a real file rather than passed via `bash -c` - a
+        # long argv string containing many literal backslashes (regex
+        # escapes) is subject to Windows' own argv-quoting rules when
+        # relayed through Python's subprocess on this platform, which
+        # can mangle it before bash ever sees it; every other script
+        # in this suite is already syntax-checked this same way
+        # (see TestInstallerScriptsStatic.test_bash_syntax_check).
+        script_path = tmp_path / "watcher.sh"
+        script_path.write_text(self._script(), encoding="utf-8")
         result = subprocess.run(
-            ["bash", "-n", "-c", script], capture_output=True, text=True
+            ["bash", "-n", str(script_path)], capture_output=True, text=True
         )
         assert result.returncode == 0, result.stderr
 
     # -- S7.1R15 Objective B - the snap/bootstrap-pathology watcher --
 
-    def test_watcher_checks_all_five_known_snap_pathology_signals(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+    def test_watcher_checks_all_six_known_snap_pathology_signals(self):
+        script = self._script()
+        assert "snapd.service" in script
         assert "desktop-security-center" in script
         assert "sanity timeout" in script
         assert "RemoveSnapServices" in script
@@ -866,19 +872,21 @@ class TestQaEvidenceGuestProducer:
         assert "snapd.seeded" in script
 
     def test_watcher_snap_frame_uses_the_specified_section_headers(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         for header in (
             "=== SEREIN SNAP FAILURE FRAME ===",
             "[SNAP_STATE]", "[SNAPD]", "[DESKTOP_SECURITY_CENTER]",
             "[SNAPD_HOLD]", "[PORTAL_STATE]", "[SNAP_CURRENT]",
-            "[JOURNAL_CONTEXT]", "=== END FRAME ===",
+            "[JOURNAL_CONTEXT]",
+            "[FAILED_CHANGE_TASKS]", "[SNAPD_SERVICE_PROPERTIES]",
+            "[SNAPD_SERVICE_JOURNAL]", "[SNAPD_LAST_PROGRESS]",
+            "[SNAPD_PROCESS_SNAPSHOT]",
+            "=== END FRAME ===",
         ):
             assert header in script
 
     def test_watcher_snap_frame_bounded_and_deduplicated(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert f"MAX_SNAP_FRAMES={QA_EVIDENCE_MAX_SNAP_FRAMES}" in script
         assert f"MAX_BYTES_PER_SNAP_FRAME={QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME}" in script
         assert 'snap_frame_count=$((snap_frame_count + 1))' in script
@@ -891,8 +899,7 @@ class TestQaEvidenceGuestProducer:
         # Section 12/14: portal/snapd.hold state genuinely unavailable
         # (e.g. no user session, no DBus) must read as NOT_OBSERVED,
         # never fabricated or left blank.
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert 'hold_state="NOT_OBSERVED"' in script
         assert 'portal_state="NOT_OBSERVED"' in script
         assert 'snap_state="NOT_OBSERVED"' in script
@@ -900,21 +907,21 @@ class TestQaEvidenceGuestProducer:
         assert 'journal_ctx="NOT_OBSERVED"' in script
 
     def test_watcher_snap_current_missing_reads_as_missing_never_fabricated(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert 'snap_current="MISSING"' in script
 
     def test_watcher_never_intentionally_triggers_any_pathology(self):
-        # Section 6: observation only - the watcher must never contain
-        # any command capable of STARTING, STOPPING, or otherwise
-        # mutating a snap/systemd unit (only read-only inspection
-        # verbs).
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        # Section 6/12: observation only - the watcher must never
+        # contain any command capable of STARTING, STOPPING, or
+        # otherwise mutating a snap/systemd unit (only read-only
+        # inspection verbs) - never restarts snapd, retries/
+        # acknowledges a Change, or mutates snap state.
+        script = self._script()
         forbidden = (
             "systemctl start", "systemctl stop", "systemctl restart",
             "systemctl mask", "systemctl kill", "snap install",
             "snap remove", "snap refresh", "snap abort", "snap disable",
+            "snap ack",
         )
         for token in forbidden:
             assert token not in script, f"forbidden mutating command {token!r} found"
@@ -924,8 +931,7 @@ class TestQaEvidenceGuestProducer:
         # ever run inside the SAME `[ -e "$PORT" ] && [ -w "$PORT" ]`
         # guard the crash-file watcher already uses - never run
         # unconditionally regardless of whether the sink exists.
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         guard_idx = script.index('if [ -e "$PORT" ] && [ -w "$PORT" ]; then')
         journal_idx = script.index("recent_journal=$(journalctl")
         end_idx = script.rindex("    fi\n    i=$((i + 1))")
@@ -937,17 +943,102 @@ class TestQaEvidenceGuestProducer:
         # journalctl/snap/systemctl probe must never abort the whole
         # watcher (each call already has its own `2>/dev/null` +
         # fallback default, but this is the structural backstop).
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         assert script.splitlines()[1] == "set -u"
         assert "set -e" not in script
 
     def test_watcher_snap_frame_never_uses_network_or_host_commands(self):
-        doc = self._rendered_doc()
-        script = self._decoded_watcher_script(doc)
+        script = self._script()
         forbidden = ("curl", "wget", "nc ", "ssh ", "scp ", "ftp ", "python", "eval ")
         for token in forbidden:
             assert token not in script
+
+    # -- S7.1R16 Objective A/8 - the boot marker --
+
+    def test_watcher_emits_boot_marker_before_the_main_loop(self):
+        script = self._script()
+        marker_idx = script.index("SEREIN_EVIDENCE_WATCHER_STARTED")
+        loop_idx = script.index('while [ "$i" -lt "$MAX_ITERATIONS" ]; do')
+        assert marker_idx < loop_idx
+        assert "watcher_start_monotonic_ts=$boot_ts" in script
+
+    def test_watcher_boot_marker_written_only_once(self):
+        script = self._script()
+        assert script.count("SEREIN_EVIDENCE_WATCHER_STARTED") == 1
+
+    # -- S7.1R16 Objective B - dynamic failed-Change task-graph capture --
+
+    def test_watcher_discovers_failed_changes_dynamically_never_hardcoded_to_one(self):
+        script = self._script()
+        assert "snap changes" in script
+        assert "snap tasks" in script
+        # dynamic discovery via the Status column - never a literal
+        # Change ID.
+        assert '$2 ~ /^[Ee]rror/' in script
+        assert 'awk \'NR>1 && $2 ~ /^[Ee]rror/ {print $1}\'' in script
+        assert f"MAX_FAILED_CHANGE_IDS={QA_EVIDENCE_MAX_FAILED_CHANGE_IDS}" in script
+
+    def test_watcher_bounds_failed_change_ids(self):
+        script = self._script()
+        assert '[ "$fc_count" -ge "$MAX_FAILED_CHANGE_IDS" ] && break' in script
+
+    # -- S7.1R16 Objective C - snapd.service state/journal capture --
+
+    def test_watcher_captures_narrow_snapd_service_properties(self):
+        script = self._script()
+        assert "systemctl show snapd.service" in script
+        for prop in (
+            "ActiveState", "SubState", "Result", "NRestarts", "ExecMainPID",
+            "ExecMainCode", "ExecMainStatus", "TimeoutStartUSec",
+        ):
+            assert prop in script
+
+    def test_watcher_captures_bounded_snapd_service_journal(self):
+        script = self._script()
+        assert "journalctl -u snapd.service" in script
+
+    # -- S7.1R16 Objective D - last progress before timeout --
+
+    def test_watcher_last_progress_helper_never_guesses_a_deadlock(self):
+        script = self._script()
+        assert "_last_snapd_progress" in script
+        assert "last_snapd_message_before_timeout=" in script
+        assert "last_snapd_message_timestamp=" in script
+        assert "time_from_last_snapd_message_to_timeout=" in script
+
+    # -- S7.1R16 Objective E - process snapshot --
+
+    def test_watcher_process_snapshot_is_read_only(self):
+        script = self._script()
+        assert "ps -o pid,stat,etime,time -C snapd" in script
+        # Real, executable code lines only - a comment documenting
+        # what this objective deliberately does NOT do (see the
+        # function's own docstring/inline comments) legitimately
+        # mentions these words in prose without invoking them.
+        code_lines = [
+            line for line in script.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        code_text = "\n".join(code_lines)
+        for forbidden in ("ptrace", "gdb", "strace", "kill -"):
+            assert forbidden not in code_text
+
+    # -- S7.1R16 Objectives F/G - ordering timestamps --
+
+    def test_watcher_captures_ordering_timestamps_via_order_independent_and_chain(self):
+        script = self._script()
+        assert "_ts_for_all" in script
+        for field in (
+            "hold_start_ts=", "hold_finish_ts=", "portal_failure_ts=",
+            "dsc_failure_ts=", "snapd_failure_ts=",
+        ):
+            assert field in script
+
+    def test_watcher_snapd_failure_pattern_matches_both_real_upstream_phrasings(self):
+        # The real Run #16 message is "start operation timed out" -
+        # never just "timeout" as one word.
+        script = self._script()
+        assert "timeout|timed out" in script
 
 
 # ---------------------------------------------------------------------------
@@ -4495,6 +4586,68 @@ class TestExtractStorageProbeForensicsScript:
         outputs = self._outputs(tmp_path, log)
         assert outputs["block_probe_crash_report_count"] == "2"
 
+    # -- S7.1R16 Objective I: real Run #16 evidence exposed a case-
+    # sensitivity defect - the real upstream finish line capitalizes
+    # SUCCESS ("finish: ...SUCCESS: restricted=False"), but the state
+    # machine only ever matched lowercase "success", so the finish line
+    # was miscounted as a SECOND start instead of closing the first
+    # attempt as a success. --
+
+    def test_unrestricted_start_then_uppercase_success_is_associated(self, tmp_path):
+        # The exact real Run #16 reproduction (RUN_ID=34768219149):
+        # start ~4497.249s, finish ~4522.488660s.
+        log = (
+            "[ 4497.249000] Filesystem/_probe/probe_once restricted=False\n"
+            "[ 4522.488660] finish: subiquity/Filesystem/_probe/probe_once: "
+            "SUCCESS: restricted=False\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_start_count"] == "1"
+        assert outputs["filesystem_probe_unrestricted_success_count"] == "1"
+        assert outputs["filesystem_probe_unrestricted_failure_count"] == "0"
+
+    def test_unrestricted_start_then_uppercase_fail(self, tmp_path):
+        log = (
+            "[  100.000000] Filesystem/_probe/probe_once restricted=False\n"
+            "[  120.000000] finish: subiquity/Filesystem/_probe/probe_once: "
+            "FAIL: restricted=False\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_start_count"] == "1"
+        assert outputs["filesystem_probe_unrestricted_failure_count"] == "1"
+
+    def test_restricted_start_then_uppercase_success(self, tmp_path):
+        log = (
+            "[  100.000000] Filesystem/_probe/probe_once restricted=True\n"
+            "[  120.000000] finish: subiquity/Filesystem/_probe/probe_once: "
+            "SUCCESS: restricted=True\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_restricted_start_count"] == "1"
+        assert outputs["filesystem_probe_restricted_success_count"] == "1"
+
+    def test_restricted_start_then_uppercase_fail(self, tmp_path):
+        log = (
+            "[  100.000000] Filesystem/_probe/probe_once restricted=True\n"
+            "[  120.000000] finish: subiquity/Filesystem/_probe/probe_once: "
+            "FAIL: restricted=True\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_restricted_start_count"] == "1"
+        assert outputs["filesystem_probe_restricted_failure_count"] == "1"
+
+    def test_orphan_success_with_no_open_attempt_never_fabricates_a_start(self, tmp_path):
+        # A self-contained success line (carries its own restricted=
+        # token) with no preceding start is still counted directly -
+        # never fabricates a phantom start to pair it with.
+        log = (
+            "[  100.000000] finish: subiquity/Filesystem/_probe/probe_once: "
+            "SUCCESS: restricted=False\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_start_count"] == "0"
+        assert outputs["filesystem_probe_unrestricted_success_count"] == "1"
+
     def test_bounded_execution_against_large_log(self, tmp_path):
         # Structural proof of Section 11's BOUNDED/FINITE/LOW_OVERHEAD
         # requirements and this round's own real, measured performance
@@ -4725,7 +4878,7 @@ class TestExtractGuestEvidenceScript:
         outputs, crash_dir = self._outputs(tmp_path, log)
         assert outputs["guest_evidence_snap_frame_count"] == "8"
         assert outputs["guest_evidence_snap_frame_truncated"] == "true"
-        assert len(list(crash_dir.glob("qa-install-snap-failure-frame-*.txt"))) == 5
+        assert len(list(crash_dir.glob("qa-install-snap-failure-frame-*.txt"))) == 6
 
     def test_malformed_snap_frame_missing_end_marker_is_a_parse_error(self, tmp_path):
         log = "=== SEREIN SNAP FAILURE FRAME ===\ntrigger=sanity_timeout\n"
@@ -4949,12 +5102,27 @@ class TestIsoPrep:
         assert (
             "systemd.mask=snap.firmware-updater.firmware-notifier.service" in qa_entry_body
         )
+        # -- S7.1R16 Objective A: the early-watcher kernel token chained
+        # on top too, and the watcher script itself embedded as a real,
+        # executable file at the extracted tree root (the SAME
+        # placement autoinstall.yaml already uses - never the
+        # squashfs). --
+        assert f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}" in qa_entry_body
+        watcher_path = extracted / QA_EVIDENCE_WATCHER_ISO_FILENAME
+        assert watcher_path.is_file()
+        assert watcher_path.read_text(encoding="utf-8").startswith("#!/bin/sh")
+        if os.name == "posix":
+            # Windows has no real POSIX executable bit to observe here
+            # (chmod is a near-no-op on NTFS) - this assertion is only
+            # meaningful on a real POSIX filesystem.
+            assert stat.S_IMODE(watcher_path.stat().st_mode) & stat.S_IXUSR
         # The unrelated second entry must never be touched.
         other_entry_body = final_grub.split('menuentry "Try or Install Ubuntu"')[1]
         assert "autoinstall" not in other_entry_body
         assert "systemd.log_level" not in other_entry_body
         assert "systemd.journald.forward_to_console" not in other_entry_body
         assert "systemd.mask" not in other_entry_body
+        assert "systemd.run" not in other_entry_body
 
     def test_missing_source_iso_fails_closed(self, tmp_path):
         with pytest.raises(IsoPrepError):
@@ -5099,6 +5267,66 @@ class TestEnableAutoinstallOnQaEntry:
         )
         qa_entry_text = derive_qa_menuentry(base_cfg)
         assert "autoinstall" not in qa_entry_text
+
+
+class TestEnableQaEvidenceWatcherOnQaEntry:
+    """S7.1R16 Objective A: real regression coverage for the early
+    guest-evidence watcher kernel token - the mechanism that starts the
+    watcher during live-session boot itself, independently of
+    Subiquity early-commands."""
+
+    def test_single_word_token_no_embedded_spaces(self):
+        # Deliberately a single, space-free kernel parameter (never
+        # `systemd.run=/bin/sh /cdrom/...`) - kernel/GRUB command-line
+        # quoting for an embedded-space value is a real, untested
+        # fragility in this environment; every other token this
+        # project adds is already a single bare word.
+        patched = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        token = f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}"
+        assert re.search(rf"(?<!\S){re.escape(token)}(?!\S)", linux_line)
+
+    def test_inserted_before_init_arg_separator_never_after(self):
+        patched = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        before_sep, _, after_sep = linux_line.partition("---")
+        assert "systemd.run=" in before_sep
+        assert "systemd.run=" not in after_sep
+
+    def test_idempotent_no_duplicate_on_second_call(self):
+        once = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        twice = _enable_qa_evidence_watcher_on_qa_entry(once)
+        assert once == twice
+        qa_body = twice.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert qa_body.count("systemd.run=") == 1
+
+    def test_unrelated_production_entry_never_touched(self):
+        patched = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        other_body = patched.split('menuentry "Try or Install Ubuntu"')[1]
+        assert "systemd.run=" not in other_body
+
+    def test_missing_entry_title_fails_closed(self):
+        with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
+            _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG, entry_title="Does Not Exist")
+
+    def test_chained_together_with_every_other_qa_only_token(self):
+        # Mirrors the real order prepare_qa_install_iso chains these in.
+        patched = _enable_autoinstall_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        patched = _enable_journald_console_forwarding_on_qa_entry(patched)
+        patched = _enable_systemd_debug_logging_on_qa_entry(patched)
+        patched = _mask_firmware_notifier_on_qa_entry(patched)
+        patched = _enable_qa_evidence_watcher_on_qa_entry(patched)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        for token in (
+            "autoinstall",
+            "systemd.journald.forward_to_console=1",
+            "systemd.log_level=debug",
+            "systemd.mask=snap.firmware-updater.firmware-notifier.service",
+            f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}",
+        ):
+            assert token in qa_body
 
 
 class TestJournaldConsoleForwardingOnQaEntry:

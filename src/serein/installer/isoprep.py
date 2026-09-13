@@ -59,6 +59,18 @@ from serein.distribution.iso import (
 from serein.distribution.models import VOLUME_ID
 from serein.distribution.pathsafety import PathSafetyError, resolve_within
 from serein.distribution.qa_boot import QA_ENTRY_TITLE, QaBootError, discover_grub_config
+from serein.installer.renderer import build_qa_evidence_watcher_script
+
+# S7.1R16 Objective A: the QA-only guest evidence watcher is embedded as
+# a real file at the ISO's own root (the SAME mechanism
+# ``autoinstall.yaml`` already uses - never the squashfs, which this
+# project has no tooling to modify, per docs/installer/
+# known-limitations.md's own S7.1R12 architectural note), and started
+# via a ``systemd.run=`` kernel command-line token on the QA entry only
+# - never Subiquity early-commands, which real Run #15/#16 evidence
+# proved starts only after the snap/bootstrap pathology has already
+# recovered.
+QA_EVIDENCE_WATCHER_ISO_FILENAME = "serein-qa-early-watcher.sh"
 
 
 class IsoPrepError(RuntimeError):
@@ -268,6 +280,48 @@ def _mask_firmware_notifier_on_qa_entry(
     )
 
 
+def _enable_qa_evidence_watcher_on_qa_entry(
+    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
+) -> str:
+    """S7.1R16 Objective A: add
+    ``systemd.run=/cdrom/serein-qa-early-watcher.sh`` to the named
+    menuentry.
+
+    ``systemd.run=`` is a real, documented systemd kernel command-line
+    option (``systemd-run-generator(8)``) that executes the given
+    command as part of early boot, ordered well before user-session/
+    network/snapd targets - through the SAME already-proven, generalized
+    kernel-token mechanism as R3's ``autoinstall``/R5's
+    journald-forwarding/R7's debug-logging/R9's firmware-notifier-mask
+    tokens (:func:`_add_kernel_token_to_qa_entry`). Deliberately kept to
+    a single, space-free word (never
+    ``systemd.run=/bin/sh /cdrom/...``) - kernel/GRUB command-line
+    quoting for a value containing embedded spaces is a real, known
+    fragility this project has no way to test in this environment;
+    single-word kernel parameters are the one form every other token
+    here already uses safely. The watcher file itself carries its own
+    ``#!/bin/sh`` shebang and is written executable
+    (:func:`prepare_qa_install_iso`), relying on the SAME Rock Ridge
+    (``-r``) permission preservation ``build_rebuild_command`` already
+    uses for every other extracted-tree file.
+
+    **Caveat honestly carried forward** (matches this project's own
+    established caveat discipline - see this module's own docstring):
+    whether the real Ubuntu live environment's systemd actually
+    supports ``systemd.run=`` at a point early enough to precede the
+    first snapd failure is NOT validated in this development
+    environment (no real QEMU/live-ISO boot here). The watcher's own
+    ``SEREIN_EVIDENCE_WATCHER_STARTED`` boot marker (with a monotonic
+    timestamp) is the mechanism by which a real run proves or disproves
+    this - never assumed true merely because this token is present.
+    """
+    return _add_kernel_token_to_qa_entry(
+        grub_cfg_text,
+        f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}",
+        entry_title,
+    )
+
+
 def prepare_qa_install_iso(
     qa_iso_path: Path,
     work_dir: Path,
@@ -329,6 +383,10 @@ def prepare_qa_install_iso(
         # S7.1R9 Objective A: chained onto the same already-patched
         # text, same discipline as the two lines above.
         patched_grub_text = _mask_firmware_notifier_on_qa_entry(patched_grub_text)
+        # S7.1R16 Objective A: chained onto the same already-patched
+        # text, same discipline as every token above - this one starts
+        # the QA guest-evidence watcher independently of Subiquity.
+        patched_grub_text = _enable_qa_evidence_watcher_on_qa_entry(patched_grub_text)
     except AutoinstallBootError as exc:
         raise IsoPrepError(f"cannot enable autoinstall boot: {exc}") from exc
     with _temporarily_owner_writable(grub_path):
@@ -336,6 +394,19 @@ def prepare_qa_install_iso(
 
     autoinstall_path = extracted_dir / "autoinstall.yaml"
     autoinstall_path.write_text(autoinstall_yaml_text, encoding="utf-8")
+
+    # S7.1R16 Objective A: the watcher script lives at the extracted
+    # tree ROOT - the exact same "outer ISO filesystem, never the
+    # squashfs" placement `autoinstall.yaml` already uses, reachable at
+    # boot via casper's own early `/cdrom` mount (the same mount point
+    # Subiquity itself reads `/cdrom/autoinstall.yaml` from). Written
+    # executable so the single-word `systemd.run=/cdrom/<name>` kernel
+    # token above can invoke it directly - `build_rebuild_command`'s own
+    # `-r` (Rock Ridge) flag preserves this permission bit into the
+    # rebuilt ISO, the same way it already preserves grub.cfg's.
+    watcher_path = extracted_dir / QA_EVIDENCE_WATCHER_ISO_FILENAME
+    watcher_path.write_text(build_qa_evidence_watcher_script(), encoding="utf-8")
+    watcher_path.chmod(0o755)
 
     output_iso.parent.mkdir(parents=True, exist_ok=True)
     rebuild_cmd = build_rebuild_command(extracted_dir, boot_flags, output_iso, VOLUME_ID)

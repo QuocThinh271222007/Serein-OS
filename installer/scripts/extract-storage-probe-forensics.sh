@@ -217,11 +217,16 @@ _first_valid_timestamp_matching_all() {
 _storage_probe_state_machine() {
     local probe_pat="$1" unrestricted_tok="$2" restricted_tok="$3"
     local success_pat="$4" failure_pat="$5"
+    # S7.1R16 Objective I: every pattern is lowercased HERE, once, to
+    # match the `tolower(line)` comparison inside the awk state
+    # machine below - never relying on an enumerated case-alternation
+    # (e.g. `(fail|FAIL)`) again, the same real defect class this
+    # objective fixed.
     grep -Ei -- "${probe_pat}" "${SERIAL_LOG}" 2>/dev/null | awk \
-        -v unrestricted="${unrestricted_tok}" \
-        -v restricted="${restricted_tok}" \
-        -v success_pat="${success_pat}" \
-        -v failure_pat="${failure_pat}" '
+        -v unrestricted="$(printf '%s' "${unrestricted_tok}" | tr '[:upper:]' '[:lower:]')" \
+        -v restricted="$(printf '%s' "${restricted_tok}" | tr '[:upper:]' '[:lower:]')" \
+        -v success_pat="$(printf '%s' "${success_pat}" | tr '[:upper:]' '[:lower:]')" \
+        -v failure_pat="$(printf '%s' "${failure_pat}" | tr '[:upper:]' '[:lower:]')" '
         BEGIN {
             n_open = 0
             start_u = 0; success_u = 0; failure_u = 0
@@ -252,10 +257,27 @@ _storage_probe_state_machine() {
             if (key == last_key) next
             last_key = key
 
-            is_u = (line ~ unrestricted)
-            is_r = (line ~ restricted)
-            is_fail = (line ~ failure_pat)
-            is_success = (line ~ success_pat)
+            # S7.1R16 Objective I: real Run #16 evidence proved a case-
+            # sensitivity defect here - awk`~` is case-SENSITIVE, but
+            # the real upstream "finish: ...SUCCESS: restricted=False"
+            # form capitalizes SUCCESS while this script only ever
+            # matched lowercase "success" (relying on the outer grep
+            # -Ei case-insensitivity, which only filters for
+            # probe_pat, never for these four per-line checks). A real
+            # unrestricted "start" line followed by that finish line
+            # was silently MISCOUNTED as a SECOND start (is_success
+            # false -> falls through to the start-event branch below)
+            # rather than closing the first attempt as a success.
+            # Fixed by matching case-insensitively via `tolower()` on
+            # both sides, never by enumerating every real case variant
+            # (the same established, proven-necessary discipline as
+            # the R9 milestone parser fix, applied here for the first
+            # time to this state machine).
+            line_lc = tolower(line)
+            is_u = (line_lc ~ unrestricted)
+            is_r = (line_lc ~ restricted)
+            is_fail = (line_lc ~ failure_pat)
+            is_success = (line_lc ~ success_pat)
 
             if (is_fail || is_success) {
                 if (is_u || is_r) {
