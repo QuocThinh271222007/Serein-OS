@@ -759,6 +759,24 @@ jobs:
             dist/installer-fixtures/qa-install-serial.log \
             dist/installer-fixtures/qa-install-snap-change-forensics.env
 
+      # S7.1R13 Objectives A-F: real Run #13 (RUN_ID=34706519567)
+      # entered Subiquity/autoinstall but never reached real Curtin
+      # storage partitioning - filesystem probes were still being
+      # attempted (unrestricted->restricted->unrestricted cycling)
+      # right up to the 6600s host timeout. This bounded, host-side,
+      # read-only pass extracts Subiquity/probert/os-prober storage-
+      # probe forensic evidence from the SAME already-captured serial
+      # log (see this script's own header for why this is raw-log
+      # extraction, never a live in-guest crash-report collector),
+      # never itself a gate, never blocking on any diagnostic
+      # command's own success.
+      - name: Extract storage-probe forensics from serial log
+        if: always()
+        run: |
+          ./installer/scripts/extract-storage-probe-forensics.sh \
+            dist/installer-fixtures/qa-install-serial.log \
+            dist/installer-fixtures/qa-install-storage-probe-forensics.env
+
       # S7.1 Section 47: remove the install ISO once the real install
       # has actually finished with it - never attached to any later
       # boot-check QEMU command anyway, but genuinely releasing the
@@ -1066,6 +1084,7 @@ jobs:
             dist/installer-fixtures/qa-install-subiquity-signals.log
             dist/installer-fixtures/qa-install-bootstrap-milestones.env
             dist/installer-fixtures/qa-install-snap-change-forensics.env
+            dist/installer-fixtures/qa-install-storage-probe-forensics.env
             dist/installer-fixtures/protected-disk-diagnostic.env
             dist/installer-fixtures/target-disk-diagnostic.env
             dist/.secondary_failures

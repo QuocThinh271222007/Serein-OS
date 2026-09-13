@@ -1,5 +1,188 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R13)
+
+**Thirteen real Installer Layer-B runs have occurred.** Run #13
+(RUN_ID=34706519567, ARTIFACT_ID=10303419050) did NOT reproduce the
+catastrophic snap lifecycle seen in Runs #7/#11/#12 -
+RUN13_CATASTROPHIC_SNAP_LIFECYCLE_RECURRED=PROVEN_FALSE (snapd.seeded
+completed a single, ~507s attempt: start ~449.643s, finish
+~956.490s). The blocker moved to a NEW area entirely:
+
+```text
+Run 13 (after S7.1R12):
+  RUN_ID=34706519567, RUN_NUMBER=13
+  HEAD=a0dba2caa47b4234b29e3131bd609b469a9c2dcf
+  RESULT=FAILURE - failure_stage=installer_timeout
+  (qemu_timeout_seconds=6600, qemu_accelerator=tcg).
+
+  Given evidence: Subiquity entered autoinstall (extract ~1180s, load
+  ~1251s, apply ~1303s, Install/install ~1304s) then began real
+  storage/filesystem probing - Filesystem/_probe/probe_once cycled
+  between restricted=False failures/cancellations and restricted=True
+  successes, then ANOTHER unrestricted probe occurred later. By
+  >6200s, filesystem probes were still being attempted when the 6600s
+  host timeout killed QEMU.
+  SUBIQUITY_STORAGE_PROBE_FAILURE=PROVEN,
+  FILESYSTEM_APPLY_AUTOINSTALL_COMPLETION=NOT_OBSERVED,
+  CURTIN_PARTITIONING_STARTED=NOT_OBSERVED. An early curtin apt-config
+  event must NEVER be read as proof partitioning started - real
+  partitioning was not observed.
+
+  Protected disk (/dev/vda, serial=SEREIN-PROTECTED-DISK) remained
+  unchanged at container/logical/ESP-sentinel/data-sentinel level -
+  PROTECTED_DISK_SAFETY=PROVEN_PASS. Target disk activity was
+  observed (container/logical hash changed) but old target sentinels
+  were STILL PRESENT afterward - OLD_TARGET_LAYOUT_REPLACED=PROVEN_FALSE,
+  TARGET_REPARTITIONING=NOT_OBSERVED (metadata-level probing/mount
+  activity, never confused with real partitioning proof).
+
+  **Root-cause investigation (Objectives A-D)**: this environment has
+  no raw Run #13 serial log, no live-guest access, and no
+  local-real-QEMU reproduction capability - the exact trigger cannot
+  be independently proven from Serein's own captured evidence this
+  round. Real, cited upstream documentation (canonical/subiquity,
+  bugs.launchpad.net/subiquity - LP #1868817, LP #2024011) was
+  consulted and materially informs classification without itself
+  being Serein-specific proof:
+    - the real log format is "... probe_once: FAIL: cancelled" and
+      "ERROR block-discover:NNN block probing failed restricted=False"
+      (note: "failed" appears BEFORE "restricted=False" in this real,
+      cited format - a genuine, order-dependent parser defect this
+      corrective found and fixed while building the new forensics
+      script - see below);
+    - `probe_once` carries a documented internal ~15s timeout on its
+      own full-probe task, and Subiquity's controller architecture is
+      DESIGNED to fall back from an unrestricted (full) probe to a
+      restricted probe on failure, then re-attempt unrestricted later
+      - the exact unrestricted->restricted->unrestricted cycle Run #13
+      observed matches this documented, intentional resilience
+      pattern, not inherently a hang by itself;
+    - Subiquity's own `match` autoinstall directive (serial/model/
+      vendor/path/id_path/devpath/ssd/size/install-media) and
+      probert's own public interface expose NO documented mechanism
+      to exclude a specific, visible block device from being probed -
+      probert probes every visible device by design; `match` only
+      affects which ALREADY-PROBED disk gets SELECTED afterward.
+      **SAFE_PROBE_MITIGATION_FOUND=false** follows directly.
+  Best-supported classification: **C. SUBIQUITY_FILESYSTEM_CONTROLLER_RETRY_LOOP**
+  (INFERRED, not PROVEN from Serein's own Run #13 evidence) - a
+  documented real Subiquity resilience pattern, plausibly compounded
+  by genuinely slow real subprocess I/O (blkid/parted/udevadm-class
+  tools) under TCG software emulation across two virtio-blk disks,
+  rather than a Serein-introduced defect.
+  DESKTOP_SECURITY_CENTER_HOOK_FAILURE etc. are irrelevant this round
+  (Objective H's own user-level firmware-notifier observation is
+  tracked separately below, confirmed NOT the primary blocker).
+
+  **Storage config audit (Objective C)**: direct code review of
+  `render_autoinstall_storage_config`
+  (`src/serein/installer/renderer.py`) re-confirms
+  TARGET_SELECTION_CORRECT=PROVEN - the disk `match` stanza uses
+  `serial` (SEREIN-TARGET-DISK) as its primary key, then `wwn`, then
+  `path` as the final anchor - never `/dev/vdb` ordinal selection,
+  never first/largest-disk, never implicit ordering. This selection
+  logic runs entirely independently of, and AFTER, Subiquity's own
+  pre-selection PROBE_VISIBILITY phase (which probes every visible
+  device regardless of which one will later be selected) - the two
+  concerns are structurally distinct, confirmed by direct reading,
+  not conflated.
+
+  **Target fixture audit (Objective E)**: `create-fixture-disks.sh`'s
+  target disk is deliberately pre-populated with a GPT, a FAT32 ESP
+  carrying an `EFI/Microsoft/Boot/sentinel.txt` path, and an ext4 data
+  partition labeled `OLD_DEBIAN_DATA` - this is an EXPLICIT, documented
+  part of the Section 32 test contract ("prove Serein intentionally
+  REPLACES a pre-existing layout only after explicit targeting"), not
+  stale/accidental metadata. This IS exactly the kind of content real
+  `os-prober` scans for (EFI Windows Boot Manager signatures) as part
+  of its normal, intended function - a real, but bounded and expected,
+  contributor to probe activity, never a defect requiring correction.
+  FIXTURE_CHANGE_REQUIRED=NOT_PROVEN; the fixture is unchanged this
+  round.
+
+  **Static review (Objective H)**: Run #13 confirmed the R9
+  system-level firmware-notifier mask
+  (`systemd.mask=snap.firmware-updater.firmware-notifier.service`)
+  remains effective (the 599-restart storm did not recur) but does
+  NOT prevent a separate USER-level systemd manager from also
+  attempting the same unit (~10 observed restart attempts before
+  StartLimit stopped it). SYSTEM_LEVEL_MASK=EFFECTIVE,
+  USER_LEVEL_UNIT_STILL_ACTIVE=PROVEN,
+  RUN9_599_RESTART_STORM_RECURRED=PROVEN_FALSE,
+  RUN13_PRIMARY_BLOCKER_FIRMWARE_NOTIFIER=NOT_OBSERVED (this is not
+  Run #13's blocker - no user-level mitigation implemented this
+  round, per this corrective's own explicit narrow-scope requirement;
+  left for a future round if it ever becomes the primary blocker).
+
+  S7.1R13 fixes (forensics-only - no speculative functional
+  mitigation implemented, per Outcome B of this corrective's own
+  acceptance standard):
+
+  1. New `installer/scripts/extract-storage-probe-forensics.sh` -
+     bounded, host-side, read-only extraction of Subiquity/probert/
+     os-prober storage-probe forensic evidence (unrestricted/
+     restricted probe start/success/failure counts, Filesystem-scoped
+     apply_autoinstall start/finish, curtin's real
+     `start:`/`finish:` `stage-partitioning` event convention -
+     NEVER an `apt-config` mention alone - os-prober invocation count,
+     protected/target disk probe-visibility observations, crash-report
+     MENTIONS in console text, and a bounded/truncation-honest
+     failure summary). Wired into `run-qa-install.sh`'s workflow step
+     and the uploaded Layer-B artifact manifest
+     (`qa-install-storage-probe-forensics.env`), with a direct static
+     test proving the wiring.
+  2. A real, order-dependent regex defect was found and fixed WHILE
+     building this script: a naive `restricted=False.*failed`-style
+     combined regex cannot match the real, cited upstream format
+     "block probing failed restricted=False" (where "failed" appears
+     BEFORE "restricted=False") - fixed with an order-independent,
+     chained AND-match helper (`_count_lines_matching_all`) used for
+     every multi-token check in this script.
+  3. A real device-path pattern defect was also found and fixed: a
+     bare `\b` word-boundary directly after "vda"/"vdb" never matches
+     the real, partition-suffixed paths Section 4's own evidence
+     explicitly lists (`/dev/vda1`, `/dev/vda2`, `/dev/vdb1`,
+     `/dev/vdb2`) - there is no word boundary between a letter and an
+     immediately-following digit. Fixed to match the bare device path
+     OR any partition-number suffix.
+  4. A real performance defect (the same class as S7.1R12's own
+     per-Change-ID optimization) was found and fixed before commit: an
+     early per-line-subshell implementation of the order-independent
+     matching helpers took ~55s against just 400 matching lines on
+     this project's Windows/MSYS2 development environment; rewritten
+     as single-awk-pass helpers, the same workload now completes in
+     ~5s, and a 4000-line fixture also completes in ~5s (real
+     production Layer-B runners have far cheaper fork/exec, but this
+     project's own established discipline is to never rely on that
+     margin).
+
+  **Architectural note** (same constraint as S7.1R12's own snap-
+  change-forensics script): this project's ONLY host<->guest channel
+  is the QEMU `-serial file:...` console log - there is no shared
+  folder, no 9p mount, no virtio-fs share, so a genuine live-guest
+  crash-report FILE copy (Objective A's literal request) is not
+  achievable without a materially larger architecture change than one
+  corrective round justifies. This script therefore extracts crash-
+  report MENTIONS from the console TEXT (journald-forwarded thanks to
+  S7.1R5's fix), never a live file copy -
+  `block_probe_crash_report_present`/`_count` are honest textual-
+  mention observations, not proof a real crash-report file's full
+  contents were captured.
+
+  Explicitly NOT done this pass: QEMU timeout (6600s) UNCHANGED - Run
+  #13 spent thousands of seconds in a storage-probe retry condition
+  before any real partitioning could even begin, so a timeout
+  increase would hide the unresolved probe loop rather than address
+  it (`6600_SECONDS_SUFFICIENT_UNDER_NORMAL_BOOTSTRAP=NOT_OBSERVED` -
+  never asserted false as a general conclusion, since no run has yet
+  completed a normal bootstrap all the way through under this
+  budget). No protected-disk visibility change, no target-selection
+  semantics change, no fixture change, no speculative snap-lifecycle
+  mitigation, no user-level firmware-notifier mitigation - all
+  confirmed via diff against the exact pre-head commit.
+```
+
 ## Real Layer-B validation status (S7.1R12)
 
 **Twelve real Installer Layer-B runs have occurred.** Run #12
