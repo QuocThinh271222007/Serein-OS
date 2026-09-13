@@ -127,6 +127,9 @@ SERIAL_LOG="${WORK_DIR}/qa-install-serial.log"
 QEMU_STDOUT_LOG="${WORK_DIR}/qa-install-qemu-stdout.log"
 QEMU_STDERR_LOG="${WORK_DIR}/qa-install-qemu-stderr.log"
 RESULT_ENV="${WORK_DIR}/qa-install-qemu-result.env"
+# S7.1R14 Objective A: the guest-evidence virtio-serial sink - see the
+# QEMU_ARGS comment below for the full design rationale.
+GUEST_EVIDENCE_LOG="${WORK_DIR}/qa-install-guest-evidence.log"
 
 # Overridable only for fast, real, sub-second test execution
 # (tests/test_installer.py::TestRunQaInstallScript) - production always
@@ -156,6 +159,25 @@ RUN_STARTED_GRACE_SECONDS="${SEREIN_TEST_RUN_STARTED_GRACE_SECONDS:-2}"
 # remains fully sufficient for the guest to discover, identify by
 # serial, and correctly reject this disk as non-target (no component
 # needs write access merely to probe/enumerate a disk).
+# S7.1R14 Objective A: the guest-evidence channel - a dedicated,
+# QA-only virtio-serial port (`org.serein.qa.evidence`, matching the
+# reverse-DNS naming convention QEMU's own virtio-serial documentation
+# uses) backed by a `-chardev file,path=...` sink. This is the
+# smallest viable guest->host evidence channel this project's real
+# architecture supports (see docs/installer/known-limitations.md's
+# own S7.1R12/R13 finding: there is no shared folder, 9p mount, or
+# virtio-fs share anywhere in this project, and none is added here
+# either - a `file` chardev is a real, standard QEMU backend that is
+# STRUCTURALLY one-way: the guest may only WRITE bytes into it; there
+# is no read-back path, no command-execution capability, and no way
+# for the guest to address any OTHER host path through it (Section 6's
+# absolute requirement - NO_HOST_COMMAND_EXECUTION_FROM_GUEST=true,
+# ARBITRARY_HOST_FS_EXPOSURE=false - both hold by QEMU's own chardev
+# design, not merely by convention). The guest-side watcher that
+# writes to this port (serein.installer.renderer's own
+# early-commands-embedded script) is bounded, finite, and
+# self-terminating - see that module's own docstring for the full
+# guest-side contract.
 QEMU_ARGS=(
     -m 4096 -smp 2 -accel "${ACCEL}"
     -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}"
@@ -163,6 +185,9 @@ QEMU_ARGS=(
     -device virtio-blk-pci,id=serein_protected_device,drive=serein_protected_backend,serial=SEREIN-PROTECTED-DISK
     -drive if=none,id=serein_target_backend,format=qcow2,file="${TARGET_DISK}"
     -device virtio-blk-pci,id=serein_target_device,drive=serein_target_backend,serial=SEREIN-TARGET-DISK
+    -device virtio-serial-pci,id=serein_evidence_bus
+    -chardev file,id=serein_evidence_chardev,path="${GUEST_EVIDENCE_LOG}"
+    -device virtserialport,bus=serein_evidence_bus.0,chardev=serein_evidence_chardev,name=org.serein.qa.evidence
     -cdrom "${ISO}"
     -boot d
     -display none -no-reboot
@@ -201,6 +226,13 @@ _write_result() {
     [ -f "${SERIAL_LOG}" ] && serial_present="true"
     local userspace
     userspace="$(_userspace_reached "${SERIAL_LOG}")"
+    # S7.1R14 Objective A: honestly report whether the guest-evidence
+    # channel produced anything at all - a genuinely empty/absent file
+    # is real NOT_OBSERVED evidence (e.g. the guest never reached the
+    # point where its early-commands watcher starts), never silently
+    # treated as success.
+    local guest_evidence_present="false"
+    [ -s "${GUEST_EVIDENCE_LOG}" ] && guest_evidence_present="true"
     cat > "${RESULT_ENV}" <<EOF
 qemu_exit_status=${status}
 qemu_accelerator=${ACCEL}
@@ -208,11 +240,13 @@ qemu_firmware=${OVMF_CODE}
 qemu_timeout_seconds=${TIMEOUT_SECONDS}
 qemu_serial_log_path=${SERIAL_LOG}
 qemu_diagnostic_log_path=${QEMU_STDERR_LOG}
+qemu_guest_evidence_log_path=${GUEST_EVIDENCE_LOG}
 qemu_started=${started}
 qemu_elapsed_seconds=${elapsed}
 failure_stage=${stage}
 installer_userspace_reached=${userspace}
 serial_log_present=${serial_present}
+guest_evidence_log_present=${guest_evidence_present}
 EOF
 }
 

@@ -46,6 +46,21 @@ from serein.installer.payload import InstallStateMarker, QaCredential
 # the naming already used elsewhere in this module
 TARGET_ROOT_FILESYSTEM = _TARGET_ROOT_FILESYSTEM
 
+# S7.1R14 Objective A: guest-side bounded crash-evidence watcher
+# constants (Section 11 - explicit, finite bounds, never unbounded).
+# QA_EVIDENCE_WATCHER_MAX_ITERATIONS * QA_EVIDENCE_WATCHER_SLEEP_SECONDS
+# is deliberately set to the SAME 6600s ceiling as
+# run-qa-install.sh's own QEMU_TIMEOUT_SECONDS - the watcher is
+# guaranteed to self-terminate at or before the host would kill QEMU
+# anyway, never relying on the guest ever shutting down gracefully
+# (Run #14 was itself killed by the host timeout).
+QA_EVIDENCE_MAX_CRASH_FILES = 5
+QA_EVIDENCE_MAX_BYTES_PER_CRASH = 4096
+QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES = 65536
+QA_EVIDENCE_WATCHER_MAX_ITERATIONS = 660
+QA_EVIDENCE_WATCHER_SLEEP_SECONDS = 10
+QA_EVIDENCE_PORT_PATH = "/dev/virtio-ports/org.serein.qa.evidence"
+
 
 class RendererError(ValueError):
     """Raised when asked to render from an unvalidated/invalid plan, or
@@ -136,6 +151,108 @@ def _install_state_late_command(marker: InstallStateMarker) -> str:
     )
 
 
+def _qa_evidence_watcher_script() -> str:
+    """The guest-side bounded crash-evidence producer (S7.1R14
+    Objective A). A POSIX ``/bin/sh`` script (no bashisms - the live
+    ISO's default shell is dash) that watches for new
+    ``/var/crash/*block_probe_fail*.crash`` files and exports bounded
+    metadata + truncated content through the QA-only, structurally
+    one-way virtio-serial port ``run-qa-install.sh`` wires up
+    (``QA_EVIDENCE_PORT_PATH``).
+
+    Guest-side contract (Section 6's absolute requirements, all held by
+    construction here, never by convention):
+
+    - reads ONLY ``/var/crash/*block_probe_fail*.crash`` inside the
+      guest's own ephemeral filesystem - never any other host or guest
+      path;
+    - writes ONLY to the named virtio-serial port - never any other
+      file, device, or network socket;
+    - never executes a host command, never opens a network connection,
+      never accepts input FROM the port (the port is opened purely for
+      appending);
+    - finite and self-terminating: a fixed ``MAX_ITERATIONS``-step
+      loop, never ``while true`` - it exits on its own well before the
+      host's own QEMU timeout, rather than depending on the guest ever
+      shutting down gracefully;
+    - bounded: at most ``MAX_CRASH_FILES`` distinct crash files ever
+      exported, at most ``MAX_BYTES_PER_CRASH`` bytes read from any one
+      of them, and a hard ``MAX_TOTAL_EVIDENCE_BYTES`` ceiling across
+      all of them combined - every truncation is recorded explicitly
+      (``truncated=true``/``false``), never silent;
+    - deduplicated: an in-memory ``seen`` list keyed by filename, so
+      the same crash file is exported at most once per run, even
+      though the watcher polls repeatedly.
+    """
+    return (
+        "#!/bin/sh\n"
+        "set -u\n"
+        f'PORT="{QA_EVIDENCE_PORT_PATH}"\n'
+        f"MAX_CRASH_FILES={QA_EVIDENCE_MAX_CRASH_FILES}\n"
+        f"MAX_BYTES_PER_CRASH={QA_EVIDENCE_MAX_BYTES_PER_CRASH}\n"
+        f"MAX_TOTAL_EVIDENCE_BYTES={QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES}\n"
+        f"MAX_ITERATIONS={QA_EVIDENCE_WATCHER_MAX_ITERATIONS}\n"
+        f"SLEEP_SECONDS={QA_EVIDENCE_WATCHER_SLEEP_SECONDS}\n"
+        'seen=""\n'
+        "exported_count=0\n"
+        "total_bytes=0\n"
+        "i=0\n"
+        'while [ "$i" -lt "$MAX_ITERATIONS" ]; do\n'
+        '    if [ -e "$PORT" ] && [ -w "$PORT" ]; then\n'
+        "        for f in /var/crash/*block_probe_fail*.crash; do\n"
+        '            [ -e "$f" ] || continue\n'
+        '            case " $seen " in\n'
+        '                *" $f "*) continue ;;\n'
+        "            esac\n"
+        '            seen="$seen $f"\n'
+        '            [ "$exported_count" -ge "$MAX_CRASH_FILES" ] && continue\n'
+        "            exported_count=$((exported_count + 1))\n"
+        '            size=$(wc -c < "$f" 2>/dev/null || echo 0)\n'
+        '            mtime=$(stat -c %Y "$f" 2>/dev/null || echo "")\n'
+        "            sha256=$(sha256sum \"$f\" 2>/dev/null | cut -d' ' -f1)\n"
+        '            take="$MAX_BYTES_PER_CRASH"\n'
+        '            remaining=$((MAX_TOTAL_EVIDENCE_BYTES - total_bytes))\n'
+        '            [ "$remaining" -lt "$take" ] && take="$remaining"\n'
+        '            [ "$take" -le 0 ] && continue\n'
+        '            trunc="false"\n'
+        '            [ "$size" -gt "$take" ] && trunc="true"\n'
+        "            {\n"
+        '                echo "===BEGIN-CRASH-EVIDENCE==="\n'
+        '                echo "filename=$(basename "$f")"\n'
+        '                echo "size=$size"\n'
+        '                echo "mtime=$mtime"\n'
+        '                echo "sha256=$sha256"\n'
+        '                echo "truncated=$trunc"\n'
+        '                echo "---BEGIN-CONTENT---"\n'
+        '                head -c "$take" "$f" 2>/dev/null\n'
+        '                echo ""\n'
+        '                echo "---END-CONTENT---"\n'
+        '                echo "===END-CRASH-EVIDENCE==="\n'
+        '            } >> "$PORT" 2>/dev/null || true\n'
+        "            total_bytes=$((total_bytes + take))\n"
+        "        done\n"
+        "    fi\n"
+        "    i=$((i + 1))\n"
+        '    sleep "$SLEEP_SECONDS"\n'
+        "done\n"
+        "exit 0\n"
+    )
+
+
+def _qa_evidence_early_command() -> str:
+    """One ``early-commands`` shell one-liner that base64-decodes and
+    launches :func:`_qa_evidence_watcher_script` detached in the
+    background (Section 27 escaping discipline, matching
+    ``_install_state_late_command``'s own base64 round-trip). Returns
+    almost instantly - ``early-commands`` entries run synchronously and
+    must never block on the watcher's own ~6600s bounded lifetime; the
+    inner ``&`` backgrounds the decode-and-run pipeline before the
+    outer ``sh -c`` returns. ``|| true`` ensures a QA-only diagnostic
+    convenience can never itself fail the real install."""
+    encoded = base64.b64encode(_qa_evidence_watcher_script().encode("utf-8")).decode("ascii")
+    return f"sh -c 'echo {encoded} | base64 -d | sh >/dev/null 2>&1 &' || true"
+
+
 def render_autoinstall_yaml(
     plan: InstallPlan,
     qa_credential: QaCredential,
@@ -173,6 +290,7 @@ def render_autoinstall_yaml(
             },
             "ssh": {"install-server": False, "allow-pw": False},
             "storage": storage,
+            "early-commands": [_qa_evidence_early_command()],
             "late-commands": [_install_state_late_command(install_state)],
         }
     }

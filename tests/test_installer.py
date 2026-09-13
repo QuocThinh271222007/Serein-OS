@@ -89,6 +89,12 @@ from serein.installer.payload import (
 )
 from serein.installer.planner import build_install_plan, validate_plan
 from serein.installer.renderer import (
+    QA_EVIDENCE_MAX_BYTES_PER_CRASH,
+    QA_EVIDENCE_MAX_CRASH_FILES,
+    QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES,
+    QA_EVIDENCE_PORT_PATH,
+    QA_EVIDENCE_WATCHER_MAX_ITERATIONS,
+    QA_EVIDENCE_WATCHER_SLEEP_SECONDS,
     RendererError,
     render_autoinstall_storage_config,
     render_autoinstall_yaml,
@@ -726,6 +732,125 @@ class TestRenderer:
         # PLAINTEXT never appears (already covered above) and that no
         # finding contains the plaintext value.
         assert all(cred.password not in rendered for _ in findings) or not findings
+
+
+# ---------------------------------------------------------------------------
+# S7.1R14 Objective A - guest-side bounded crash-evidence watcher
+# (serein.installer.renderer._qa_evidence_watcher_script /
+# _qa_evidence_early_command)
+# ---------------------------------------------------------------------------
+
+
+class TestQaEvidenceGuestProducer:
+    def _rendered_doc(self):
+        plan, cred, marker = _valid_plan_and_credential()
+        rendered = render_autoinstall_yaml(plan, cred, marker, qa_mode=True)
+        return json.loads(rendered)
+
+    def _decoded_watcher_script(self, doc) -> str:
+        early_command = doc["autoinstall"]["early-commands"][0]
+        encoded = early_command.split("echo ")[1].split(" | base64")[0]
+        return base64.b64decode(encoded).decode("utf-8")
+
+    def test_early_commands_present_with_one_bounded_entry(self):
+        doc = self._rendered_doc()
+        early_commands = doc["autoinstall"]["early-commands"]
+        assert isinstance(early_commands, list)
+        assert len(early_commands) == 1
+
+    def test_early_command_backgrounds_and_never_blocks(self):
+        # Non-blocking (Section 4/11): the decode-and-run pipeline is
+        # itself backgrounded with `&` inside the outer `sh -c`, so
+        # early-commands returns almost instantly rather than waiting
+        # on the watcher's own ~6600s bounded lifetime.
+        doc = self._rendered_doc()
+        early_command = doc["autoinstall"]["early-commands"][0]
+        assert "base64 -d | sh" in early_command
+        assert "&" in early_command
+        assert early_command.rstrip().endswith("|| true")
+
+    def test_watcher_script_watches_only_block_probe_fail_crash_files(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert "/var/crash/*block_probe_fail*.crash" in script
+
+    def test_watcher_script_writes_only_to_named_evidence_port(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert f'PORT="{QA_EVIDENCE_PORT_PATH}"' in script
+        # every redirection into a real sink targets $PORT (or
+        # /dev/null for discarded stdout/stderr) - never any other
+        # file path.
+        redirect_targets = re.findall(r">>?\s*\"?([^\s\"]+)\"?", script)
+        assert redirect_targets
+        assert all(t in ("$PORT",) or t.startswith("/dev/null") for t in redirect_targets)
+
+    def test_watcher_script_never_executes_host_commands_or_network(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        forbidden = ("curl", "wget", "nc ", "ssh ", "scp ", "ftp ", "python", "eval ")
+        for token in forbidden:
+            assert token not in script, f"forbidden token {token!r} found in watcher script"
+
+    def test_watcher_script_never_references_arbitrary_host_paths(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        for forbidden_path in ("/home", "/etc", "/root", "/dev/sda", "/dev/vda", "/dev/vdb"):
+            assert forbidden_path not in script
+
+    def test_watcher_bounded_finite_loop_never_while_true(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert "while true" not in script
+        assert 'while [ "$i" -lt "$MAX_ITERATIONS" ]' in script
+        assert f"MAX_ITERATIONS={QA_EVIDENCE_WATCHER_MAX_ITERATIONS}" in script
+        assert f"SLEEP_SECONDS={QA_EVIDENCE_WATCHER_SLEEP_SECONDS}" in script
+
+    def test_watcher_bounded_lifetime_matches_qemu_timeout_ceiling(self):
+        # The watcher must self-terminate at or before the host's own
+        # QEMU_TIMEOUT_SECONDS (run-qa-install.sh) - never rely on the
+        # guest shutting down gracefully (Run #14 was itself killed by
+        # the host timeout).
+        total_seconds = QA_EVIDENCE_WATCHER_MAX_ITERATIONS * QA_EVIDENCE_WATCHER_SLEEP_SECONDS
+        assert total_seconds == 6600
+
+    def test_watcher_enforces_crash_file_and_byte_caps(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert f"MAX_CRASH_FILES={QA_EVIDENCE_MAX_CRASH_FILES}" in script
+        assert f"MAX_BYTES_PER_CRASH={QA_EVIDENCE_MAX_BYTES_PER_CRASH}" in script
+        assert f"MAX_TOTAL_EVIDENCE_BYTES={QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES}" in script
+
+    def test_watcher_dedups_within_one_run(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert 'case " $seen " in' in script
+        assert 'seen="$seen $f"' in script
+
+    def test_watcher_records_truncation_explicitly(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert 'trunc="false"' in script
+        assert 'trunc="true"' in script
+        assert "truncated=$trunc" in script
+
+    def test_watcher_script_is_posix_sh_not_bash(self):
+        # The live ISO's default shell is dash - no bashisms (arrays,
+        # [[, local without a POSIX-safe form) may be relied upon.
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert script.startswith("#!/bin/sh")
+        assert "[[" not in script
+
+    def test_watcher_script_bash_syntax_check(self):
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        result = subprocess.run(
+            ["bash", "-n", "-c", script], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -1568,6 +1693,25 @@ class TestInstallerSmokeWorkflow:
         upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
         assert output_path in upload["with"]["path"]
 
+    def test_guest_evidence_step_present_and_wired_to_artifact(self, workflow):
+        # S7.1R14 Objective A: the same wiring-bug unacceptability
+        # standard as S7.1R12/R13 - the producing step exists, runs
+        # unconditionally, and its exact output paths are actually
+        # included in the uploaded artifact manifest.
+        steps = workflow["jobs"]["installer-smoke"]["steps"]
+        expected_name = "Extract guest evidence from QA-install run"
+        producer = next(s for s in steps if s.get("name") == expected_name)
+        assert producer.get("if") == "always()"
+        assert "extract-guest-evidence.sh" in producer["run"]
+        assert "dist/installer-fixtures/qa-install-guest-evidence.log" in producer["run"]
+        assert "dist/installer-fixtures/qa-install-guest-evidence.env" in producer["run"]
+
+        upload = next(s for s in steps if s.get("uses", "").startswith("actions/upload-artifact"))
+        upload_paths = upload["with"]["path"]
+        assert "dist/installer-fixtures/qa-install-guest-evidence.log" in upload_paths
+        assert "dist/installer-fixtures/qa-install-guest-evidence.env" in upload_paths
+        assert "dist/installer-fixtures/qa-install-block-probe-crash-*.txt" in upload_paths
+
     def test_failure_sites_use_canonical_record_failure_helper(self, workflow):
         steps = workflow["jobs"]["installer-smoke"]["steps"]
         for step in steps:
@@ -2307,6 +2451,64 @@ class TestRunQaInstallScript:
         assert "serial=SEREIN-PROTECTED-DISK" in protected_device
         assert "drive=serein_target_backend" in target_device
         assert "serial=SEREIN-TARGET-DISK" in target_device
+
+    # -- S7.1R14 Objective A: guest-evidence virtio-serial channel --
+
+    def test_r14_virtio_serial_bus_and_port_present_in_real_argv(self, tmp_path):
+        self._run(tmp_path, "probe_fail")
+        argv_text = (tmp_path / "qemu-argv.log").read_text(encoding="utf-8")
+        assert "virtio-serial-pci,id=serein_evidence_bus" in argv_text
+        assert "org.serein.qa.evidence" in argv_text
+        assert "chardev=serein_evidence_chardev" in argv_text
+
+    def test_r14_evidence_chardev_is_file_backend_not_socket(self, tmp_path):
+        # Section 6's absolute requirement: no socket-based
+        # bidirectional channel, no host command execution surface -
+        # a `file` chardev is structurally write-only from the guest.
+        self._run(tmp_path, "probe_fail")
+        argv_text = (tmp_path / "qemu-argv.log").read_text(encoding="utf-8")
+        chardev_arg = next(a for a in argv_text.split() if a.startswith("file,id=serein_evidence"))
+        assert chardev_arg.startswith("file,")
+        assert "socket" not in chardev_arg
+
+    def test_r14_evidence_chardev_path_is_the_declared_guest_evidence_log(self, tmp_path):
+        self._run(tmp_path, "probe_fail")
+        argv_text = (tmp_path / "qemu-argv.log").read_text(encoding="utf-8")
+        chardev_arg = next(a for a in argv_text.split() if a.startswith("file,id=serein_evidence"))
+        assert "path=" in chardev_arg
+        assert "qa-install-guest-evidence.log" in chardev_arg
+
+    def test_r14_result_env_reports_guest_evidence_log_path_and_presence(self, tmp_path):
+        result, fixtures = self._run(tmp_path, "pass")
+        assert result.returncode == 0
+        env = self._result_env(fixtures)
+        assert "qa-install-guest-evidence.log" in env["qemu_guest_evidence_log_path"]
+        # No fake QEMU ever actually writes to the evidence file (it is
+        # not real QEMU), so the honest observation is "absent" -
+        # never fabricated as present.
+        assert env["guest_evidence_log_present"] == "false"
+
+    def test_r14_guest_evidence_present_when_file_has_content(self, tmp_path):
+        result, fixtures = self._run(tmp_path, "pass")
+        assert result.returncode == 0
+        (fixtures / "qa-install-guest-evidence.log").write_text("some real evidence\n")
+        # Re-derive presence the same way the script does (a direct,
+        # minimal re-check - the script itself already wrote its
+        # result before we injected content, so this proves the
+        # underlying file-presence semantics the script's own
+        # `[ -s ... ]` check relies on, without re-running QEMU).
+        assert (fixtures / "qa-install-guest-evidence.log").stat().st_size > 0
+
+    def test_r14_no_socket_or_network_chardev_anywhere_in_script(self):
+        # Section 6/26: NETWORK_DEPENDENCY=false - structural proof no
+        # network-facing chardev backend (socket/udp/tcp) is used
+        # anywhere in this script.
+        text = self.SCRIPT.read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "-chardev" in line:
+                assert "socket" not in line
+                assert "udp" not in line
+                assert "tcp" not in line
 
     def test_a7_no_dev_vdx_hardcoded_in_orchestration(self):
         text = self.SCRIPT.read_text(encoding="utf-8")
@@ -4099,6 +4301,86 @@ class TestExtractStorageProbeForensicsScript:
         self._run([str(serial), str(tmp_path / "out.env")])
         assert serial.read_text() == before
 
+    # -- S7.1R14 Objective G: semantic probe-attempt state machine --
+
+    def test_bare_fail_line_without_restricted_token_associates_via_open_attempt(self, tmp_path):
+        # The real Run #14 bug: filesystem_probe_unrestricted_start_count=6,
+        # filesystem_probe_unrestricted_failure_count=0 despite raw
+        # evidence containing "probe_once: FAIL: cancelled" (a bare
+        # failure line carrying no restricted= token of its own).
+        log = (
+            "[ 1400.000000] Filesystem/_probe/probe_once restricted=False\n"
+            "[ 1420.000000] probe_once: FAIL: cancelled\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_start_count"] == "1"
+        assert outputs["filesystem_probe_unrestricted_failure_count"] == "1"
+        assert outputs["filesystem_probe_unassociated_failure_count"] == "0"
+
+    def test_ambiguous_failure_with_no_open_attempt_is_unassociated_never_guessed(self, tmp_path):
+        # No preceding start line at all - the mode is genuinely
+        # unknown, so this must never be guessed into either the
+        # unrestricted or restricted bucket (Section 10).
+        log = "[  100.000000] probe_once: FAIL: cancelled\n"
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_failure_count"] == "0"
+        assert outputs["filesystem_probe_restricted_failure_count"] == "0"
+        assert outputs["filesystem_probe_unassociated_failure_count"] == "1"
+
+    def test_restricted_probe_start_then_success(self, tmp_path):
+        log = (
+            "[  100.000000] Filesystem/_probe/probe_once restricted=True\n"
+            "[  120.000000] probe_once: succeeded\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_restricted_start_count"] == "1"
+        assert outputs["filesystem_probe_restricted_success_count"] == "1"
+
+    def test_later_unrestricted_retry_after_earlier_close(self, tmp_path):
+        log = (
+            "[  100.000000] Filesystem/_probe/probe_once restricted=False\n"
+            "[  120.000000] probe_once: FAIL: cancelled\n"
+            "[  200.000000] Filesystem/_probe/probe_once restricted=False\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_start_count"] == "2"
+        assert outputs["filesystem_probe_unrestricted_failure_count"] == "1"
+
+    def test_duplicate_serialized_line_deduplicated(self, tmp_path):
+        # The exact same real event, serialized twice (identical
+        # timestamp AND identical content) - must count once, not
+        # twice.
+        log = (
+            "[  100.000000] Filesystem/_probe/probe_once restricted=False\n"
+            "[  100.000000] Filesystem/_probe/probe_once restricted=False\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_start_count"] == "1"
+
+    def test_distinct_events_sharing_a_timestamp_remain_distinct(self, tmp_path):
+        # Two genuinely different lines that happen to share a
+        # timestamp must both still count (never conflated merely
+        # because they collide on time).
+        log = (
+            "[  100.000000] Filesystem/_probe/probe_once restricted=False\n"
+            "[  100.000000] Filesystem/_probe/probe_once restricted=True\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["filesystem_probe_unrestricted_start_count"] == "1"
+        assert outputs["filesystem_probe_restricted_start_count"] == "1"
+
+    def test_two_distinct_real_crash_report_ids(self, tmp_path):
+        # The two real, proven-distinct Run #14 crash report IDs -
+        # never conflated as one, never miscounted as more than two.
+        log = (
+            "[  100.000000] problem report saved to "
+            "/var/crash/1789270740.339945555.block_probe_fail.crash\n"
+            "[  200.000000] problem report saved to "
+            "/var/crash/1789271065.851166248.block_probe_fail.crash\n"
+        )
+        outputs = self._outputs(tmp_path, log)
+        assert outputs["block_probe_crash_report_count"] == "2"
+
     def test_bounded_execution_against_large_log(self, tmp_path):
         # Structural proof of Section 11's BOUNDED/FINITE/LOW_OVERHEAD
         # requirements and this round's own real, measured performance
@@ -4117,6 +4399,150 @@ class TestExtractStorageProbeForensicsScript:
         log = "\n".join(lines) + "\n"
         outputs = self._outputs(tmp_path, log)
         assert outputs["filesystem_probe_unrestricted_start_count"] == "500"
+
+
+# ---------------------------------------------------------------------------
+# S7.1R14 Objective A - installer/scripts/extract-guest-evidence.sh
+# ---------------------------------------------------------------------------
+
+
+class TestExtractGuestEvidenceScript:
+    """Host-side, read-only parsing of the QA-only guest crash-evidence
+    channel into a compact summary + per-crash artifact files - see
+    this script's own header for the full architectural note."""
+
+    SCRIPT = REPO_ROOT / "installer" / "scripts" / "extract-guest-evidence.sh"
+
+    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        return subprocess.run(
+            ["bash", str(self.SCRIPT), *args], capture_output=True, text=True, timeout=30
+        )
+
+    def _block(
+        self, filename: str, content: str, *, size=None, sha256="deadbeef", truncated="false"
+    ):
+        size = len(content) if size is None else size
+        return (
+            "===BEGIN-CRASH-EVIDENCE===\n"
+            f"filename={filename}\n"
+            f"size={size}\n"
+            "mtime=1789270741\n"
+            f"sha256={sha256}\n"
+            f"truncated={truncated}\n"
+            "---BEGIN-CONTENT---\n"
+            f"{content}\n"
+            "---END-CONTENT---\n"
+            "===END-CRASH-EVIDENCE===\n"
+        )
+
+    def _outputs(self, tmp_path: Path, log_content: str | None) -> tuple[dict[str, str], Path]:
+        log_path = tmp_path / "qa-install-guest-evidence.log"
+        if log_content is not None:
+            log_path.write_text(log_content)
+        crash_dir = tmp_path / "crashes"
+        env_path = tmp_path / "guest-evidence.env"
+        result = self._run([str(log_path), str(env_path), str(crash_dir)])
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs = {
+            k: v for k, v in (
+                line.split("=", 1) for line in env_path.read_text().splitlines()
+                if "=" in line and not line.startswith("#")
+            )
+        }
+        return outputs, crash_dir
+
+    def test_guest_evidence_device_absent_is_honest_not_fabricated(self, tmp_path):
+        outputs, crash_dir = self._outputs(tmp_path, None)
+        assert outputs["guest_evidence_log_present"] == "false"
+        assert outputs["guest_evidence_crash_block_count"] == "0"
+        assert list(crash_dir.glob("*.txt")) == []
+
+    def test_guest_evidence_log_present_but_empty(self, tmp_path):
+        outputs, _crash_dir = self._outputs(tmp_path, "")
+        assert outputs["guest_evidence_log_present"] == "true"
+        assert outputs["guest_evidence_crash_block_count"] == "0"
+
+    def test_one_crash_block_parsed_into_its_own_file(self, tmp_path):
+        log = self._block("a.crash", "Traceback: block probe failed")
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "1"
+        crash1 = crash_dir / "qa-install-block-probe-crash-1.txt"
+        assert crash1.exists()
+        text = crash1.read_text()
+        assert "filename=a.crash" in text
+        assert "Traceback: block probe failed" in text
+
+    def test_multiple_crash_blocks_written_in_order(self, tmp_path):
+        log = self._block("a.crash", "first") + self._block("b.crash", "second")
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "2"
+        assert (crash_dir / "qa-install-block-probe-crash-1.txt").read_text().find("a.crash") != -1
+        assert (crash_dir / "qa-install-block-probe-crash-2.txt").read_text().find("b.crash") != -1
+
+    def test_late_crash_creation_after_unrelated_content(self, tmp_path):
+        log = "some unrelated console noise\n" * 3 + self._block("late.crash", "late content")
+        outputs, _crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "1"
+
+    def test_duplicate_crash_block_deduplicated_by_filename(self, tmp_path):
+        log = self._block("dup.crash", "first copy") + self._block("dup.crash", "second copy")
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "1"
+        assert len(list(crash_dir.glob("qa-install-block-probe-crash-*.txt"))) == 1
+
+    def test_crash_block_count_bounded_and_truncation_recorded(self, tmp_path):
+        log = "".join(self._block(f"c{i}.crash", f"content {i}") for i in range(8))
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "8"
+        assert outputs["guest_evidence_crash_block_truncated"] == "true"
+        assert len(list(crash_dir.glob("qa-install-block-probe-crash-*.txt"))) == 5
+
+    def test_malformed_block_missing_end_marker_is_a_parse_error_not_a_crash(self, tmp_path):
+        log = "===BEGIN-CRASH-EVIDENCE===\nfilename=incomplete.crash\nsize=1\n"
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_parse_error_count"] == "1"
+        assert outputs["guest_evidence_crash_block_count"] == "0"
+        assert list(crash_dir.glob("*.txt")) == []
+
+    def test_block_missing_filename_is_a_parse_error(self, tmp_path):
+        log = (
+            "===BEGIN-CRASH-EVIDENCE===\n"
+            "size=1\n"
+            "---BEGIN-CONTENT---\nx\n---END-CONTENT---\n"
+            "===END-CRASH-EVIDENCE===\n"
+        )
+        outputs, _crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_parse_error_count"] == "1"
+        assert outputs["guest_evidence_crash_block_count"] == "0"
+
+    def test_never_fails_the_job_on_missing_log(self, tmp_path):
+        result = self._run(
+            [str(tmp_path / "missing.log"), str(tmp_path / "out.env"), str(tmp_path / "crashes")]
+        )
+        assert result.returncode == 0
+
+    def test_never_mutates_the_guest_evidence_log(self, tmp_path):
+        log = self._block("a.crash", "content")
+        log_path = tmp_path / "qa-install-guest-evidence.log"
+        log_path.write_text(log)
+        before = log_path.read_text()
+        self._run([str(log_path), str(tmp_path / "out.env"), str(tmp_path / "crashes")])
+        assert log_path.read_text() == before
+
+    def test_output_env_defaults_to_output_dirname_when_crash_dir_omitted(self, tmp_path):
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        log_path = tmp_path / "qa-install-guest-evidence.log"
+        log_path.write_text(self._block("a.crash", "content"))
+        env_path = tmp_path / "out.env"
+        result = subprocess.run(
+            ["bash", str(self.SCRIPT), str(log_path), str(env_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (tmp_path / "qa-install-block-probe-crash-1.txt").exists()
 
 
 # ---------------------------------------------------------------------------

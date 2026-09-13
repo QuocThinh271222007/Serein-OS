@@ -205,6 +205,110 @@ _first_valid_timestamp_matching_all() {
     " || true
 }
 
+# _storage_probe_state_machine <probe_pat> <unrestricted_tok>
+#   <restricted_tok> <success_pat> <failure_pat>
+#
+# Single awk pass modeling real probe-attempt open/close semantics
+# (S7.1R14 Objective G - see the call site's own comment for the full
+# rationale). Emits `SPSM_<NAME>=<int>` assignment lines on stdout,
+# meant to be consumed via `eval "$(...)"` at the call site - every
+# value here is a plain integer this script itself computed, never
+# untrusted input echoed back.
+_storage_probe_state_machine() {
+    local probe_pat="$1" unrestricted_tok="$2" restricted_tok="$3"
+    local success_pat="$4" failure_pat="$5"
+    grep -Ei -- "${probe_pat}" "${SERIAL_LOG}" 2>/dev/null | awk \
+        -v unrestricted="${unrestricted_tok}" \
+        -v restricted="${restricted_tok}" \
+        -v success_pat="${success_pat}" \
+        -v failure_pat="${failure_pat}" '
+        BEGIN {
+            n_open = 0
+            start_u = 0; success_u = 0; failure_u = 0
+            start_r = 0; success_r = 0; failure_r = 0
+            unassociated_failure = 0
+            last_key = ""
+        }
+        {
+            line = $0
+            ts = ""
+            if (match(line, /\[[ \t]*[0-9]+\.[0-9]+\]/)) {
+                ts = substr(line, RSTART, RLENGTH)
+                gsub(/[^0-9.]/, "", ts)
+            } else if (match(line, /^[ \t]*[0-9]+\.[0-9]+/)) {
+                ts = substr(line, RSTART, RLENGTH)
+                gsub(/^[ \t]+/, "", ts)
+            }
+            if (ts == "") next
+
+            # Duplicate SERIALIZED rendering of the exact same real
+            # event (identical timestamp AND identical normalized
+            # content) - deduplicated. Two genuinely distinct events
+            # that merely share a timestamp have different normalized
+            # content and so a different key - never conflated.
+            norm = line
+            gsub(/^[ \t]*\[?[ \t]*[0-9]+\.[0-9]+\]?[ \t]*/, "", norm)
+            key = ts SUBSEP norm
+            if (key == last_key) next
+            last_key = key
+
+            is_u = (line ~ unrestricted)
+            is_r = (line ~ restricted)
+            is_fail = (line ~ failure_pat)
+            is_success = (line ~ success_pat)
+
+            if (is_fail || is_success) {
+                if (is_u || is_r) {
+                    # Self-contained result - this line carries its own
+                    # restricted= token, so its mode is real evidence,
+                    # never guessed. Counted directly regardless of any
+                    # open attempt; if a matching-mode attempt happens
+                    # to be open, consume (close) it too, so it is
+                    # never left dangling as still-open.
+                    mode = is_u ? "u" : "r"
+                    if (mode == "u") { if (is_fail) failure_u++; else success_u++ }
+                    else { if (is_fail) failure_r++; else success_r++ }
+                    for (k = n_open; k >= 1; k--) {
+                        if (open_mode[k] == mode) {
+                            for (j = k; j < n_open; j++) { open_mode[j] = open_mode[j + 1] }
+                            n_open--
+                            break
+                        }
+                    }
+                } else {
+                    # Ambiguous result (e.g. real "probe_once: FAIL:
+                    # cancelled" - no restricted= token of its own) -
+                    # associate with the MOST RECENTLY opened
+                    # still-open attempt, whichever mode that is
+                    # (Section 10: never guessed when none is open).
+                    if (n_open >= 1) {
+                        mode = open_mode[n_open]
+                        n_open--
+                        if (mode == "u") { if (is_fail) failure_u++; else success_u++ }
+                        else { if (is_fail) failure_r++; else success_r++ }
+                    } else if (is_fail) {
+                        unassociated_failure++
+                    }
+                }
+            } else if (is_u || is_r) {
+                mode = is_u ? "u" : "r"
+                if (mode == "u") start_u++; else start_r++
+                n_open++
+                open_mode[n_open] = mode
+            }
+        }
+        END {
+            printf "SPSM_START_U=%d\n", start_u
+            printf "SPSM_SUCCESS_U=%d\n", success_u
+            printf "SPSM_FAILURE_U=%d\n", failure_u
+            printf "SPSM_START_R=%d\n", start_r
+            printf "SPSM_SUCCESS_R=%d\n", success_r
+            printf "SPSM_FAILURE_R=%d\n", failure_r
+            printf "SPSM_UNASSOCIATED_FAILURE=%d\n", unassociated_failure
+        }
+    ' || true
+}
+
 {
     echo "# S7.1R13 Objectives A-F - bounded, host-side,"
     echo "# NON_AUTHORITATIVE Subiquity/probert/os-prober storage-probe"
@@ -230,13 +334,44 @@ _first_valid_timestamp_matching_all() {
     outcome_success='(succeeded|success)'
     outcome_failure='(fail|FAIL|cancel|Cancel)'
 
-    echo "filesystem_probe_unrestricted_start_count=$(_count_lines_matching_all "${probe_once_or_block}" "${unrestricted_tok}")"
-    echo "filesystem_probe_unrestricted_success_count=$(_count_lines_matching_all "${probe_once_or_block}" "${unrestricted_tok}" "${outcome_success}")"
-    echo "filesystem_probe_unrestricted_failure_count=$(_count_lines_matching_all "${probe_once_or_block}" "${unrestricted_tok}" "${outcome_failure}")"
+    # S7.1R14 Objective G (Run #14 real evidence: this exact
+    # single-line-AND approach reported
+    # filesystem_probe_unrestricted_start_count=6,
+    # filesystem_probe_unrestricted_failure_count=0 despite raw
+    # evidence containing "probe_once: FAIL: cancelled" - a real,
+    # cited-upstream "bare" failure line that never carries its own
+    # "restricted=" token on the same line, so a naive single-line AND
+    # match against unrestricted_tok+outcome_failure can never match
+    # it). Modeled instead as a semantic attempt state machine
+    # (_storage_probe_state_machine, below): a "start" line opens an
+    # attempt in its own restricted=True/False mode; a "result" line
+    # that ITSELF carries an explicit restricted= token is
+    # self-contained (counted directly, regardless of any open
+    # attempt); a "result" line with NO restricted= token is
+    # ambiguous - it closes the MOST RECENTLY opened still-open
+    # attempt (whichever mode that is), never guessed when no attempt
+    # is open (Section 10 - "do not fabricate"), and instead recorded
+    # under filesystem_probe_unassociated_failure_count. Duplicate
+    # SERIALIZED renderings of the exact same real event (identical
+    # timestamp AND identical normalized content) are deduplicated;
+    # distinct events that merely happen to share a timestamp are
+    # never conflated (S7.1R12's own established discipline, applied
+    # here to storage-probe events for the first time). --
+    eval "$(_storage_probe_state_machine "${probe_once_or_block}" "${unrestricted_tok}" "${restricted_tok}" "${outcome_success}" "${outcome_failure}")"
 
-    echo "filesystem_probe_restricted_start_count=$(_count_lines_matching_all "${probe_once_or_block}" "${restricted_tok}")"
-    echo "filesystem_probe_restricted_success_count=$(_count_lines_matching_all "${probe_once_or_block}" "${restricted_tok}" "${outcome_success}")"
-    echo "filesystem_probe_restricted_failure_count=$(_count_lines_matching_all "${probe_once_or_block}" "${restricted_tok}" "${outcome_failure}")"
+    echo "filesystem_probe_unrestricted_start_count=${SPSM_START_U}"
+    echo "filesystem_probe_unrestricted_success_count=${SPSM_SUCCESS_U}"
+    echo "filesystem_probe_unrestricted_failure_count=${SPSM_FAILURE_U}"
+
+    echo "filesystem_probe_restricted_start_count=${SPSM_START_R}"
+    echo "filesystem_probe_restricted_success_count=${SPSM_SUCCESS_R}"
+    echo "filesystem_probe_restricted_failure_count=${SPSM_FAILURE_R}"
+
+    # Section 10: a failure event with no explicit restricted= token of
+    # its own AND no matching open attempt to associate with - real,
+    # honest NOT_OBSERVED-mode evidence, never guessed into either
+    # bucket above.
+    echo "filesystem_probe_unassociated_failure_count=${SPSM_UNASSOCIATED_FAILURE}"
 
     # -- Objective F: Filesystem-controller-specific apply_autoinstall
     # start/finish - distinct from the generic top-level

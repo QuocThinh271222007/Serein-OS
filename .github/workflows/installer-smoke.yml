@@ -777,6 +777,24 @@ jobs:
             dist/installer-fixtures/qa-install-serial.log \
             dist/installer-fixtures/qa-install-storage-probe-forensics.env
 
+      # S7.1R14 Objective A: the guest-side bounded crash-evidence
+      # watcher (serein.installer.renderer._qa_evidence_watcher_script,
+      # embedded via an early-commands autoinstall directive) appends
+      # bounded crash evidence to the QA-only, structurally one-way
+      # virtio-serial sink run-qa-install.sh wires up
+      # (qa-install-guest-evidence.log). This bounded, host-side,
+      # read-only pass turns that raw evidence into a compact summary
+      # plus per-crash artifact files, never itself a gate, never
+      # blocking on any diagnostic command's own success - see this
+      # script's own header for the full architectural note.
+      - name: Extract guest evidence from QA-install run
+        if: always()
+        run: |
+          ./installer/scripts/extract-guest-evidence.sh \
+            dist/installer-fixtures/qa-install-guest-evidence.log \
+            dist/installer-fixtures/qa-install-guest-evidence.env \
+            dist/installer-fixtures
+
       # S7.1 Section 47: remove the install ISO once the real install
       # has actually finished with it - never attached to any later
       # boot-check QEMU command anyway, but genuinely releasing the
@@ -1085,6 +1103,9 @@ jobs:
             dist/installer-fixtures/qa-install-bootstrap-milestones.env
             dist/installer-fixtures/qa-install-snap-change-forensics.env
             dist/installer-fixtures/qa-install-storage-probe-forensics.env
+            dist/installer-fixtures/qa-install-guest-evidence.log
+            dist/installer-fixtures/qa-install-guest-evidence.env
+            dist/installer-fixtures/qa-install-block-probe-crash-*.txt
             dist/installer-fixtures/protected-disk-diagnostic.env
             dist/installer-fixtures/target-disk-diagnostic.env
             dist/.secondary_failures
