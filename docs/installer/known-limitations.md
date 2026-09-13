@@ -1,5 +1,117 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R15)
+
+**Fifteen real Installer Layer-B runs have occurred.** Run #15
+(RUN_ID=34749167021, HEAD=0966ac8a3162ba3dcb0de7486a814242f084ee14 -
+the S7.1R14 guest-evidence-producer commit) did NOT reproduce the
+Run #13/#14 block-probe pathology - storage progressed cleanly through
+filesystem apply, partitioning, and extract - but DID reproduce the
+recurring, nondeterministic snap/bootstrap pathology first seen in
+Runs #7/#11/#12:
+
+```text
+Run 15 (after S7.1R14):
+  RUN_ID=34749167021, RUN_NUMBER=15
+  HEAD=0966ac8a3162ba3dcb0de7486a814242f084ee14
+  RESULT=FAILURE - failure_stage=installer_timeout
+  (qemu_timeout_seconds=6600).
+
+  This environment has no raw Run #15 serial log, no live-guest
+  access, and no local-real-QEMU reproduction capability -
+  RUN15_RAW_ARTIFACT_DIRECTLY_READ=BLOCKED, the same limitation as
+  every prior round. The figures below are the task's own given,
+  authoritative Run #15 summary - RAW_SERIAL_LOG remains the
+  authoritative source whenever it does become available; this
+  section documents the given summary, never a direct read.
+
+  PROVEN (as given): storage progressed cleanly this round -
+  Filesystem/apply_autoinstall_config ~4128.357s->~4391.429s PASS,
+  stage-partitioning ~4374.873s->~4415.353s PASS, stage-extract
+  ~4502.447s->~5725.360s PASS, curthooks active near the timeout, old
+  target sentinels replaced. RUN15_BLOCK_PROBE_FAILURE=PROVEN_FALSE.
+  This directly demonstrates the Run #13/#14 storage-probe pathology
+  is NOT deterministic - the same storage code can and does complete
+  correctly.
+
+  PROVEN (as given): a genuine 3-attempt snapd.seeded lifecycle -
+  attempt 1 ~422.431s->~581.546s FAIL, attempt 2
+  ~1715.404s->~2401.800s FAIL, attempt 3 ~2629.471s->~3871.714s
+  SUCCESS (seed_attempt_count=3, unstable_seed_window≈3449.28s
+  ≈57m29s) - with the same critical sequence as Runs #7/#11/#12: a
+  desktop-security-center configure-hook failure (~821.731s), an
+  associated sanity timeout (~821.747s), RemoveSnapServices beginning
+  (~840.715s), `/snap/snapd/current` going missing (~1726.219s), and
+  eventual stable recovery (~3871.714s).
+  RUN15_CATASTROPHIC_SNAP_LIFECYCLE_RECURRED=PROVEN.
+
+  Historical recurrence now spans Runs #7, #11, #12, #15 (pathological)
+  against Runs #8, #9, #10, #13, #14 (normal) -
+  RECURRING_NONDETERMINISTIC_PATHOLOGY=PROVEN, not a one-off outlier.
+  The exact differentiating variable between the two groups remains
+  genuinely unknown from evidence available in this environment -
+  SNAP_ROOT_CAUSE_STATUS=NOT_OBSERVED (the same honest conclusion
+  reached in R11/R12, for the same reason: no raw serial log, no
+  snapd Change/Task API access, and no local real-QEMU reproduction
+  capability to establish a specific, narrow, deterministic trigger).
+
+  S7.1R15 fixes (observability-only, per this round's own explicit
+  decision principle - the last corrective must diagnose BOTH
+  pathology families, not optimize for whichever happened most
+  recently):
+
+  1. Objective B: the guest-side evidence watcher
+     (`serein.installer.renderer._qa_evidence_watcher_script`) now
+     also polls the guest's own systemd journal (a single bounded
+     `journalctl -n 200` fetch per 10s iteration, never a fresh
+     invocation per signal) for the five known snap-pathology signals
+     above, exporting one bounded `SEREIN SNAP FAILURE FRAME` through
+     the same QA-only, one-way virtio-serial port the R14 crash
+     watcher already uses - at most once per signal per run
+     (`QA_EVIDENCE_MAX_SNAP_FRAMES=5`,
+     `QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME=8192`). Genuinely
+     unavailable diagnostic state (no user session/DBus for the
+     portal check, no snapd.hold unit, etc.) reads as `NOT_OBSERVED`,
+     never fabricated. `installer/scripts/extract-guest-evidence.sh`
+     now parses both block kinds from the same raw evidence log,
+     producing `qa-install-snap-failure-frame-N.txt` artifacts
+     alongside the existing crash artifacts - Run #16 (or any future
+     run) can now diagnose EITHER pathology family, BOTH, or NEITHER
+     without requiring another observability-only round.
+  2. Section 16: fixed a real field-name collision Run #15 exposed -
+     `run-qa-install.sh`'s own `_write_result` and
+     `extract-guest-evidence.sh` both called a field "present" while
+     meaning two different things (`[ -s ... ]` nonempty-only vs.
+     `[ -f ... ]` exists-only - a real QEMU chardev `file` backend
+     creates the file the instant it opens it, so "exists" is
+     trivially true almost immediately regardless of whether the
+     guest watcher ever wrote anything). Split into
+     `guest_evidence_log_exists`/`guest_evidence_log_nonempty` in
+     both producers - never overloaded again.
+
+  Per Section 10's explicit 10-point mitigation-eligibility checklist,
+  a narrow functional snap-lifecycle mitigation was NOT implemented
+  this round - the same blockers as R11/R12 apply
+  (QA_ONLY_MITIGATION_ACCEPTABLE=false): no raw serial log, no snapd
+  Change/Task API access, and no local real-QEMU reproduction
+  capability to independently establish a specific, narrow,
+  deterministic trigger before any mitigation could be safely
+  proposed. SNAP_MITIGATION_IMPLEMENTED=false.
+  DESKTOP_SECURITY_CENTER_MITIGATION=NOT_IMPLEMENTED (Section 12's own
+  proof requirements are not met from evidence available in this
+  environment). SNAPD_SEEDED_FAKED=false.
+
+  Explicitly NOT done this pass: QEMU timeout (6600s) and job timeout
+  (270min) both UNCHANGED - Run #15 spent ~3449s in the snap
+  pathology before meaningful storage progress could even begin, so
+  it does NOT fairly test whether 6600s is sufficient for a normal
+  bootstrap path; changing either timeout now would hide the
+  pathology rather than address it. Storage selection, protected-disk
+  visibility, target fixture layout, storage YAML grammar, and the
+  R14 block-probe evidence path are all unchanged - confirmed via
+  diff against the exact pre-head commit.
+```
+
 ## Real Layer-B validation status (S7.1R13)
 
 **Thirteen real Installer Layer-B runs have occurred.** Run #13

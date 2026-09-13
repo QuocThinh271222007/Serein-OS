@@ -231,8 +231,21 @@ _write_result() {
     # is real NOT_OBSERVED evidence (e.g. the guest never reached the
     # point where its early-commands watcher starts), never silently
     # treated as success.
-    local guest_evidence_present="false"
-    [ -s "${GUEST_EVIDENCE_LOG}" ] && guest_evidence_present="true"
+    #
+    # S7.1R15 Section 16: real Run #15 exposed a genuine field-name
+    # collision - this script called `[ -s ... ]` (nonexistent-OR-empty
+    # both count as false) "present", while
+    # extract-guest-evidence.sh's own "present" meant merely `[ -f ]`
+    # (exists, even if empty) - the QEMU chardev backend itself creates
+    # the file the instant QEMU opens it, so "exists" is trivially true
+    # almost immediately regardless of whether the guest watcher ever
+    # wrote anything, while "has real content" is the actually
+    # meaningful signal. Split into two separate, honestly-named
+    # fields - never overloaded again.
+    local guest_evidence_exists="false"
+    [ -f "${GUEST_EVIDENCE_LOG}" ] && guest_evidence_exists="true"
+    local guest_evidence_nonempty="false"
+    [ -s "${GUEST_EVIDENCE_LOG}" ] && guest_evidence_nonempty="true"
     cat > "${RESULT_ENV}" <<EOF
 qemu_exit_status=${status}
 qemu_accelerator=${ACCEL}
@@ -246,7 +259,8 @@ qemu_elapsed_seconds=${elapsed}
 failure_stage=${stage}
 installer_userspace_reached=${userspace}
 serial_log_present=${serial_present}
-guest_evidence_log_present=${guest_evidence_present}
+guest_evidence_log_exists=${guest_evidence_exists}
+guest_evidence_log_nonempty=${guest_evidence_nonempty}
 EOF
 }
 

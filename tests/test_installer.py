@@ -90,7 +90,9 @@ from serein.installer.payload import (
 from serein.installer.planner import build_install_plan, validate_plan
 from serein.installer.renderer import (
     QA_EVIDENCE_MAX_BYTES_PER_CRASH,
+    QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME,
     QA_EVIDENCE_MAX_CRASH_FILES,
+    QA_EVIDENCE_MAX_SNAP_FRAMES,
     QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES,
     QA_EVIDENCE_PORT_PATH,
     QA_EVIDENCE_WATCHER_MAX_ITERATIONS,
@@ -851,6 +853,101 @@ class TestQaEvidenceGuestProducer:
             ["bash", "-n", "-c", script], capture_output=True, text=True
         )
         assert result.returncode == 0, result.stderr
+
+    # -- S7.1R15 Objective B - the snap/bootstrap-pathology watcher --
+
+    def test_watcher_checks_all_five_known_snap_pathology_signals(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert "desktop-security-center" in script
+        assert "sanity timeout" in script
+        assert "RemoveSnapServices" in script
+        assert "/snap/snapd/current" in script
+        assert "snapd.seeded" in script
+
+    def test_watcher_snap_frame_uses_the_specified_section_headers(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        for header in (
+            "=== SEREIN SNAP FAILURE FRAME ===",
+            "[SNAP_STATE]", "[SNAPD]", "[DESKTOP_SECURITY_CENTER]",
+            "[SNAPD_HOLD]", "[PORTAL_STATE]", "[SNAP_CURRENT]",
+            "[JOURNAL_CONTEXT]", "=== END FRAME ===",
+        ):
+            assert header in script
+
+    def test_watcher_snap_frame_bounded_and_deduplicated(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert f"MAX_SNAP_FRAMES={QA_EVIDENCE_MAX_SNAP_FRAMES}" in script
+        assert f"MAX_BYTES_PER_SNAP_FRAME={QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME}" in script
+        assert 'snap_frame_count=$((snap_frame_count + 1))' in script
+        # each trigger's own dedup key is recorded in the SAME `seen`
+        # list already used for crash-file dedup - one shared
+        # mechanism, never a second independent one.
+        assert 'seen="$seen $key"' in script
+
+    def test_watcher_never_guesses_unavailable_snap_diagnostic_state(self):
+        # Section 12/14: portal/snapd.hold state genuinely unavailable
+        # (e.g. no user session, no DBus) must read as NOT_OBSERVED,
+        # never fabricated or left blank.
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert 'hold_state="NOT_OBSERVED"' in script
+        assert 'portal_state="NOT_OBSERVED"' in script
+        assert 'snap_state="NOT_OBSERVED"' in script
+        assert 'dsc_state="NOT_OBSERVED"' in script
+        assert 'journal_ctx="NOT_OBSERVED"' in script
+
+    def test_watcher_snap_current_missing_reads_as_missing_never_fabricated(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert 'snap_current="MISSING"' in script
+
+    def test_watcher_never_intentionally_triggers_any_pathology(self):
+        # Section 6: observation only - the watcher must never contain
+        # any command capable of STARTING, STOPPING, or otherwise
+        # mutating a snap/systemd unit (only read-only inspection
+        # verbs).
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        forbidden = (
+            "systemctl start", "systemctl stop", "systemctl restart",
+            "systemctl mask", "systemctl kill", "snap install",
+            "snap remove", "snap refresh", "snap abort", "snap disable",
+        )
+        for token in forbidden:
+            assert token not in script, f"forbidden mutating command {token!r} found"
+
+    def test_watcher_snap_pathology_check_guarded_by_same_port_availability_check(self):
+        # The expensive journal/snap/systemctl introspection must only
+        # ever run inside the SAME `[ -e "$PORT" ] && [ -w "$PORT" ]`
+        # guard the crash-file watcher already uses - never run
+        # unconditionally regardless of whether the sink exists.
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        guard_idx = script.index('if [ -e "$PORT" ] && [ -w "$PORT" ]; then')
+        journal_idx = script.index("recent_journal=$(journalctl")
+        end_idx = script.rindex("    fi\n    i=$((i + 1))")
+        assert guard_idx < journal_idx < end_idx
+
+    def test_watcher_never_uses_set_dash_e_so_one_failing_diagnostic_never_aborts(self):
+        # Section 21 "non-blocking diagnostic failure": the watcher
+        # uses `set -u` only, never `set -e` - a single failing
+        # journalctl/snap/systemctl probe must never abort the whole
+        # watcher (each call already has its own `2>/dev/null` +
+        # fallback default, but this is the structural backstop).
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        assert script.splitlines()[1] == "set -u"
+        assert "set -e" not in script
+
+    def test_watcher_snap_frame_never_uses_network_or_host_commands(self):
+        doc = self._rendered_doc()
+        script = self._decoded_watcher_script(doc)
+        forbidden = ("curl", "wget", "nc ", "ssh ", "scp ", "ftp ", "python", "eval ")
+        for token in forbidden:
+            assert token not in script
 
 
 # ---------------------------------------------------------------------------
@@ -2483,20 +2580,37 @@ class TestRunQaInstallScript:
         assert result.returncode == 0
         env = self._result_env(fixtures)
         assert "qa-install-guest-evidence.log" in env["qemu_guest_evidence_log_path"]
-        # No fake QEMU ever actually writes to the evidence file (it is
+        # No fake QEMU ever actually creates the evidence file (it is
         # not real QEMU), so the honest observation is "absent" -
         # never fabricated as present.
-        assert env["guest_evidence_log_present"] == "false"
+        assert env["guest_evidence_log_exists"] == "false"
+        assert env["guest_evidence_log_nonempty"] == "false"
 
-    def test_r14_guest_evidence_present_when_file_has_content(self, tmp_path):
+    def test_r15_guest_evidence_exists_but_empty_is_a_distinct_state(self, tmp_path):
+        # S7.1R15 Section 16: real Run #15 exposed a genuine field-name
+        # collision between this script (which meant "has real
+        # content") and extract-guest-evidence.sh (which meant "the
+        # file exists at all, even empty") both under the name
+        # "present". A real QEMU chardev `file` backend creates the
+        # file the instant it opens it - exists=true is trivially true
+        # almost immediately, independent of whether the guest watcher
+        # ever wrote anything.
+        result, fixtures = self._run(tmp_path, "pass")
+        assert result.returncode == 0
+        log_path = fixtures / "qa-install-guest-evidence.log"
+        log_path.write_text("")
+        assert log_path.exists()
+        assert log_path.stat().st_size == 0
+
+    def test_r14_guest_evidence_nonempty_when_file_has_content(self, tmp_path):
         result, fixtures = self._run(tmp_path, "pass")
         assert result.returncode == 0
         (fixtures / "qa-install-guest-evidence.log").write_text("some real evidence\n")
-        # Re-derive presence the same way the script does (a direct,
-        # minimal re-check - the script itself already wrote its
-        # result before we injected content, so this proves the
-        # underlying file-presence semantics the script's own
-        # `[ -s ... ]` check relies on, without re-running QEMU).
+        # Re-derive nonempty-ness the same way the script does (a
+        # direct, minimal re-check - the script itself already wrote
+        # its result before we injected content, so this proves the
+        # underlying semantics the script's own `[ -s ... ]` check
+        # relies on, without re-running QEMU).
         assert (fixtures / "qa-install-guest-evidence.log").stat().st_size > 0
 
     def test_r14_no_socket_or_network_chardev_anywhere_in_script(self):
@@ -4437,6 +4551,21 @@ class TestExtractGuestEvidenceScript:
             "===END-CRASH-EVIDENCE===\n"
         )
 
+    def _snap_frame(self, trigger: str, *, journal_ctx: str = "NOT_OBSERVED"):
+        return (
+            "=== SEREIN SNAP FAILURE FRAME ===\n"
+            "timestamp=821.747\n"
+            f"trigger={trigger}\n"
+            "\n[SNAP_STATE]\nNOT_OBSERVED\n"
+            "\n[SNAPD]\nactive\n"
+            "\n[DESKTOP_SECURITY_CENTER]\nNOT_OBSERVED\n"
+            "\n[SNAPD_HOLD]\nNOT_OBSERVED\n"
+            "\n[PORTAL_STATE]\nNOT_OBSERVED\n"
+            "\n[SNAP_CURRENT]\nMISSING\n"
+            f"\n[JOURNAL_CONTEXT]\n{journal_ctx}\n"
+            "=== END FRAME ===\n"
+        )
+
     def _outputs(self, tmp_path: Path, log_content: str | None) -> tuple[dict[str, str], Path]:
         log_path = tmp_path / "qa-install-guest-evidence.log"
         if log_content is not None:
@@ -4455,14 +4584,22 @@ class TestExtractGuestEvidenceScript:
 
     def test_guest_evidence_device_absent_is_honest_not_fabricated(self, tmp_path):
         outputs, crash_dir = self._outputs(tmp_path, None)
-        assert outputs["guest_evidence_log_present"] == "false"
+        assert outputs["guest_evidence_log_exists"] == "false"
+        assert outputs["guest_evidence_log_nonempty"] == "false"
         assert outputs["guest_evidence_crash_block_count"] == "0"
         assert list(crash_dir.glob("*.txt")) == []
 
-    def test_guest_evidence_log_present_but_empty(self, tmp_path):
+    def test_guest_evidence_log_exists_but_empty(self, tmp_path):
         outputs, _crash_dir = self._outputs(tmp_path, "")
-        assert outputs["guest_evidence_log_present"] == "true"
+        assert outputs["guest_evidence_log_exists"] == "true"
+        assert outputs["guest_evidence_log_nonempty"] == "false"
         assert outputs["guest_evidence_crash_block_count"] == "0"
+
+    def test_guest_evidence_log_exists_and_nonempty(self, tmp_path):
+        log = self._block("a.crash", "content")
+        outputs, _crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_log_exists"] == "true"
+        assert outputs["guest_evidence_log_nonempty"] == "true"
 
     def test_one_crash_block_parsed_into_its_own_file(self, tmp_path):
         log = self._block("a.crash", "Traceback: block probe failed")
@@ -4543,6 +4680,99 @@ class TestExtractGuestEvidenceScript:
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert (tmp_path / "qa-install-block-probe-crash-1.txt").exists()
+
+    # -- S7.1R15 Objective B - snap-pathology frame parsing --
+
+    def test_one_snap_frame_parsed_into_its_own_file(self, tmp_path):
+        log = self._snap_frame("sanity_timeout", journal_ctx="snapd: sanity timeout")
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_snap_frame_count"] == "1"
+        assert outputs["guest_evidence_snap_triggers"] == "sanity_timeout"
+        frame1 = crash_dir / "qa-install-snap-failure-frame-1.txt"
+        assert frame1.exists()
+        text = frame1.read_text()
+        assert "trigger=sanity_timeout" in text
+        assert "snapd: sanity timeout" in text
+
+    def test_multiple_distinct_snap_triggers_all_captured(self, tmp_path):
+        log = (
+            self._snap_frame("desktop_security_center_hook_failure")
+            + self._snap_frame("sanity_timeout")
+            + self._snap_frame("remove_snap_services")
+            + self._snap_frame("snapd_current_missing")
+            + self._snap_frame("snapd_seeded_failure")
+        )
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_snap_frame_count"] == "5"
+        triggers = outputs["guest_evidence_snap_triggers"].split(",")
+        assert triggers == [
+            "desktop_security_center_hook_failure",
+            "sanity_timeout",
+            "remove_snap_services",
+            "snapd_current_missing",
+            "snapd_seeded_failure",
+        ]
+        assert len(list(crash_dir.glob("qa-install-snap-failure-frame-*.txt"))) == 5
+
+    def test_duplicate_snap_trigger_deduplicated(self, tmp_path):
+        log = self._snap_frame("sanity_timeout") + self._snap_frame("sanity_timeout")
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_snap_frame_count"] == "1"
+        assert len(list(crash_dir.glob("qa-install-snap-failure-frame-*.txt"))) == 1
+
+    def test_snap_frame_count_bounded_and_truncation_recorded(self, tmp_path):
+        log = "".join(self._snap_frame(f"trigger_{i}") for i in range(8))
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_snap_frame_count"] == "8"
+        assert outputs["guest_evidence_snap_frame_truncated"] == "true"
+        assert len(list(crash_dir.glob("qa-install-snap-failure-frame-*.txt"))) == 5
+
+    def test_malformed_snap_frame_missing_end_marker_is_a_parse_error(self, tmp_path):
+        log = "=== SEREIN SNAP FAILURE FRAME ===\ntrigger=sanity_timeout\n"
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_parse_error_count"] == "1"
+        assert outputs["guest_evidence_snap_frame_count"] == "0"
+        assert list(crash_dir.glob("qa-install-snap-failure-frame-*.txt")) == []
+
+    def test_snap_frame_missing_trigger_is_a_parse_error(self, tmp_path):
+        log = "=== SEREIN SNAP FAILURE FRAME ===\ntimestamp=1.0\n=== END FRAME ===\n"
+        outputs, _crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_parse_error_count"] == "1"
+        assert outputs["guest_evidence_snap_frame_count"] == "0"
+
+    # -- S7.1R15 Section 22 - dual-path evidence: the producer must
+    # remain valid whether it observed only the block-probe pathology,
+    # only the snap pathology, both, or neither. --
+
+    def test_dual_path_only_block_probe_pathology(self, tmp_path):
+        log = self._block("a.crash", "content")
+        outputs, _crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "1"
+        assert outputs["guest_evidence_snap_frame_count"] == "0"
+        assert outputs["guest_evidence_snap_triggers"] == ""
+
+    def test_dual_path_only_snap_pathology(self, tmp_path):
+        log = self._snap_frame("sanity_timeout")
+        outputs, _crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "0"
+        assert outputs["guest_evidence_snap_frame_count"] == "1"
+
+    def test_dual_path_both_pathologies(self, tmp_path):
+        log = self._block("a.crash", "content") + self._snap_frame("sanity_timeout")
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "1"
+        assert outputs["guest_evidence_snap_frame_count"] == "1"
+        assert (crash_dir / "qa-install-block-probe-crash-1.txt").exists()
+        assert (crash_dir / "qa-install-snap-failure-frame-1.txt").exists()
+
+    def test_dual_path_neither_pathology(self, tmp_path):
+        log = "ordinary console noise with no evidence blocks at all\n"
+        outputs, crash_dir = self._outputs(tmp_path, log)
+        assert outputs["guest_evidence_crash_block_count"] == "0"
+        assert outputs["guest_evidence_snap_frame_count"] == "0"
+        assert outputs["guest_evidence_log_exists"] == "true"
+        assert outputs["guest_evidence_log_nonempty"] == "true"
+        assert list(crash_dir.glob("*.txt")) == []
 
 
 # ---------------------------------------------------------------------------
