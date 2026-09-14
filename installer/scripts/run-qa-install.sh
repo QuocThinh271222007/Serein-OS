@@ -214,6 +214,47 @@ _userspace_reached() {
     fi
 }
 
+# _installer_progress_observed <log-path> - S7.1R18 Objective B: real,
+# STRONG, POSITIVE evidence the real installer path was actually
+# entered - a clean QEMU exit (status 0) alone is NEVER sufficient
+# proof of a successful installation. Real Run #18 (RUN_ID=34812057869)
+# proved a genuinely early guest shutdown - the systemd.run-generator's
+# own default success action tearing down the live session the instant
+# kernel-command-line.service completed, entirely before snapd,
+# Subiquity, or autoinstall ever started - produces a qemu_exit_status=0
+# INDISTINGUISHABLE from a real, completed install unless the serial
+# log content itself is checked.
+#
+# Requires BOTH of two independent, already-proven real Subiquity/
+# curtin markers, reused VERBATIM from this project's own established,
+# tested patterns (never invented fresh):
+#   - `apply_autoinstall_config` - the exact real Subiquity milestone
+#     pattern extract-bootstrap-milestones.sh's own MILESTONE_PATTERNS
+#     already uses for `subiquity_apply`;
+#   - curtin's own real `start: cmd-install/stage-partitioning`
+#     event-logging convention - the exact real, order-independent
+#     AND-chain discipline extract-storage-probe-forensics.sh's own
+#     header already established ("an apt-config mention alone is
+#     explicitly NEVER treated as partitioning evidence" - the SAME
+#     real, named prior mistake this helper must not repeat).
+#
+# A genuinely completed installation necessarily passes through BOTH
+# markers before ever reaching late-commands/poweroff; Run #18's entire
+# class of early-shutdown defect reaches neither. `grep -Eq` (quiet,
+# boolean) is deliberately used here rather than any timestamp
+# extraction - this is a pure PASS/FAIL gate, not a forensic summary
+# (the actual timestamps remain available separately via
+# extract-bootstrap-milestones.sh/extract-storage-probe-forensics.sh,
+# both still purely diagnostic and never a gate in their own right).
+_installer_progress_observed() {
+    local log="$1"
+    [ -f "${log}" ] || return 1
+    grep -Eq 'apply_autoinstall_config' "${log}" 2>/dev/null || return 1
+    grep -Eq 'start:' "${log}" 2>/dev/null || return 1
+    grep -Eq 'stage-partitioning' "${log}" 2>/dev/null || return 1
+    return 0
+}
+
 # _write_result <exit-status> <failure-stage> <qemu-started> <elapsed-seconds>
 # Always writes the full required evidence field set (Section 7),
 # regardless of which exit path got here - `failure_stage` is empty on
@@ -347,9 +388,24 @@ END_TIME=$(date +%s)
 ELAPSED_SECONDS=$((END_TIME - START_TIME))
 
 if [ "${STATUS}" -eq 0 ]; then
-    _write_result 0 "" "${QEMU_STARTED}" "${ELAPSED_SECONDS}"
-    echo "PASS: QA autoinstall run completed (QEMU exited cleanly)"
-    exit 0
+    # S7.1R18 Objective B: a clean QEMU exit is a necessary transport
+    # condition, never sufficient evidence of installation success on
+    # its own (real Run #18 proof - see _installer_progress_observed's
+    # own docstring for the full defect). failure_stage remains a
+    # SEPARATE fact from qemu_exit_status - the exact classification
+    # Section 4 requires: a real, distinct primary-failure stage can
+    # coexist with qemu_exit_status=0.
+    if _installer_progress_observed "${SERIAL_LOG}"; then
+        _write_result 0 "" "${QEMU_STARTED}" "${ELAPSED_SECONDS}"
+        echo "PASS: QA autoinstall run completed (QEMU exited cleanly, real installer progress observed)"
+        exit 0
+    fi
+    echo "::error::QEMU exited cleanly (status=0) but no real installer progress was observed in" \
+         "the serial log - a clean exit alone is NEVER sufficient proof of installation success" \
+         "(Run #18, RUN_ID=34812057869: the guest can power off before autoinstall ever starts)" >&2
+    _print_diagnostic_tail
+    _write_result 0 "installer_not_observed" "${QEMU_STARTED}" "${ELAPSED_SECONDS}"
+    exit 1
 fi
 
 _print_diagnostic_tail

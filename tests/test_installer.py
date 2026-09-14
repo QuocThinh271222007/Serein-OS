@@ -72,6 +72,8 @@ from serein.installer.isoprep import (
     QA_EVIDENCE_WATCHER_ISO_FILENAME,
     AutoinstallBootError,
     IsoPrepError,
+    _disable_qa_evidence_launcher_failure_action_on_qa_entry,
+    _disable_qa_evidence_launcher_success_action_on_qa_entry,
     _enable_autoinstall_on_qa_entry,
     _enable_journald_console_forwarding_on_qa_entry,
     _enable_qa_evidence_launcher_on_qa_entry,
@@ -2679,7 +2681,18 @@ def _make_fake_qemu(bin_dir: Path) -> None:
       pass                - accepts the probe (stays alive, frozen,
                              the whole probe window); the real run
                              stays alive past the grace window, then
-                             exits 0.
+                             exits 0 WITHOUT writing anything to the
+                             serial log - S7.1R18's own exact Run #18
+                             reproduction: a clean exit with zero real
+                             installer-progress evidence.
+      pass_with_install_progress - same probe/grace behavior as `pass`;
+                             before exiting 0, writes the two real,
+                             established Subiquity/curtin progress
+                             markers (`apply_autoinstall_config`,
+                             `start: cmd-install/stage-partitioning`)
+                             into the `-serial file:...` path parsed
+                             out of its own real argv - a synthetic
+                             stand-in for a genuinely completed install.
       run_fail            - same probe behavior as `pass`; the real
                              run stays alive past the grace window,
                              then exits non-zero.
@@ -2697,12 +2710,29 @@ def _make_fake_qemu(bin_dir: Path) -> None:
         'echo "$@" >> "${FAKE_QEMU_ARGV_FILE:?}"\n'
         "IS_PROBE=false\n"
         'for a in "$@"; do [ "$a" = "-S" ] && IS_PROBE=true; done\n'
+        "_serial_path() {\n"
+        '    local prev=""\n'
+        '    for a in "$@"; do\n'
+        '        if [ "$prev" = "-serial" ]; then printf "%s" "${a#file:}"; return 0; fi\n'
+        '        prev="$a"\n'
+        "    done\n"
+        "}\n"
         'case "${FAKE_QEMU_BEHAVIOR:-pass}" in\n'
         "  probe_fail)\n"
         '    echo "fake: invalid command line or device model" >&2\n'
         "    exit 1 ;;\n"
         "  pass)\n"
         '    if [ "${IS_PROBE}" = "true" ]; then exec sleep 1000; fi\n'
+        '    sleep "${FAKE_QEMU_RUN_SLEEP:-2}"; exit 0 ;;\n'
+        "  pass_with_install_progress)\n"
+        '    if [ "${IS_PROBE}" = "true" ]; then exec sleep 1000; fi\n'
+        '    SERIAL_PATH="$(_serial_path "$@")"\n'
+        '    if [ -n "${SERIAL_PATH}" ]; then\n'
+        '        printf "[   10.000000] subiquity: apply_autoinstall_config\\n" '
+        '>> "${SERIAL_PATH}"\n'
+        '        printf "[   20.000000] start: cmd-install/stage-partitioning\\n" '
+        '>> "${SERIAL_PATH}"\n'
+        "    fi\n"
         '    sleep "${FAKE_QEMU_RUN_SLEEP:-2}"; exit 0 ;;\n'
         "  run_fail)\n"
         '    if [ "${IS_PROBE}" = "true" ]; then exec sleep 1000; fi\n'
@@ -2846,7 +2876,11 @@ class TestRunQaInstallScript:
         assert "qa-install-guest-evidence.log" in chardev_arg
 
     def test_r14_result_env_reports_guest_evidence_log_path_and_presence(self, tmp_path):
-        result, fixtures = self._run(tmp_path, "pass")
+        # S7.1R18: "pass" alone no longer returns 0 without real
+        # installer progress - this test is about the guest-evidence
+        # path/presence fields, orthogonal to installer-success
+        # classification, so it uses the progress-bearing behavior.
+        result, fixtures = self._run(tmp_path, "pass_with_install_progress")
         assert result.returncode == 0
         env = self._result_env(fixtures)
         assert "qa-install-guest-evidence.log" in env["qemu_guest_evidence_log_path"]
@@ -2865,7 +2899,7 @@ class TestRunQaInstallScript:
         # file the instant it opens it - exists=true is trivially true
         # almost immediately, independent of whether the guest watcher
         # ever wrote anything.
-        result, fixtures = self._run(tmp_path, "pass")
+        result, fixtures = self._run(tmp_path, "pass_with_install_progress")
         assert result.returncode == 0
         log_path = fixtures / "qa-install-guest-evidence.log"
         log_path.write_text("")
@@ -2873,7 +2907,7 @@ class TestRunQaInstallScript:
         assert log_path.stat().st_size == 0
 
     def test_r14_guest_evidence_nonempty_when_file_has_content(self, tmp_path):
-        result, fixtures = self._run(tmp_path, "pass")
+        result, fixtures = self._run(tmp_path, "pass_with_install_progress")
         assert result.returncode == 0
         (fixtures / "qa-install-guest-evidence.log").write_text("some real evidence\n")
         # Re-derive nonempty-ness the same way the script does (a
@@ -2961,8 +2995,30 @@ class TestRunQaInstallScript:
         env = self._result_env(fixtures)
         assert env["failure_stage"] == "installer_timeout"
 
-    def test_real_pass_records_no_failure_stage(self, tmp_path):
+    # -- S7.1R18 Objective B: a clean QEMU exit alone is NEVER
+    # sufficient proof of installation success - real Run #18
+    # (RUN_ID=34812057869) proved the guest can power off cleanly
+    # (qemu_exit_status=0) entirely before snapd/Subiquity/autoinstall
+    # ever start. --
+
+    def test_clean_exit_without_installer_progress_is_fail_not_pass(self, tmp_path):
+        # The exact real Run #18 reproduction: QEMU exits 0, but the
+        # serial log never shows real Subiquity/curtin progress (the
+        # fake QEMU's own `pass` behavior never writes anything to the
+        # serial log) - this must now FAIL, never PASS.
         result, fixtures = self._run(tmp_path, "pass", run_sleep=2)
+        assert result.returncode != 0
+        env = self._result_env(fixtures)
+        assert env["qemu_exit_status"] == "0"
+        assert env["qemu_started"] == "true"
+        assert env["failure_stage"] == "installer_not_observed"
+
+    def test_clean_exit_with_real_installer_progress_still_passes(self, tmp_path):
+        # A synthetic valid completed-install scenario (Section 9.H) -
+        # the fake QEMU writes the two real, established progress
+        # markers into the serial log before exiting 0 - this must
+        # still PASS.
+        result, fixtures = self._run(tmp_path, "pass_with_install_progress", run_sleep=2)
         assert result.returncode == 0
         env = self._result_env(fixtures)
         assert env["failure_stage"] == ""
@@ -5290,6 +5346,11 @@ class TestIsoPrep:
         # Run #17 regression - see this module's own docstrings). --
         assert f"systemd.run=/cdrom/{QA_EVIDENCE_LAUNCHER_ISO_FILENAME}" in qa_entry_body
         assert f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}" not in qa_entry_body
+        # -- S7.1R18 corrective: the launcher's own completion must
+        # never tear down the live environment (real Run #18
+        # regression) - both explicit non-exit actions present. --
+        assert "systemd.run_success_action=none" in qa_entry_body
+        assert "systemd.run_failure_action=none" in qa_entry_body
         launcher_path = extracted / QA_EVIDENCE_LAUNCHER_ISO_FILENAME
         assert launcher_path.is_file()
         launcher_text = launcher_path.read_text(encoding="utf-8")
@@ -5312,6 +5373,8 @@ class TestIsoPrep:
         assert "systemd.journald.forward_to_console" not in other_entry_body
         assert "systemd.mask" not in other_entry_body
         assert "systemd.run" not in other_entry_body
+        assert "systemd.run_success_action" not in other_entry_body
+        assert "systemd.run_failure_action" not in other_entry_body
 
     def test_missing_source_iso_fails_closed(self, tmp_path):
         with pytest.raises(IsoPrepError):
@@ -5526,6 +5589,8 @@ class TestEnableQaEvidenceLauncherOnQaEntry:
         patched = _enable_systemd_debug_logging_on_qa_entry(patched)
         patched = _mask_firmware_notifier_on_qa_entry(patched)
         patched = _enable_qa_evidence_launcher_on_qa_entry(patched)
+        patched = _disable_qa_evidence_launcher_success_action_on_qa_entry(patched)
+        patched = _disable_qa_evidence_launcher_failure_action_on_qa_entry(patched)
         qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
         for token in (
             "autoinstall",
@@ -5533,8 +5598,78 @@ class TestEnableQaEvidenceLauncherOnQaEntry:
             "systemd.log_level=debug",
             "systemd.mask=snap.firmware-updater.firmware-notifier.service",
             f"systemd.run=/cdrom/{QA_EVIDENCE_LAUNCHER_ISO_FILENAME}",
+            "systemd.run_success_action=none",
+            "systemd.run_failure_action=none",
         ):
             assert token in qa_body
+
+
+class TestDisableQaEvidenceLauncherExitActionsOnQaEntry:
+    """S7.1R18 corrective: real regression coverage for the exact Run
+    #18 defect (RUN_ID=34812057869) - the launcher completed
+    successfully in well under a second, but the
+    systemd-run-generator's own default success action then powered
+    the whole live environment off before snapd/Subiquity/autoinstall
+    ever started. Both explicit non-exit action tokens must be present
+    on the QA entry and absent from production."""
+
+    def test_success_action_token_present_and_set_to_none(self):
+        patched = _disable_qa_evidence_launcher_success_action_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        assert re.search(r"(?<!\S)systemd\.run_success_action=none(?!\S)", linux_line)
+
+    def test_failure_action_token_present_and_set_to_none(self):
+        patched = _disable_qa_evidence_launcher_failure_action_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        assert re.search(r"(?<!\S)systemd\.run_failure_action=none(?!\S)", linux_line)
+
+    def test_inserted_before_init_arg_separator_never_after(self):
+        patched = _disable_qa_evidence_launcher_success_action_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        patched = _disable_qa_evidence_launcher_failure_action_on_qa_entry(patched)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        before_sep, _, after_sep = linux_line.partition("---")
+        assert "systemd.run_success_action=none" in before_sep
+        assert "systemd.run_failure_action=none" in before_sep
+        assert "systemd.run_success_action" not in after_sep
+        assert "systemd.run_failure_action" not in after_sep
+
+    def test_idempotent_no_duplicate_on_second_call(self):
+        once = _disable_qa_evidence_launcher_success_action_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        twice = _disable_qa_evidence_launcher_success_action_on_qa_entry(once)
+        assert once == twice
+        qa_body = twice.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        assert qa_body.count("systemd.run_success_action=none") == 1
+
+    def test_unrelated_production_entry_never_touched(self):
+        patched = _disable_qa_evidence_launcher_success_action_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        patched = _disable_qa_evidence_launcher_failure_action_on_qa_entry(patched)
+        other_body = patched.split('menuentry "Try or Install Ubuntu"')[1]
+        assert "systemd.run_success_action" not in other_body
+        assert "systemd.run_failure_action" not in other_body
+
+    def test_missing_entry_title_fails_closed(self):
+        with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
+            _disable_qa_evidence_launcher_success_action_on_qa_entry(
+                _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
+            )
+        with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
+            _disable_qa_evidence_launcher_failure_action_on_qa_entry(
+                _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
+            )
+
+    def test_action_value_is_the_real_documented_none_never_invented(self):
+        # `none` is systemd's own real, documented SuccessAction=/
+        # FailureAction= no-op value - never a guessed string like
+        # "noop"/"ignore"/"skip".
+        patched = _disable_qa_evidence_launcher_success_action_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        patched = _disable_qa_evidence_launcher_failure_action_on_qa_entry(patched)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        for forbidden in ("noop", "ignore", "skip"):
+            assert f"systemd.run_success_action={forbidden}" not in qa_body
+            assert f"systemd.run_failure_action={forbidden}" not in qa_body
 
 
 class TestJournaldConsoleForwardingOnQaEntry:

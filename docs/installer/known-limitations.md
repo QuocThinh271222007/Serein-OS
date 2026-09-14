@@ -1,5 +1,115 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R18)
+
+**Eighteen real Installer Layer-B runs have occurred.** Run #18
+(RUN_ID=34812057869, HEAD=bfe69626e2ed80b647eb261747afccf060ae5fa6 -
+the S7.1R17 non-blocking-launcher commit) proved the R17 fix WORKED,
+but exposed a second, distinct instrumentation regression - Run #18 is
+NOT evidence about snap or storage runtime health:
+
+```text
+Run 18 (after S7.1R17):
+  RUN_ID=34812057869
+  HEAD=bfe69626e2ed80b647eb261747afccf060ae5fa6
+  RESULT=FAILURE.
+
+  RUN18_RAW_ARTIFACT_DIRECTLY_READ=BLOCKED - no gh CLI, no local
+  artifact in this environment; the figures below are the task's own
+  given, authoritative Run #18 summary, never an independent read.
+
+  PROVEN (as given): launcher_start_ts≈177.18s,
+  launcher_finish_ts≈177.71s - R17_LAUNCHER_NONBLOCKING_FIX=PROVEN_PASS,
+  the launcher completes in well under a second, exactly as designed.
+  kernel-command-line.service itself STARTED and COMPLETED
+  SUCCESSFULLY. But the live environment then began shutting down
+  almost immediately afterward - snapd_service_first_start,
+  snapd_seeded_first_start, subiquity_autoinstall_extract,
+  subiquity_install_enter, and partitioning_stage_start were all
+  NOT_OBSERVED. QEMU exited cleanly (status 0) because the GUEST
+  powered itself down, entirely before autoinstall ever started.
+  RUN18_AUTOINSTALL_STARTED=PROVEN_FALSE,
+  RUN18_SNAP_PATH_EVALUABLE=false, RUN18_STORAGE_PATH_EVALUABLE=false.
+  Protected-disk safety remained PROVEN_PASS throughout. Target
+  activity alone was NOT installation proof - the old target ESP/data
+  sentinels remained unchanged (TARGET_ACTIVITY=PROVEN,
+  TARGET_OLD_LAYOUT_REPLACED=PROVEN_FALSE).
+
+  Root cause (as given): real, documented
+  ``systemd-run-generator(8)`` behavior gives the synthesized
+  ``kernel-command-line.service`` unit a default
+  ``SuccessAction=exit`` - once the launcher process exits 0, systemd
+  applies that default action, which on a live/casper boot session (no
+  "next" target to hand control back to, unlike a normal multi-user
+  boot) tears the whole live environment down.
+  SYSTEMD_RUN_DEFAULT_SUCCESS_ACTION_EXIT=PROVEN,
+  RUN18_EARLY_POWER_OFF_CAUSED_BY_INSTRUMENTATION=PROVEN. This is a
+  SEPARATE, DISTINCT defect from R17's own: R17 was the launcher never
+  RETURNING; R18 is the launcher returning SUCCESSFULLY and that
+  success itself terminating the boot.
+
+  Run #18 also exposed a real, latent validation gap this round closes
+  independently of the root cause above: ``run-qa-install.sh``
+  previously treated ANY clean QEMU exit (status 0) as installer
+  PASS - a guest that powers off before autoinstall ever starts
+  produces a qemu_exit_status=0 structurally indistinguishable, from
+  the host side alone, from a genuinely completed install.
+
+  S7.1R18 fixes (two independent hardenings, neither touching snap,
+  storage, or timeout behavior):
+
+  1. Objective A: two new QA-only kernel tokens,
+     ``systemd.run_success_action=none`` and
+     ``systemd.run_failure_action=none`` (real, documented
+     ``systemd-run-generator(8)``/``systemd.special(7)`` no-op action
+     values - never invented strings), chained onto the same QA boot
+     entry the launcher token already patches
+     (``serein.installer.isoprep``). The R17 short-lived-launcher
+     architecture is otherwise completely unchanged - the launcher
+     still hands the watcher off via `systemd-run --no-block
+     --collect`, still carries no `Before=`/`Requires=`/`Wants=` edge
+     to snapd or any other unit, and the watcher itself remains
+     byte-for-byte unchanged.
+  2. Objective B: ``run-qa-install.sh``'s own success classification is
+     hardened with a new ``_installer_progress_observed`` check - a
+     clean QEMU exit (status 0) is now REQUIRED to also show BOTH of
+     two independent, already-proven real Subiquity/curtin markers
+     reused verbatim from this project's own established scripts
+     (`apply_autoinstall_config`, the exact real milestone pattern
+     `extract-bootstrap-milestones.sh` already uses; curtin's own real
+     `start:`/`stage-partitioning` event-logging convention, the exact
+     order-independent AND-chain discipline
+     `extract-storage-probe-forensics.sh` already established) before
+     being classified PASS. Absent either marker, a clean exit is now
+     classified FAIL with a new, explicit `failure_stage=
+     installer_not_observed` - a SEPARATE fact from `qemu_exit_status`,
+     never collapsed into one boolean (Section 4's own requirement).
+     Since the workflow's own downstream steps (target-layout
+     inspection, boot validation, evidence assembly) are ALL already
+     gated on `steps.run-install.outputs.status == 'pass'` (unchanged,
+     pre-existing workflow structure), this one hardening point
+     transitively protects the entire pipeline - Run #18's own
+     "old ESP/data sentinels unchanged" false-positive risk (Section 5
+     of this round's own corrective) can no longer reach evidence
+     assembly at all once installer progress genuinely was never
+     observed, since that later machinery never runs in the first
+     place. No new evidence-schema field, no closure-gate change, no
+     sentinel-fixture change - the existing target-fixture sentinels
+     (`installer/scripts/create-fixture-disks.sh`,
+     `installer/scripts/hash-disk-image.sh`) and the existing
+     `serein_core_present` marker (`/etc/serein/install-state.json`,
+     `installer/scripts/inspect-target-layout.sh`) were already strong,
+     already-proven evidence - this round reuses them rather than
+     inventing a fragile new one.
+
+  RUN18_EARLY_SHUTDOWN_ROOT_CAUSE=PROVEN. No snap, storage, or timeout
+  behavior changed this round - SNAP_MITIGATION_IMPLEMENTED=false,
+  SNAP_RUNTIME_BEHAVIOR_CHANGED=false,
+  STORAGE_RUNTIME_BEHAVIOR_CHANGED=false. QEMU/job timeouts, storage
+  selection, protected-disk visibility, and target fixture layout are
+  all unchanged - confirmed via diff against the exact pre-head commit.
+```
+
 ## Real Layer-B validation status (S7.1R17)
 
 **Seventeen real Installer Layer-B runs have occurred.** Run #17
