@@ -1,5 +1,157 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R19)
+
+**Nineteen real Installer Layer-B runs have occurred.** Run #19
+(RUN_ID=34832918752, JOB_ID=103940172932,
+HEAD=92f6cc90702609eb25cac38489236ba347e0daf7 - the S7.1R18 shutdown-
+semantics/false-pass-hardening commit) proved the R18 fix genuinely
+worked, but exposed a THIRD, distinct instrumentation regression in the
+same `systemd.run=` mechanism family - the launcher/watcher
+architecture itself (R17's short-lived-launcher split, the internal
+`systemd-run --no-block --collect` handoff, all R16 forensic
+capabilities) was never at fault:
+
+```text
+Run 19 (after S7.1R18):
+  RUN_ID=34832918752, JOB_ID=103940172932
+  HEAD=92f6cc90702609eb25cac38489236ba347e0daf7
+  RESULT=FAILURE - failure_stage=installer_timeout
+  (qemu_exit_status=124, qemu_timeout_seconds=6600).
+
+  RUN19_RAW_ARTIFACT_DIRECT_READ=BLOCKED - no gh CLI, no local artifact
+  in this environment; the figures below are the task's own given,
+  authoritative Run #19 summary, never an independent read.
+
+  PROVEN (as given): kernel-command-line.service start ~275.987s,
+  SEREIN_EVIDENCE_WATCHER_STARTED ~277.35s, kernel-command-line.service
+  completed successfully ~277.803s, kernel-command-line.target reached
+  ~277.828s, "system startup reported finished" ~277.875s. The guest
+  then remained ALIVE (never shut down - R18's own fix confirmed
+  working) until the 6600s host timeout. RUN18_EARLY_SHUTDOWN_REGRESSION_FIXED=PROVEN_PASS,
+  EARLY_GUEST_SHUTDOWN=PROVEN_FALSE, WATCHER_STARTED=PROVEN,
+  KERNEL_COMMAND_LINE_SERVICE_COMPLETED=PROVEN,
+  KERNEL_COMMAND_LINE_TARGET_REACHED=PROVEN.
+
+  PROVEN (as given): despite the guest staying alive, normal live boot
+  never progressed into the installer stack -
+  snapd.service/snapd.seeded/Subiquity/autoinstall/Curtin/filesystem-
+  apply/partitioning were all NOT_OBSERVED (seed_attempt_count=0).
+  RUN19_SNAPD_STARTED=PROVEN_FALSE, RUN19_SUBIQUITY_STARTED=PROVEN_FALSE,
+  RUN19_AUTOINSTALL_STARTED=PROVEN_FALSE. Run #19 is NOT evidence about
+  snap or storage health - the installer never reached either path.
+
+  OBSERVATION vs. MECHANISM vs. ROOT CAUSE (kept explicitly separate,
+  per this round's own discipline): the OBSERVATION - the system
+  reaches kernel-command-line.target and remains alive, while the
+  normal live-system services never subsequently start - is PROVEN.
+  The exact internal systemd MECHANISM (most likely,
+  `systemd-run-generator`'s own documented purpose - "run a single
+  command instead of the usual set of services during boot" - retargets
+  this boot's effective default target rather than merely adding an
+  additional peer dependency alongside the normal one) is INFERRED
+  only, never independently verified against a real boot-graph dump or
+  systemd source tree in this development environment. Regardless of
+  the precise mechanism, the real, PROVEN correlation (with
+  `systemd.run=` present, the normal live-session services never
+  start; every historical run before R16 introduced it eventually DID
+  reach them) is sufficient justification to retire the token family
+  entirely.
+
+  Run #19 also confirmed a real, separate host-side observability
+  defect (Section 8 of this round's own corrective): the launcher
+  ALREADY emitted `SEREIN_EVIDENCE_LAUNCHER_STARTED`/`_COMPLETED`
+  markers since S7.1R17, but `extract-guest-evidence.sh` never parsed
+  them - `guest_evidence_watcher_started` could read `true` while the
+  launcher-level fields stayed entirely absent from this script's own
+  output, even though the launcher itself DID run and complete
+  correctly.
+
+  S7.1R19 fixes (boot-integration + observability only - no snap,
+  storage, or timeout change):
+
+  1. Primary corrective: `systemd.run=`, `systemd.run_success_action=`,
+     and `systemd.run_failure_action=` are retired from the QA boot
+     entry entirely - the three functions that ever added them
+     (`_enable_qa_evidence_launcher_on_qa_entry`,
+     `_disable_qa_evidence_launcher_success_action_on_qa_entry`,
+     `_disable_qa_evidence_launcher_failure_action_on_qa_entry`) are
+     deleted from `serein.installer.isoprep`, not merely left unused.
+     The launcher (its own internal `systemd-run --no-block --collect`
+     handoff to the watcher completely UNCHANGED - see
+     `build_qa_evidence_launcher_script`'s own docstring) is instead
+     base64-embedded directly into the rendered `autoinstall.yaml`'s
+     `early-commands` directive - Subiquity's own normal execution
+     point, which structurally cannot disrupt the live session's own
+     boot graph the way a kernel-level generator token can, since it is
+     Subiquity's own already-normal install flow invoking it. This is
+     the EXACT ORIGINAL S7.1R14 mechanism (the same base64-round-trip
+     idiom `_install_state_late_command` still uses for
+     `late-commands`), reused verbatim rather than reinvented.
+
+     **The architecturally preferred alternative was investigated and
+     found infeasible with current tooling**: a real, persisted,
+     boot-graph-integrated QA-only systemd unit (started via
+     `systemd.wants=<unit>`, which - unlike `systemd.run=` - is
+     documented to add an ADDITIONAL peer dependency without touching
+     the real default target) would need a real unit file placed
+     somewhere systemd's unit loader searches early enough to resolve
+     it. This project has NO squashfs-modification tooling (no
+     `unsquashfs`/`mksquashfs` anywhere in this repository or its CI
+     dependencies - the SAME real, already-established constraint
+     `extract-snap-change-forensics.sh`'s own header and this
+     document's own S7.1R7/R12 entries already document) to bake such a
+     unit into the live squashfs at BUILD time, and using `systemd.run=`
+     itself to write that unit file at BOOT time would reintroduce the
+     exact real, proven defect this round exists to fix - a genuine
+     chicken-and-egg constraint given the current toolchain. This is
+     the same class of honestly-documented architectural gap this
+     project has repeatedly acknowledged rather than working around
+     unsafely (S7.1R7/R12's own "materially larger architecture
+     change... deferred" decisions).
+
+     **The honest tradeoff accepted this round**: the watcher now
+     starts LATER (once Subiquity reaches early-commands, itself gated
+     on snapd.seeded having already completed - Subiquity ships as a
+     snap, so it structurally cannot run any earlier) than R16-R18's
+     ~280s aspirational ideal - real-time observation of snapd's own
+     VERY FIRST startup moment is lost this round. But a working,
+     non-blocking watcher that lets the real installer run is strictly
+     more valuable than an earlier one that prevents the installer from
+     running at all (Run #19's own proof) - and it still captures
+     whatever remains of an in-progress snap/bootstrap pathology once
+     Subiquity itself becomes runnable.
+  2. Objective B (the launcher-marker defect): `extract-guest-evidence.sh`
+     now parses `SEREIN_EVIDENCE_LAUNCHER_STARTED`/`_COMPLETED` (with
+     their own `launcher_start_ts=`/`launcher_finish_ts=` fields) using
+     the SAME "await next line" two-line marker+field convention the
+     pre-existing watcher boot marker already used - generalized from a
+     single watcher-only boolean into a named `awaiting_field` state so
+     all three markers (launcher-started, launcher-completed,
+     watcher-started) are correctly, independently recognized in one
+     pass. New `guest_evidence_launcher_started`/`_start_ts`/
+     `_completed`/`_finish_ts` output fields.
+
+  R18's false-pass hardening (`_installer_progress_observed`,
+  `failure_stage=installer_not_observed`) is UNCHANGED and confirmed
+  still correct this round - `run-qa-install.sh` itself has zero diff.
+  A new direct, structural test
+  (`test_installer_progress_observed_never_reads_guest_evidence_log`)
+  proves the exit-0 success gate is computed SOLELY from the serial
+  log, so launcher/watcher boot markers (which live in the guest-
+  evidence log, a completely separate QEMU chardev file) can never
+  satisfy it regardless of content - the exact class of false-positive
+  risk a naive "the QA evidence channel shows activity" heuristic could
+  otherwise introduce.
+
+  SNAP_MITIGATION_IMPLEMENTED=false, SNAP_RUNTIME_BEHAVIOR_CHANGED=false,
+  STORAGE_RUNTIME_BEHAVIOR_CHANGED=false - this round changed ONLY how
+  the launcher is dispatched and fixed a host-side parser gap. Storage
+  selection, protected-disk visibility, target fixture layout, and
+  QEMU/job timeouts are all unchanged - confirmed via diff against the
+  exact pre-head commit.
+```
+
 ## Real Layer-B validation status (S7.1R18)
 
 **Eighteen real Installer Layer-B runs have occurred.** Run #18

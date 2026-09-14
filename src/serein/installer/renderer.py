@@ -83,14 +83,19 @@ QA_EVIDENCE_MAX_FAILED_CHANGE_IDS = 5
 # and never unbounded.
 QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES = 262144
 
-# S7.1R16 Objective A / S7.1R17 corrective: both scripts are embedded
-# as real files at the QA-install ISO's own root (never the squashfs -
-# see prepare_qa_install_iso's own docstring). Named here, not in
-# isoprep.py, since both the launcher script (below) and isoprep's own
-# kernel-token wiring need the SAME two filenames and must never drift
-# apart into two independently-typed string literals.
+# S7.1R16 Objective A / S7.1R17 corrective: the watcher script is
+# embedded as a real file at the QA-install ISO's own root (never the
+# squashfs - see prepare_qa_install_iso's own docstring). Named here,
+# not in isoprep.py, since both the launcher script (below) and
+# isoprep's own file-writing wiring need this SAME filename and must
+# never drift apart into two independently-typed string literals.
+#
+# S7.1R19 corrective: the LAUNCHER is no longer written as a separate
+# ISO-root file - it is base64-embedded directly into an early-commands
+# autoinstall directive instead (see
+# _qa_evidence_launcher_early_command's own docstring for why) - so
+# there is no longer a QA_EVIDENCE_LAUNCHER_ISO_FILENAME constant.
 QA_EVIDENCE_WATCHER_ISO_FILENAME = "serein-qa-early-watcher.sh"
-QA_EVIDENCE_LAUNCHER_ISO_FILENAME = "serein-qa-early-launcher.sh"
 # S7.1R17: the name of the independent, systemd-managed transient unit
 # the launcher hands the long-running watcher off to - see
 # build_qa_evidence_launcher_script's own docstring for the real Run
@@ -578,10 +583,11 @@ def build_qa_evidence_watcher_script() -> str:
 
 
 def build_qa_evidence_launcher_script() -> str:
-    """S7.1R17: the short-lived boot launcher that hands the
-    long-running watcher (:func:`build_qa_evidence_watcher_script`) off
-    to systemd as an independent, PID1-managed transient unit, then
-    exits almost immediately.
+    """S7.1R17 (internal handoff logic unchanged by S7.1R19): the
+    short-lived boot launcher that hands the long-running watcher
+    (:func:`build_qa_evidence_watcher_script`) off to systemd as an
+    independent, PID1-managed transient unit, then exits almost
+    immediately.
 
     **The real Run #17 defect this corrects**: S7.1R16 pointed the
     ``systemd.run=`` kernel token directly at the long-running watcher
@@ -597,36 +603,69 @@ def build_qa_evidence_launcher_script() -> str:
     watcher's own logic (Objectives B-G, block-probe watching, etc. are
     all unchanged this round).
 
-    **The fix**: this script is now the ``systemd.run=`` target instead.
-    It runs `systemd-run --no-block --collect` (a real, documented
-    systemd client command, never a raw shell `&` background job - a
-    backgrounded child of a service's own cgroup is liable to be killed
-    the instant that service's job is torn down, per systemd's default
-    ``KillMode=control-group``; a `systemd-run` transient unit is a
-    genuinely SEPARATE unit/cgroup PID1 manages directly, immune to the
-    launcher's own lifecycle) to start the watcher as
-    ``serein-qa-evidence-watcher.service`` - a unit this launcher never
-    waits on (``--no-block`` returns the instant the job is QUEUED, not
-    once the watcher finishes) and never links into any other unit's
-    dependency graph (no ``Before=``/``Requires=``/``Wants=`` naming
-    snapd or any other target anywhere in this codebase - the watcher
-    OBSERVES snapd, it never gates it). ``--collect`` tells systemd to
-    automatically unload the transient unit once it exits, so it never
-    lingers as a permanently "failed"/"inactive" unit cluttering the
-    live session's own unit list.
+    **The internal handoff mechanism** (unchanged since R17, and again
+    this round - see :func:`_qa_evidence_launcher_early_command` for
+    what DID change): runs `systemd-run --no-block --collect` (a real,
+    documented systemd client command, never a raw shell `&` background
+    job - a backgrounded child of a parent process's own cgroup is
+    liable to be killed the instant that parent exits/is torn down,
+    per systemd's default ``KillMode=control-group``; a `systemd-run`
+    transient unit is a genuinely SEPARATE unit/cgroup PID1 manages
+    directly, immune to the launcher's own lifecycle) to start the
+    watcher as ``serein-qa-evidence-watcher.service`` - a unit this
+    launcher never waits on (``--no-block`` returns the instant the job
+    is QUEUED, not once the watcher finishes) and never links into any
+    other unit's dependency graph (no ``Before=``/``Requires=``/
+    ``Wants=`` naming snapd or any other target anywhere in this
+    codebase - the watcher OBSERVES snapd, it never gates it).
+    ``--collect`` tells systemd to automatically unload the transient
+    unit once it exits, so it never lingers as a permanently "failed"/
+    "inactive" unit cluttering the live session's own unit list.
+
+    **S7.1R19 correction - how this script is now TRIGGERED**: R16-R18
+    triggered this script via a `systemd.run=` kernel command-line
+    token. Real Run #19 evidence (RUN_ID=34832918752) proved that, even
+    after R18's fix eliminated the early-shutdown defect
+    (`SEREIN_EVIDENCE_LAUNCHER_STARTED`/`_COMPLETED` were both observed,
+    ~275.99s/~277.80s, and the guest correctly stayed ALIVE afterward),
+    the mere PRESENCE of `systemd.run=` on the kernel command line still
+    prevented the REST of the normal live-session boot graph from ever
+    starting - `kernel-command-line.target` was reached and systemd
+    reported startup FINISHED at ~277.88s, with
+    snapd.service/snapd.seeded/Subiquity/autoinstall all subsequently
+    NOT_OBSERVED before the 6600s host timeout. The most likely
+    mechanism (INFERRED from `systemd-run-generator`'s own documented
+    purpose - "run a single command instead of the usual set of
+    services during boot" - and from the observed symptom pattern,
+    never independently verified against a real boot-graph dump in this
+    development environment) is that the generator retargets this
+    boot's effective default target rather than merely adding an
+    ADDITIONAL peer dependency alongside the normal one. Regardless of
+    the exact internal mechanism, the real, PROVEN correlation (with
+    `systemd.run=` present, the normal live-session services never
+    start; every historical run before R16 introduced it eventually DID
+    reach them) is sufficient justification to retire it. This script
+    (and its own internal `systemd-run` handoff to the watcher, which
+    is unaffected by this change and remains exactly as described
+    above) is now invoked from Subiquity's own ``early-commands``
+    autoinstall directive instead - see
+    :func:`_qa_evidence_launcher_early_command`'s own docstring for the
+    full rationale, including the real, project-established tooling
+    constraint (no squashfs-modification capability) that ruled out a
+    persisted, boot-graph-integrated systemd unit as this round's fix.
 
     Emits ``SEREIN_EVIDENCE_LAUNCHER_STARTED``/
     ``SEREIN_EVIDENCE_LAUNCHER_COMPLETED`` markers (with monotonic
-    timestamps) bracketing the ``systemd-run`` call - Run #18's own
+    timestamps) bracketing the ``systemd-run`` call - a real run's own
     ``launcher_finish_ts - launcher_start_ts`` is the real proof this
-    launcher completes in seconds, never merely asserted from this
+    launcher completes quickly, never merely asserted from this
     script's own source. **Caveat honestly carried forward**: whether
-    ``systemd-run`` can actually reach PID1's manager socket this early
-    in boot (~280s, around ``sysinit.target``) is NOT validated in this
-    development environment (no real QEMU/live-ISO boot here) - if it
-    cannot, `systemd-run` simply fails (non-fatal, `|| true`) and the
-    watcher never starts, which is itself real, honest, observable
-    evidence for Run #18 rather than a silent hang.
+    ``systemd-run`` can reach PID1's manager socket at whatever point
+    Subiquity's own early-commands stage actually runs is NOT validated
+    in this development environment (no real QEMU/live-ISO boot here) -
+    if it cannot, `systemd-run` simply fails (non-fatal, `|| true`) and
+    the watcher never starts, which is itself real, honest, observable
+    evidence for a real run rather than a silent hang.
     """
     lines = [
         "#!/bin/sh",
@@ -668,6 +707,80 @@ def build_qa_evidence_launcher_script() -> str:
     return "\n".join(lines)
 
 
+def _qa_evidence_launcher_early_command() -> str:
+    """S7.1R19 corrective: one ``early-commands`` shell one-liner that
+    base64-decodes and launches :func:`build_qa_evidence_launcher_script`
+    detached in the background - reusing verbatim this project's own
+    ORIGINAL S7.1R14 idiom (the same base64-round-trip discipline
+    ``_install_state_late_command`` still uses for ``late-commands``),
+    which was the QA evidence channel's very first launch mechanism
+    before R16 moved away from it.
+
+    **Why this round returns to early-commands** (the full history is
+    also recorded in ``docs/installer/known-limitations.md``'s own
+    S7.1R19 entry): S7.1R16 moved the launch trigger OFF early-commands
+    specifically to observe snapd's own startup in real time - Subiquity
+    itself ships as a snap, so it structurally cannot even begin running
+    (let alone reach its own early-commands stage) until AFTER snapd has
+    already seeded, a real dependency this project's own code cannot
+    route around. R16-R18 progressively tried a `systemd.run=` kernel
+    command-line token instead. Real Run #19 evidence (RUN_ID=34832918752)
+    proved that even after R18 fixed the early-shutdown defect (the
+    launcher itself completed correctly, ~275.99s-~277.80s, and the
+    guest correctly stayed ALIVE afterward), `systemd.run=`'s mere
+    presence still prevents the REST of the normal live-session boot
+    graph (snapd, Subiquity, everything) from ever starting - see
+    :func:`build_qa_evidence_launcher_script`'s own docstring for the
+    full observed-evidence/inferred-mechanism breakdown.
+
+    A real, persisted, boot-graph-integrated QA-only systemd unit (the
+    architecturally PREFERRED fix, which would let the watcher start
+    from a normal early target like ``sysinit.target`` without gating
+    or being gated by snapd) would need a real unit FILE placed
+    somewhere systemd's unit loader searches (e.g.
+    ``/etc/systemd/system/``) early enough for a `systemd.wants=<unit>`
+    kernel token to resolve it. This project has NO squashfs-
+    modification tooling (no ``unsquashfs``/``mksquashfs`` anywhere in
+    this repository or its CI dependencies - the SAME real,
+    already-established constraint
+    ``extract-snap-change-forensics.sh``'s own header and multiple
+    ``docs/installer/known-limitations.md`` entries, going back to
+    S7.1R7/R12, already document) to bake such a unit into the live
+    squashfs at BUILD time. Using `systemd.run=` itself to write that
+    unit file at BOOT time would reintroduce the exact real, proven
+    defect this round exists to fix - a genuine chicken-and-egg
+    constraint given the current toolchain. Rather than invent an
+    early-boot injection mechanism this development environment has no
+    way to validate (no real QEMU/live-ISO boot here), this round takes
+    the conservative, ALREADY-PROVEN-SAFE path: early-commands is
+    Subiquity's own normal execution point, so it structurally CANNOT
+    disrupt the live session's own boot graph the way `systemd.run=`
+    real evidence proved it can - Subiquity's own normal install flow is
+    what invokes it, never a kernel-level generator that substitutes for
+    part of that flow.
+
+    **The honest tradeoff**: the watcher now starts LATER (once
+    Subiquity reaches early-commands, itself gated on snapd.seeded
+    having already completed) than R16-R18's ~280s aspirational ideal -
+    real-time observation of snapd's own VERY FIRST startup moment is
+    lost this round. But it is still capable of observing whatever
+    remains of an in-progress snap/bootstrap pathology (snapd.hold,
+    desktop-security-center activity, a still-missing
+    ``/snap/snapd/current``, etc.) for as long as any of that continues
+    after Subiquity itself becomes runnable - and, critically, a
+    working, non-blocking watcher that lets the real installer run is
+    strictly more valuable than an earlier one that prevents the
+    installer from running at all (real Run #19's own proof). A future
+    round may revisit a genuinely early, boot-graph-integrated
+    mechanism if real squashfs-modification tooling is ever added to
+    this project - not attempted here, matching this round's own
+    explicit narrow-corrective scope."""
+    encoded = base64.b64encode(
+        build_qa_evidence_launcher_script().encode("utf-8")
+    ).decode("ascii")
+    return f"sh -c 'echo {encoded} | base64 -d | sh >/dev/null 2>&1 &' || true"
+
+
 def render_autoinstall_yaml(
     plan: InstallPlan,
     qa_credential: QaCredential,
@@ -705,18 +818,22 @@ def render_autoinstall_yaml(
             },
             "ssh": {"install-server": False, "allow-pw": False},
             "storage": storage,
-            # S7.1R16 Objective A: the QA guest-evidence watcher is no
-            # longer launched via early-commands - real Run #15/#16
-            # evidence proved Subiquity does not even reach
-            # early-commands until WELL after the snap/bootstrap
-            # pathology has already recovered (Run #16's own autoinstall
-            # extraction/load only occurred at ~4259s/~4266s, after the
-            # ~446s-4193s pathology window), making early-commands-based
-            # evidence collection retrospective rather than real-time.
-            # The watcher is now started independently of Subiquity
-            # entirely - see serein.installer.isoprep's own
-            # `systemd.run=` kernel-token wiring, which starts it during
-            # live-session boot itself.
+            # S7.1R16-R18 tried starting the QA guest-evidence watcher
+            # independently of Subiquity, via a `systemd.run=` kernel
+            # command-line token - real Run #19 evidence
+            # (RUN_ID=34832918752) proved that token's mere presence
+            # prevents the rest of the normal live-session boot graph
+            # (snapd, Subiquity, everything) from ever starting, even
+            # though the launcher it triggers completes correctly. S7.1R19
+            # returns the launch trigger to Subiquity's own
+            # early-commands directive - the ORIGINAL S7.1R14 mechanism,
+            # already proven not to disrupt the live session's own boot
+            # graph, since it is Subiquity's own normal execution point -
+            # see _qa_evidence_launcher_early_command's own docstring for
+            # the full history, the real tooling constraint that ruled
+            # out a persisted boot-graph-integrated unit, and the honest
+            # timing tradeoff this reversion accepts.
+            "early-commands": [_qa_evidence_launcher_early_command()],
             "late-commands": [_install_state_late_command(install_state)],
         }
     }

@@ -7,11 +7,22 @@
 # (org.serein.qa.evidence) backed by a `-chardev file,...` sink
 # (qa-install-guest-evidence.log) - a real, structurally one-way QEMU
 # backend the guest may only WRITE into (see run-qa-install.sh's own
-# QEMU_ARGS comment for the full safety rationale). The guest-side
-# watcher (serein.installer.renderer._qa_evidence_watcher_script,
-# embedded via an early-commands autoinstall directive) appends two
-# kinds of bounded blocks to that sink:
+# QEMU_ARGS comment for the full safety rationale). S7.1R19: a short-
+# lived launcher (serein.installer.renderer.build_qa_evidence_launcher_script,
+# embedded via a base64-encoded Subiquity early-commands directive -
+# see render_autoinstall_yaml's own docstring for why this replaced an
+# earlier `systemd.run=` kernel-token mechanism) hands the long-running
+# watcher (build_qa_evidence_watcher_script) off to an independent
+# `systemd-run --no-block --collect` transient unit. Both the launcher
+# and the watcher write bounded markers/blocks to this sink:
 #
+#   SEREIN_EVIDENCE_LAUNCHER_STARTED / launcher_start_ts=
+#   SEREIN_EVIDENCE_LAUNCHER_COMPLETED / launcher_finish_ts=
+#       one-time boot markers (S7.1R17/R19) bracketing the launcher's
+#       own `systemd-run` handoff call - the guest's own monotonic
+#       timestamps proving (or disproving) that the launcher actually
+#       ran and completed quickly, rather than merely asserting the
+#       mechanism exists.
 #   SEREIN_EVIDENCE_WATCHER_STARTED / watcher_start_monotonic_ts=
 #       a one-time boot marker (S7.1R16 Objective A/8) - the guest's
 #       own monotonic timestamp at the moment the watcher started,
@@ -104,6 +115,10 @@ if [ ! -f "${GUEST_EVIDENCE_LOG}" ]; then
         echo "guest_evidence_parse_error_count=0"
         echo "guest_evidence_watcher_started=false"
         echo "guest_evidence_watcher_start_ts="
+        echo "guest_evidence_launcher_started=false"
+        echo "guest_evidence_launcher_start_ts="
+        echo "guest_evidence_launcher_completed=false"
+        echo "guest_evidence_launcher_finish_ts="
         echo "snapd_failure_precedes_portal_failure=unknown"
         echo "snapd_failure_precedes_desktop_security_center_failure=unknown"
         echo "snapd_failure_precedes_hold=unknown"
@@ -124,6 +139,10 @@ if [ ! -s "${GUEST_EVIDENCE_LOG}" ]; then
         echo "guest_evidence_parse_error_count=0"
         echo "guest_evidence_watcher_started=false"
         echo "guest_evidence_watcher_start_ts="
+        echo "guest_evidence_launcher_started=false"
+        echo "guest_evidence_launcher_start_ts="
+        echo "guest_evidence_launcher_completed=false"
+        echo "guest_evidence_launcher_finish_ts="
         echo "snapd_failure_precedes_portal_failure=unknown"
         echo "snapd_failure_precedes_desktop_security_center_failure=unknown"
         echo "snapd_failure_precedes_hold=unknown"
@@ -163,7 +182,25 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         # earlier frame own bounded journal window.
         watcher_started = "false"
         watcher_start_ts = ""
-        awaiting_watcher_ts = 0
+        # S7.1R19 Section 8: the launcher marker defect - the launcher
+        # (build_qa_evidence_launcher_script) already emitted
+        # SEREIN_EVIDENCE_LAUNCHER_STARTED/_COMPLETED markers (with
+        # launcher_start_ts=/launcher_finish_ts= on the line right
+        # after each, the SAME two-line marker+field convention the
+        # watcher boot marker already uses) since S7.1R17, but this
+        # extractor never parsed them - guest_evidence_watcher_started
+        # could read true while the launcher-level fields stayed
+        # entirely absent from this script own output, even though
+        # the launcher itself DID run. Fixed by generalizing the single
+        # "await next line" state the watcher marker already used
+        # (awaiting_field now names WHICH field is expected next,
+        # rather than a single watcher-only boolean) to also recognize
+        # both launcher markers.
+        launcher_started = "false"
+        launcher_start_ts = ""
+        launcher_completed = "false"
+        launcher_finish_ts = ""
+        awaiting_field = ""
         min_hold_start_ts = ""
         min_portal_failure_ts = ""
         min_dsc_failure_ts = ""
@@ -171,14 +208,36 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
     }
     /^SEREIN_EVIDENCE_WATCHER_STARTED$/ {
         watcher_started = "true"
-        awaiting_watcher_ts = 1
+        awaiting_field = "watcher_start_ts"
+        next
+    }
+    /^SEREIN_EVIDENCE_LAUNCHER_STARTED$/ {
+        launcher_started = "true"
+        awaiting_field = "launcher_start_ts"
+        next
+    }
+    /^SEREIN_EVIDENCE_LAUNCHER_COMPLETED$/ {
+        launcher_completed = "true"
+        awaiting_field = "launcher_finish_ts"
         next
     }
     {
-        if (awaiting_watcher_ts) {
-            awaiting_watcher_ts = 0
+        if (awaiting_field == "watcher_start_ts") {
+            awaiting_field = ""
             if ($0 ~ /^watcher_start_monotonic_ts=/) {
                 watcher_start_ts = substr($0, index($0, "=") + 1)
+                next
+            }
+        } else if (awaiting_field == "launcher_start_ts") {
+            awaiting_field = ""
+            if ($0 ~ /^launcher_start_ts=/) {
+                launcher_start_ts = substr($0, index($0, "=") + 1)
+                next
+            }
+        } else if (awaiting_field == "launcher_finish_ts") {
+            awaiting_field = ""
+            if ($0 ~ /^launcher_finish_ts=/) {
+                launcher_finish_ts = substr($0, index($0, "=") + 1)
                 next
             }
         }
@@ -282,6 +341,13 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         # claim (this script never emits a "CAUSED" field).
         printf "guest_evidence_watcher_started=%s\n", watcher_started
         printf "guest_evidence_watcher_start_ts=%s\n", watcher_start_ts
+        # S7.1R19 Section 8: the launcher-marker-defect fix - the
+        # launcher own two markers, now actually parsed (see this
+        # script own header comment for the real prior defect).
+        printf "guest_evidence_launcher_started=%s\n", launcher_started
+        printf "guest_evidence_launcher_start_ts=%s\n", launcher_start_ts
+        printf "guest_evidence_launcher_completed=%s\n", launcher_completed
+        printf "guest_evidence_launcher_finish_ts=%s\n", launcher_finish_ts
         if (watcher_start_ts != "" && min_snapd_failure_ts != "") {
             printf "watcher_started_before_first_snapd_failure=%s\n", \
                 (watcher_start_ts + 0 < min_snapd_failure_ts + 0 ? "true" : "false")

@@ -60,36 +60,42 @@ from serein.distribution.models import VOLUME_ID
 from serein.distribution.pathsafety import PathSafetyError, resolve_within
 from serein.distribution.qa_boot import QA_ENTRY_TITLE, QaBootError, discover_grub_config
 from serein.installer.renderer import (
-    QA_EVIDENCE_LAUNCHER_ISO_FILENAME,
     QA_EVIDENCE_WATCHER_ISO_FILENAME,
-    build_qa_evidence_launcher_script,
     build_qa_evidence_watcher_script,
 )
 
-# S7.1R16 Objective A / S7.1R17 corrective / S7.1R18 corrective: the
-# QA-only guest evidence watcher and its short-lived launcher are both
-# embedded as real files at the ISO's own root (the SAME mechanism
+# S7.1R16 Objective A: the QA-only guest evidence watcher is embedded
+# as a real file at the ISO's own root (the SAME mechanism
 # ``autoinstall.yaml`` already uses - never the squashfs, which this
 # project has no tooling to modify, per docs/installer/
-# known-limitations.md's own S7.1R12 architectural note). The kernel
-# command line invokes only the LAUNCHER (never the long-running
-# watcher directly - real Run #17 evidence proved doing so blocks boot
-# indefinitely, see ``build_qa_evidence_launcher_script``'s own
-# docstring for the full defect and fix) - never Subiquity
-# early-commands either, which real Run #15/#16 evidence proved starts
-# only after the snap/bootstrap pathology has already recovered. Two
-# further kernel tokens (``systemd.run_success_action=none``/
-# ``systemd.run_failure_action=none``) prevent the launcher's own
-# completion from tearing down the live environment - real Run #18
-# evidence proved the R17 launcher fix worked (it completed in well
-# under a second) but the systemd-run-generator's own default
-# ``SuccessAction=exit`` then powered the whole guest off before snapd,
-# Subiquity, or autoinstall ever started, see
-# ``_disable_qa_evidence_launcher_success_action_on_qa_entry``'s own
-# docstring for the full defect and fix. Both filenames are defined in
-# ``serein.installer.renderer`` (re-exported here for callers that
-# only need the ISO-prep-facing names), never redeclared as
-# independent string literals that could silently drift apart.
+# known-limitations.md's own S7.1R12 architectural note). This filename
+# is defined in ``serein.installer.renderer`` (re-exported here for
+# callers that only need the ISO-prep-facing name), never redeclared as
+# an independent string literal that could silently drift apart.
+#
+# S7.1R17/R18 tried starting the watcher's own short-lived launcher via
+# a `systemd.run=` kernel command-line token (plus
+# `systemd.run_success_action=none`/`systemd.run_failure_action=none`
+# to stop it tearing the live environment down on completion). Real
+# Run #19 evidence (RUN_ID=34832918752) proved that even with both of
+# those R18 fixes in place, `systemd.run=`'s mere presence on the QA
+# boot entry still prevents the rest of the normal live-session boot
+# graph (snapd, Subiquity, everything) from ever starting - see
+# ``serein.installer.renderer.build_qa_evidence_launcher_script``'s own
+# docstring for the full observed-evidence/inferred-mechanism
+# breakdown. S7.1R19 retires ALL THREE kernel tokens
+# (``systemd.run=``/``systemd.run_success_action=``/
+# ``systemd.run_failure_action=``) from this module entirely - this
+# module no longer patches the QA boot entry's kernel command line to
+# launch the watcher at all. The launcher is now instead embedded into
+# the rendered ``autoinstall.yaml`` itself, as a base64-encoded
+# ``early-commands`` directive (Subiquity's own normal execution point,
+# which structurally cannot disrupt the live session's own boot graph
+# the way a kernel-level generator token can) - see
+# ``serein.installer.renderer.render_autoinstall_yaml``/
+# ``_qa_evidence_launcher_early_command`` for that wiring. This module
+# now only ever writes the WATCHER file itself (unchanged) - the
+# launcher script is no longer written as a separate file at all.
 
 
 class IsoPrepError(RuntimeError):
@@ -299,131 +305,6 @@ def _mask_firmware_notifier_on_qa_entry(
     )
 
 
-def _enable_qa_evidence_launcher_on_qa_entry(
-    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
-) -> str:
-    """S7.1R16 Objective A / S7.1R17 corrective: add
-    ``systemd.run=/cdrom/serein-qa-early-launcher.sh`` to the named
-    menuentry.
-
-    ``systemd.run=`` is a real, documented systemd kernel command-line
-    option (``systemd-run-generator(8)``) that executes the given
-    command as part of early boot, ordered well before user-session/
-    network/snapd targets - through the SAME already-proven, generalized
-    kernel-token mechanism as R3's ``autoinstall``/R5's
-    journald-forwarding/R7's debug-logging/R9's firmware-notifier-mask
-    tokens (:func:`_add_kernel_token_to_qa_entry`). Deliberately kept to
-    a single, space-free word (never
-    ``systemd.run=/bin/sh /cdrom/...``) - kernel/GRUB command-line
-    quoting for a value containing embedded spaces is a real, known
-    fragility this project has no way to test in this environment;
-    single-word kernel parameters are the one form every other token
-    here already uses safely.
-
-    **S7.1R17 correction**: this token now points at the SHORT-LIVED
-    launcher (:func:`~serein.installer.renderer.build_qa_evidence_launcher_script`),
-    never at the long-running watcher directly. Real Run #17 evidence
-    (RUN_ID=34784265045) proved the R16 design - pointing this token
-    straight at the watcher - left the ``kernel-command-line.service``
-    ``systemd-run-generator`` synthesizes for this token stuck in its
-    "start job running" state for the watcher's entire ~6600s bounded
-    lifetime, blocking every unit ordered after it (snapd never
-    started, autoinstall never started) until the host's own timeout
-    killed the run. The launcher now hands the watcher off to systemd
-    as an independent transient unit (via ``systemd-run --no-block``)
-    and exits within seconds - see the launcher's own docstring for
-    the full defect/fix. Both the launcher and watcher files carry
-    their own ``#!/bin/sh`` shebang and are written executable
-    (:func:`prepare_qa_install_iso`), relying on the SAME Rock Ridge
-    (``-r``) permission preservation ``build_rebuild_command`` already
-    uses for every other extracted-tree file.
-
-    **Caveat honestly carried forward** (matches this project's own
-    established caveat discipline - see this module's own docstring):
-    whether the real Ubuntu live environment's systemd actually
-    supports ``systemd.run=`` at a point early enough to precede the
-    first snapd failure, AND whether ``systemd-run`` can itself reach
-    PID1's manager at that same early point, are NOT validated in this
-    development environment (no real QEMU/live-ISO boot here). The
-    launcher's own ``SEREIN_EVIDENCE_LAUNCHER_STARTED``/
-    ``_COMPLETED`` markers and the watcher's own
-    ``SEREIN_EVIDENCE_WATCHER_STARTED`` marker (each with a monotonic
-    timestamp) are the mechanism by which a real run proves or
-    disproves this - never assumed true merely because these tokens
-    are present.
-    """
-    return _add_kernel_token_to_qa_entry(
-        grub_cfg_text,
-        f"systemd.run=/cdrom/{QA_EVIDENCE_LAUNCHER_ISO_FILENAME}",
-        entry_title,
-    )
-
-
-def _disable_qa_evidence_launcher_success_action_on_qa_entry(
-    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
-) -> str:
-    """S7.1R18 corrective: add ``systemd.run_success_action=none`` to
-    the named menuentry.
-
-    **The real Run #18 defect this corrects**: real Run #18 evidence
-    (RUN_ID=34812057869) proved the R17 short-lived-launcher fix
-    actually worked - ``launcher_start_ts``/``launcher_finish_ts`` were
-    observed roughly half a second apart (~177.18s/~177.71s), and
-    ``kernel-command-line.service`` (the unit
-    ``systemd-run-generator`` synthesizes for the ``systemd.run=``
-    token) completed SUCCESSFULLY. But real,
-    documented ``systemd-run-generator(8)`` behavior is that this unit
-    carries a default ``SuccessAction=exit`` - once the launched command
-    exits 0, systemd applies that default action, which on a live/
-    casper boot session (there is no "next" target to hand control back
-    to, unlike a normal multi-user boot) tears the whole live
-    environment down. Real Run #18 evidence shows QEMU exited cleanly
-    (status 0) entirely because the GUEST powered itself off in
-    response to this default action - snapd, Subiquity, and autoinstall
-    never started (``snapd_service_first_start``/
-    ``subiquity_autoinstall_extract``/``partitioning_stage_start`` all
-    ``NOT_OBSERVED``). A clean QEMU exit produced by this defect is
-    STRUCTURALLY INDISTINGUISHABLE, from the host side alone, from a
-    genuinely completed install - see
-    ``installer/scripts/run-qa-install.sh``'s own
-    ``_installer_progress_observed`` for the independent host-side
-    hardening this same round adds against exactly that ambiguity.
-
-    ``systemd.run_success_action=`` is a real, documented systemd
-    kernel command-line option (``systemd-run-generator(8)``,
-    ``systemd.special(7)``'s own ``SuccessAction=``/``FailureAction=``
-    semantics) accepting the SAME action vocabulary as a unit's own
-    ``SuccessAction=``/``FailureAction=`` directives - ``none`` is a
-    real, valid, documented no-op value ("no action taken"), never a
-    guessed or invented string. Added via the SAME already-proven,
-    generalized kernel-token mechanism as every other QA-only token in
-    this module (:func:`_add_kernel_token_to_qa_entry`).
-    """
-    return _add_kernel_token_to_qa_entry(
-        grub_cfg_text, "systemd.run_success_action=none", entry_title
-    )
-
-
-def _disable_qa_evidence_launcher_failure_action_on_qa_entry(
-    grub_cfg_text: str, entry_title: str = QA_ENTRY_TITLE
-) -> str:
-    """S7.1R18 corrective: add ``systemd.run_failure_action=none`` to
-    the named menuentry - the same real, documented
-    ``systemd-run-generator(8)`` mechanism as
-    :func:`_disable_qa_evidence_launcher_success_action_on_qa_entry`
-    (see its own docstring for the full Run #18 defect/fix), applied to
-    the FAILURE side of the same default-action problem: a launcher
-    invocation that exits non-zero (e.g. a real ``systemd-run``
-    failure) must equally never tear down the live environment - the
-    installer must still get a chance to run even if the QA evidence
-    instrumentation itself failed to start (Section 12: "forensic
-    failure must never become installer primary failure").
-    """
-    return _add_kernel_token_to_qa_entry(
-        grub_cfg_text, "systemd.run_failure_action=none", entry_title
-    )
-
-
 def prepare_qa_install_iso(
     qa_iso_path: Path,
     work_dir: Path,
@@ -485,23 +366,16 @@ def prepare_qa_install_iso(
         # S7.1R9 Objective A: chained onto the same already-patched
         # text, same discipline as the two lines above.
         patched_grub_text = _mask_firmware_notifier_on_qa_entry(patched_grub_text)
-        # S7.1R16 Objective A / S7.1R17 corrective: chained onto the
-        # same already-patched text, same discipline as every token
-        # above - this one starts the QA guest-evidence watcher
-        # independently of Subiquity, via the short-lived launcher.
-        patched_grub_text = _enable_qa_evidence_launcher_on_qa_entry(patched_grub_text)
-        # S7.1R18 corrective: chained onto the same already-patched
-        # text, same discipline as every token above - these two
-        # prevent the systemd-run-generator's own default success/
-        # failure action from tearing down the live environment the
-        # instant the launcher (kernel-command-line.service) completes
-        # (real Run #18 proof - see both functions' own docstrings).
-        patched_grub_text = _disable_qa_evidence_launcher_success_action_on_qa_entry(
-            patched_grub_text
-        )
-        patched_grub_text = _disable_qa_evidence_launcher_failure_action_on_qa_entry(
-            patched_grub_text
-        )
+        # S7.1R19 corrective: no further kernel token is added here.
+        # R16-R18 added a `systemd.run=` token (plus two exit-action
+        # tokens) to start the QA guest-evidence launcher independently
+        # of Subiquity - real Run #19 evidence proved that token's mere
+        # presence prevents the rest of the normal live-session boot
+        # graph from ever starting. The launcher is now instead
+        # launched via an `early-commands` autoinstall directive (see
+        # `serein.installer.renderer.render_autoinstall_yaml`) - never
+        # a kernel command-line patch, so no further GRUB mutation is
+        # needed for it.
     except AutoinstallBootError as exc:
         raise IsoPrepError(f"cannot enable autoinstall boot: {exc}") from exc
     with _temporarily_owner_writable(grub_path):
@@ -510,22 +384,19 @@ def prepare_qa_install_iso(
     autoinstall_path = extracted_dir / "autoinstall.yaml"
     autoinstall_path.write_text(autoinstall_yaml_text, encoding="utf-8")
 
-    # S7.1R16 Objective A / S7.1R17 corrective: both the launcher and
-    # the long-running watcher live at the extracted tree ROOT - the
-    # exact same "outer ISO filesystem, never the squashfs" placement
-    # `autoinstall.yaml` already uses, reachable at boot via casper's
-    # own early `/cdrom` mount (the same mount point Subiquity itself
-    # reads `/cdrom/autoinstall.yaml` from). Both written executable so
-    # the single-word `systemd.run=/cdrom/<launcher>` kernel token
-    # above can invoke the launcher directly, which in turn invokes the
-    # watcher via `systemd-run` (never a squashfs-embedded unit file -
-    # this project has no tooling to modify the squashfs) -
+    # S7.1R16 Objective A: the long-running watcher lives at the
+    # extracted tree ROOT - the exact same "outer ISO filesystem, never
+    # the squashfs" placement `autoinstall.yaml` already uses, reachable
+    # at boot via casper's own early `/cdrom` mount (the same mount
+    # point Subiquity itself reads `/cdrom/autoinstall.yaml` from) -
     # `build_rebuild_command`'s own `-r` (Rock Ridge) flag preserves
-    # both permission bits into the rebuilt ISO, the same way it
-    # already preserves grub.cfg's.
-    launcher_path = extracted_dir / QA_EVIDENCE_LAUNCHER_ISO_FILENAME
-    launcher_path.write_text(build_qa_evidence_launcher_script(), encoding="utf-8")
-    launcher_path.chmod(0o755)
+    # this permission bit into the rebuilt ISO, the same way it already
+    # preserves grub.cfg's. S7.1R19: the launcher is no longer written
+    # as a separate file here at all - it is base64-embedded directly
+    # into the rendered `autoinstall.yaml`'s own early-commands entry
+    # (`autoinstall_yaml_text`, already written above), invoked by
+    # Subiquity itself, which in turn invokes THIS watcher file via
+    # `systemd-run` at its own early-commands execution point.
     watcher_path = extracted_dir / QA_EVIDENCE_WATCHER_ISO_FILENAME
     watcher_path.write_text(build_qa_evidence_watcher_script(), encoding="utf-8")
     watcher_path.chmod(0o755)
