@@ -1,5 +1,95 @@
 # Known Limitations (S7.1)
 
+## Real Layer-B validation status (S7.1R17)
+
+**Seventeen real Installer Layer-B runs have occurred.** Run #17
+(RUN_ID=34784265045, JOB_ID=103796764712,
+HEAD=0b7ce497ec2a1921441195f261cc455dd8bc711f - the S7.1R16 early-
+forensics commit) is NOT evidence about snap health - it proved a real
+instrumentation regression the R16 corrective itself introduced:
+
+```text
+Run 17 (after S7.1R16):
+  RUN_ID=34784265045, RUN_NUMBER=17
+  HEAD=0b7ce497ec2a1921441195f261cc455dd8bc711f
+  RESULT=FAILURE - failure_stage=installer_timeout
+  (qemu_timeout_seconds=6600).
+
+  RUN17_RAW_ARTIFACT_DIRECTLY_READ=BLOCKED - no gh CLI, no local copy
+  of ARTIFACT_ID=10328375844; the figures below are the task's own
+  given, authoritative Run #17 summary, never an independent read.
+
+  PROVEN (as given): ~280.236s sysinit.target reached,
+  ~280.331s kernel-command-line.service starts,
+  ~280.86s SEREIN_EVIDENCE_WATCHER_STARTED (the watcher DID start
+  early - the R16 timing goal was met). But
+  kernel-command-line.service then remained in "start job running"
+  for the ENTIRE remainder of the run (>1h40m, until the 6600s host
+  timeout) - snapd never started, snapd.seeded never started,
+  Subiquity never started, autoinstall never started.
+  EARLY_WATCHER_STARTED=PROVEN,
+  SYSTEMD_RUN_LONG_RUNNING_WATCHER_DEFECT=PROVEN,
+  KERNEL_COMMAND_LINE_SERVICE_BLOCKED_BOOT=PROVEN,
+  SNAPD_STARTED=PROVEN_FALSE, SUBIQUITY_STARTED=PROVEN_FALSE.
+
+  Root cause (as given): S7.1R16 pointed the `systemd.run=` kernel
+  token directly at the long-running watcher script (a ~6600s bounded
+  polling loop). `systemd-run-generator`'s own synthesized
+  `kernel-command-line.service` unit does not reach "done" until the
+  process it launched actually EXITS - ordering every later unit
+  (snapd, Subiquity, autoinstall) behind a service that, by design,
+  does not exit until the watcher's own bounded lifetime ends. The
+  watcher's own internal logic (Objectives B-G, block-probe watching,
+  trigger detection, etc.) was never proven defective - only the LAUNCH
+  semantics were.
+
+  S7.1R17 fix (launch-semantics only - no snapd/storage/timeout
+  change):
+
+  1. Objective A: a new, deliberately SHORT-LIVED launcher script
+     (`serein.installer.renderer.build_qa_evidence_launcher_script`)
+     is now the `systemd.run=` target instead of the watcher itself.
+     The launcher hands the watcher off to `systemd-run --no-block
+     --collect --unit=serein-qa-evidence-watcher ... /bin/sh
+     /cdrom/serein-qa-early-watcher.sh` - a real systemd client command
+     that creates a genuinely INDEPENDENT, PID1-managed transient unit
+     (never a plain shell `&` background job, which would be killed
+     along with kernel-command-line.service's own cgroup under
+     systemd's default `KillMode=control-group`). `--no-block` returns
+     the instant the job is queued, never waiting for the watcher to
+     run or finish; `--collect` auto-unloads the transient unit once it
+     exits. No `Before=`/`Requires=`/`Wants=` relationship links the
+     watcher to snapd or any other unit anywhere in this codebase - the
+     watcher observes snapd, it never gates it.
+  2. Objective B: new `SEREIN_EVIDENCE_LAUNCHER_STARTED`/
+     `_COMPLETED` boot markers (with monotonic timestamps) bracket the
+     `systemd-run` call - Run #18's own
+     `launcher_finish_ts - launcher_start_ts` is the real proof the
+     launcher completes in seconds, never merely asserted from source.
+  3. `serein.installer.isoprep` now embeds BOTH the launcher and the
+     (unchanged) watcher as separate executable files at the QA-install
+     ISO's own root - the kernel token points only at the launcher; the
+     watcher file itself, its 6-trigger snap-pathology detection, its
+     R16 task-graph/service-state/ordering-timestamp capture, and the
+     unrelated R14 block-probe crash watcher are all byte-for-byte
+     unchanged this round.
+
+  **Caveat honestly carried forward**: whether `systemd-run` can
+  itself reach PID1's manager socket this early in boot (~280s, around
+  `sysinit.target`) is NOT validated in this development environment
+  (no real QEMU/live-ISO boot here) - if it cannot, `systemd-run`
+  simply fails non-fatally and the watcher never starts, which is
+  itself real, honest, observable evidence for Run #18 (a missing
+  `SEREIN_EVIDENCE_WATCHER_STARTED` marker despite a present
+  `SEREIN_EVIDENCE_LAUNCHER_COMPLETED` one) rather than a silent hang.
+
+  SNAP_MITIGATION_IMPLEMENTED=false, SNAP_RUNTIME_BEHAVIOR_CHANGED=false
+  - this round changed ONLY how the watcher is launched. Storage
+  selection, protected-disk visibility, target fixture layout, and
+  QEMU/job timeouts are all unchanged - confirmed via diff against the
+  exact pre-head commit.
+```
+
 ## Real Layer-B validation status (S7.1R16)
 
 **Sixteen real Installer Layer-B runs have occurred.** Run #16

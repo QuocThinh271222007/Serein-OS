@@ -83,6 +83,20 @@ QA_EVIDENCE_MAX_FAILED_CHANGE_IDS = 5
 # and never unbounded.
 QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES = 262144
 
+# S7.1R16 Objective A / S7.1R17 corrective: both scripts are embedded
+# as real files at the QA-install ISO's own root (never the squashfs -
+# see prepare_qa_install_iso's own docstring). Named here, not in
+# isoprep.py, since both the launcher script (below) and isoprep's own
+# kernel-token wiring need the SAME two filenames and must never drift
+# apart into two independently-typed string literals.
+QA_EVIDENCE_WATCHER_ISO_FILENAME = "serein-qa-early-watcher.sh"
+QA_EVIDENCE_LAUNCHER_ISO_FILENAME = "serein-qa-early-launcher.sh"
+# S7.1R17: the name of the independent, systemd-managed transient unit
+# the launcher hands the long-running watcher off to - see
+# build_qa_evidence_launcher_script's own docstring for the real Run
+# #17 defect this corrects.
+QA_EVIDENCE_WATCHER_UNIT_NAME = "serein-qa-evidence-watcher"
+
 
 class RendererError(ValueError):
     """Raised when asked to render from an unvalidated/invalid plan, or
@@ -557,6 +571,97 @@ def build_qa_evidence_watcher_script() -> str:
         "    i=$((i + 1))",
         '    sleep "$SLEEP_SECONDS"',
         "done",
+        "exit 0",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_qa_evidence_launcher_script() -> str:
+    """S7.1R17: the short-lived boot launcher that hands the
+    long-running watcher (:func:`build_qa_evidence_watcher_script`) off
+    to systemd as an independent, PID1-managed transient unit, then
+    exits almost immediately.
+
+    **The real Run #17 defect this corrects**: S7.1R16 pointed the
+    ``systemd.run=`` kernel token directly at the long-running watcher
+    script. Real Run #17 evidence (RUN_ID=34784265045) proved this
+    caused ``kernel-command-line.service`` (the unit
+    ``systemd-run-generator`` synthesizes for a ``systemd.run=`` token)
+    to remain in its "start job running" state for the watcher's ENTIRE
+    ~6600s bounded lifetime - blocking every unit ordered after it
+    (snapd never started, autoinstall never started) until the host's
+    own 6600s QEMU timeout killed the run. ``SEREIN_EVIDENCE_WATCHER_STARTED``
+    WAS observed at ~280.86s, proving the watcher itself started early
+    enough - the defect was purely in HOW it was launched, never in the
+    watcher's own logic (Objectives B-G, block-probe watching, etc. are
+    all unchanged this round).
+
+    **The fix**: this script is now the ``systemd.run=`` target instead.
+    It runs `systemd-run --no-block --collect` (a real, documented
+    systemd client command, never a raw shell `&` background job - a
+    backgrounded child of a service's own cgroup is liable to be killed
+    the instant that service's job is torn down, per systemd's default
+    ``KillMode=control-group``; a `systemd-run` transient unit is a
+    genuinely SEPARATE unit/cgroup PID1 manages directly, immune to the
+    launcher's own lifecycle) to start the watcher as
+    ``serein-qa-evidence-watcher.service`` - a unit this launcher never
+    waits on (``--no-block`` returns the instant the job is QUEUED, not
+    once the watcher finishes) and never links into any other unit's
+    dependency graph (no ``Before=``/``Requires=``/``Wants=`` naming
+    snapd or any other target anywhere in this codebase - the watcher
+    OBSERVES snapd, it never gates it). ``--collect`` tells systemd to
+    automatically unload the transient unit once it exits, so it never
+    lingers as a permanently "failed"/"inactive" unit cluttering the
+    live session's own unit list.
+
+    Emits ``SEREIN_EVIDENCE_LAUNCHER_STARTED``/
+    ``SEREIN_EVIDENCE_LAUNCHER_COMPLETED`` markers (with monotonic
+    timestamps) bracketing the ``systemd-run`` call - Run #18's own
+    ``launcher_finish_ts - launcher_start_ts`` is the real proof this
+    launcher completes in seconds, never merely asserted from this
+    script's own source. **Caveat honestly carried forward**: whether
+    ``systemd-run`` can actually reach PID1's manager socket this early
+    in boot (~280s, around ``sysinit.target``) is NOT validated in this
+    development environment (no real QEMU/live-ISO boot here) - if it
+    cannot, `systemd-run` simply fails (non-fatal, `|| true`) and the
+    watcher never starts, which is itself real, honest, observable
+    evidence for Run #18 rather than a silent hang.
+    """
+    lines = [
+        "#!/bin/sh",
+        "set -u",
+        f'PORT="{QA_EVIDENCE_PORT_PATH}"',
+        f'WATCHER_UNIT="{QA_EVIDENCE_WATCHER_UNIT_NAME}"',
+        f'WATCHER_SCRIPT="/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}"',
+        "",
+        'if [ -e "$PORT" ] && [ -w "$PORT" ]; then',
+        '    launcher_start_ts=$(cut -d" " -f1 /proc/uptime 2>/dev/null || echo "")',
+        "    {",
+        '        echo "SEREIN_EVIDENCE_LAUNCHER_STARTED"',
+        '        echo "launcher_start_ts=$launcher_start_ts"',
+        '    } >> "$PORT" 2>/dev/null || true',
+        "fi",
+        "",
+        "# S7.1R17 Objective A: hand the long-running watcher off to a",
+        "# genuinely independent, PID1-managed transient unit - never a",
+        "# plain shell `&` background job (killed with this launcher's",
+        "# own cgroup under systemd's default KillMode=control-group).",
+        "# --no-block: return the instant the job is QUEUED, never wait",
+        "# for the watcher itself to run or finish. --collect: auto-unload",
+        "# the transient unit once it exits, never left lingering.",
+        "systemd-run --no-block --collect \\",
+        '    --unit="$WATCHER_UNIT" \\',
+        '    --description="Serein QA evidence watcher (observation only)" \\',
+        '    /bin/sh "$WATCHER_SCRIPT" >/dev/null 2>&1 || true',
+        "",
+        'if [ -e "$PORT" ] && [ -w "$PORT" ]; then',
+        '    launcher_finish_ts=$(cut -d" " -f1 /proc/uptime 2>/dev/null || echo "")',
+        "    {",
+        '        echo "SEREIN_EVIDENCE_LAUNCHER_COMPLETED"',
+        '        echo "launcher_finish_ts=$launcher_finish_ts"',
+        '    } >> "$PORT" 2>/dev/null || true',
+        "fi",
         "exit 0",
         "",
     ]

@@ -68,12 +68,13 @@ from serein.installer.identity import (
     resolve_target,
 )
 from serein.installer.isoprep import (
+    QA_EVIDENCE_LAUNCHER_ISO_FILENAME,
     QA_EVIDENCE_WATCHER_ISO_FILENAME,
     AutoinstallBootError,
     IsoPrepError,
     _enable_autoinstall_on_qa_entry,
     _enable_journald_console_forwarding_on_qa_entry,
-    _enable_qa_evidence_watcher_on_qa_entry,
+    _enable_qa_evidence_launcher_on_qa_entry,
     _enable_systemd_debug_logging_on_qa_entry,
     _mask_firmware_notifier_on_qa_entry,
     prepare_qa_install_iso,
@@ -101,7 +102,9 @@ from serein.installer.renderer import (
     QA_EVIDENCE_PORT_PATH,
     QA_EVIDENCE_WATCHER_MAX_ITERATIONS,
     QA_EVIDENCE_WATCHER_SLEEP_SECONDS,
+    QA_EVIDENCE_WATCHER_UNIT_NAME,
     RendererError,
+    build_qa_evidence_launcher_script,
     build_qa_evidence_watcher_script,
     render_autoinstall_storage_config,
     render_autoinstall_yaml,
@@ -1039,6 +1042,182 @@ class TestQaEvidenceGuestProducer:
         # never just "timeout" as one word.
         script = self._script()
         assert "timeout|timed out" in script
+
+
+# ---------------------------------------------------------------------------
+# S7.1R17 corrective - the short-lived boot launcher
+# (serein.installer.renderer.build_qa_evidence_launcher_script)
+# ---------------------------------------------------------------------------
+
+
+class TestQaEvidenceLauncherScript:
+    """Real regression coverage for the exact Run #17 defect
+    (RUN_ID=34784265045): pointing the `systemd.run=` kernel token
+    directly at the long-running watcher left
+    `kernel-command-line.service` stuck for the watcher's entire
+    ~6600s lifetime, blocking snapd/autoinstall for the whole run. The
+    launcher must be short-lived and hand the watcher off to an
+    independent, systemd-managed transient unit."""
+
+    def _script(self) -> str:
+        return build_qa_evidence_launcher_script()
+
+    def test_launcher_never_contains_the_long_running_loop(self):
+        # The single most important regression check: the launcher
+        # script itself must never embed the watcher's own bounded
+        # polling loop - it only ever hands the watcher off.
+        script = self._script()
+        assert "MAX_ITERATIONS" not in script
+        assert 'while [ "$i" -lt' not in script
+        assert "SLEEP_SECONDS" not in script
+
+    def test_launcher_hands_off_via_systemd_run_never_shell_background(self):
+        # Section 7: prefer systemd-managed lifecycle over shell `&` -
+        # a plain backgrounded child of kernel-command-line.service's
+        # own cgroup is liable to be killed the instant that service's
+        # job is torn down (systemd's default KillMode=control-group).
+        script = self._script()
+        assert "systemd-run" in script
+        # No bare shell backgrounding of the watcher script itself.
+        assert f"{QA_EVIDENCE_WATCHER_ISO_FILENAME} &" not in script
+        assert "sh -c 'echo" not in script  # the old R14-R16 early-commands idiom
+
+    def test_launcher_uses_no_block_and_collect(self):
+        # --no-block: return the instant the job is QUEUED, never wait
+        # for the watcher to run or finish. --collect: auto-unload the
+        # transient unit once it exits, never left lingering.
+        script = self._script()
+        assert "--no-block" in script
+        assert "--collect" in script
+
+    def test_launcher_names_the_watcher_unit(self):
+        script = self._script()
+        assert f'WATCHER_UNIT="{QA_EVIDENCE_WATCHER_UNIT_NAME}"' in script
+        assert '--unit="$WATCHER_UNIT"' in script
+
+    def test_launcher_invokes_the_correct_watcher_script_path(self):
+        script = self._script()
+        assert f'WATCHER_SCRIPT="/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}"' in script
+        assert '/bin/sh "$WATCHER_SCRIPT"' in script
+
+    def test_launcher_never_creates_a_blocking_dependency_on_snapd(self):
+        # Section 6/19: no Before=/Requires=/Wants= relationship that
+        # could make snapd wait for the watcher - the launcher/watcher
+        # must remain entirely decoupled from snapd's own unit graph.
+        script = self._script()
+        for forbidden in (
+            "Before=snapd", "Requires=snapd", "Wants=snapd",
+            "--property=Before", "--property=Requires",
+        ):
+            assert forbidden not in script
+
+    def test_launcher_emits_both_start_and_completion_markers(self):
+        script = self._script()
+        assert "SEREIN_EVIDENCE_LAUNCHER_STARTED" in script
+        assert "SEREIN_EVIDENCE_LAUNCHER_COMPLETED" in script
+        assert "launcher_start_ts=" in script
+        assert "launcher_finish_ts=" in script
+        # the completion marker must be written AFTER the systemd-run
+        # call, not before - proving it only fires once the hand-off
+        # has actually happened.
+        run_idx = script.index("systemd-run")
+        completed_idx = script.index("SEREIN_EVIDENCE_LAUNCHER_COMPLETED")
+        started_idx = script.index("SEREIN_EVIDENCE_LAUNCHER_STARTED")
+        assert started_idx < run_idx < completed_idx
+
+    def test_launcher_writes_only_to_named_evidence_port(self):
+        script = self._script()
+        assert f'PORT="{QA_EVIDENCE_PORT_PATH}"' in script
+        # Filters out awk-style `>` comparison operators (bare digits,
+        # not applicable here but kept for consistency) and `2>&1`
+        # style fd-duplication targets (`&1` is not a file write).
+        redirect_targets = re.findall(r">>?\s*\"?([^\s\"]+)\"?", script)
+        redirect_targets = [
+            t for t in redirect_targets if not t.isdigit() and not t.startswith("&")
+        ]
+        assert redirect_targets
+        assert all(t in ("$PORT",) or t.startswith("/dev/null") for t in redirect_targets)
+
+    def test_launcher_never_executes_host_commands_or_network(self):
+        script = self._script()
+        forbidden = ("curl", "wget", "nc ", "ssh ", "scp ", "ftp ", "python", "eval ")
+        for token in forbidden:
+            assert token not in script
+
+    def test_launcher_never_references_arbitrary_host_paths(self):
+        script = self._script()
+        for forbidden_path in ("/home", "/etc", "/root", "/dev/sda", "/dev/vda", "/dev/vdb"):
+            assert forbidden_path not in script
+
+    def test_launcher_never_uses_set_dash_e_so_systemd_run_failure_is_non_fatal(self):
+        # A failing systemd-run (e.g. PID1's manager unreachable this
+        # early) must never abort the launcher itself - it is already
+        # followed by `|| true`, but this is the structural backstop.
+        script = self._script()
+        assert script.splitlines()[1] == "set -u"
+        assert "set -e" not in script
+
+    def test_launcher_is_posix_sh_not_bash(self):
+        script = self._script()
+        assert script.startswith("#!/bin/sh")
+        assert not re.search(r"(?:^|\s)\[\[\s", script)
+
+    def test_launcher_script_bash_syntax_check(self, tmp_path):
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        script_path = tmp_path / "launcher.sh"
+        script_path.write_text(self._script(), encoding="utf-8")
+        result = subprocess.run(
+            ["bash", "-n", str(script_path)], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_launcher_functionally_completes_quickly_and_invokes_systemd_run(self, tmp_path):
+        # A real functional smoke test (not just static string checks)
+        # against a fake `systemd-run` on PATH - proves the launcher
+        # actually completes and actually invokes systemd-run with the
+        # expected arguments, never merely that the source text
+        # contains the right substrings.
+        if shutil.which("bash") is None:
+            pytest.skip("bash not available in this environment")
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        calls_log = tmp_path / "calls.log"
+        fake_systemd_run = fake_bin / "systemd-run"
+        fake_systemd_run.write_text(
+            "#!/bin/sh\n"
+            f'echo "CALLED: $*" >> "{calls_log}"\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_systemd_run.chmod(0o755)
+
+        port_path = tmp_path / "fake_port.log"
+        port_path.write_text("", encoding="utf-8")
+        script_text = self._script().replace(
+            f'PORT="{QA_EVIDENCE_PORT_PATH}"', f'PORT="{port_path.as_posix()}"'
+        )
+        script_path = tmp_path / "launcher.sh"
+        script_path.write_text(script_text, encoding="utf-8")
+
+        env = dict(os.environ)
+        env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+        result = subprocess.run(
+            ["bash", str(script_path)], capture_output=True, text=True,
+            env=env, timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+        port_content = port_path.read_text(encoding="utf-8")
+        assert "SEREIN_EVIDENCE_LAUNCHER_STARTED" in port_content
+        assert "SEREIN_EVIDENCE_LAUNCHER_COMPLETED" in port_content
+
+        assert calls_log.exists()
+        call_text = calls_log.read_text(encoding="utf-8")
+        assert "--no-block" in call_text
+        assert "--collect" in call_text
+        assert f"--unit={QA_EVIDENCE_WATCHER_UNIT_NAME}" in call_text
+        assert f"/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}" in call_text
 
 
 # ---------------------------------------------------------------------------
@@ -5102,12 +5281,21 @@ class TestIsoPrep:
         assert (
             "systemd.mask=snap.firmware-updater.firmware-notifier.service" in qa_entry_body
         )
-        # -- S7.1R16 Objective A: the early-watcher kernel token chained
-        # on top too, and the watcher script itself embedded as a real,
-        # executable file at the extracted tree root (the SAME
-        # placement autoinstall.yaml already uses - never the
-        # squashfs). --
-        assert f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}" in qa_entry_body
+        # -- S7.1R16 Objective A / S7.1R17 corrective: the early-launcher
+        # kernel token chained on top too, and BOTH the launcher and the
+        # long-running watcher embedded as real, executable files at
+        # the extracted tree root (the SAME placement autoinstall.yaml
+        # already uses - never the squashfs). The token must target the
+        # SHORT-LIVED launcher, never the watcher directly (the real
+        # Run #17 regression - see this module's own docstrings). --
+        assert f"systemd.run=/cdrom/{QA_EVIDENCE_LAUNCHER_ISO_FILENAME}" in qa_entry_body
+        assert f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}" not in qa_entry_body
+        launcher_path = extracted / QA_EVIDENCE_LAUNCHER_ISO_FILENAME
+        assert launcher_path.is_file()
+        launcher_text = launcher_path.read_text(encoding="utf-8")
+        assert launcher_text.startswith("#!/bin/sh")
+        assert "systemd-run" in launcher_text
+        assert "MAX_ITERATIONS" not in launcher_text  # never the long-running loop
         watcher_path = extracted / QA_EVIDENCE_WATCHER_ISO_FILENAME
         assert watcher_path.is_file()
         assert watcher_path.read_text(encoding="utf-8").startswith("#!/bin/sh")
@@ -5116,6 +5304,7 @@ class TestIsoPrep:
             # (chmod is a near-no-op on NTFS) - this assertion is only
             # meaningful on a real POSIX filesystem.
             assert stat.S_IMODE(watcher_path.stat().st_mode) & stat.S_IXUSR
+            assert stat.S_IMODE(launcher_path.stat().st_mode) & stat.S_IXUSR
         # The unrelated second entry must never be touched.
         other_entry_body = final_grub.split('menuentry "Try or Install Ubuntu"')[1]
         assert "autoinstall" not in other_entry_body
@@ -5269,11 +5458,28 @@ class TestEnableAutoinstallOnQaEntry:
         assert "autoinstall" not in qa_entry_text
 
 
-class TestEnableQaEvidenceWatcherOnQaEntry:
-    """S7.1R16 Objective A: real regression coverage for the early
-    guest-evidence watcher kernel token - the mechanism that starts the
-    watcher during live-session boot itself, independently of
-    Subiquity early-commands."""
+class TestEnableQaEvidenceLauncherOnQaEntry:
+    """S7.1R16 Objective A / S7.1R17 corrective: real regression
+    coverage for the early guest-evidence launcher kernel token - the
+    mechanism that starts the (short-lived) launcher during
+    live-session boot itself, independently of Subiquity
+    early-commands."""
+
+    def test_token_targets_the_launcher_never_the_watcher_directly(self):
+        # S7.1R17 Section 18 - the exact real Run #17 regression: the
+        # kernel token must point at the SHORT-LIVED launcher, never
+        # directly at the long-running watcher (doing so left
+        # kernel-command-line.service stuck in "start job running" for
+        # the watcher's entire ~6600s lifetime, blocking snapd/
+        # autoinstall for the whole run).
+        patched = _enable_qa_evidence_launcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
+        linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
+        launcher_token = f"systemd.run=/cdrom/{QA_EVIDENCE_LAUNCHER_ISO_FILENAME}"
+        watcher_token = f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}"
+        assert re.search(rf"(?<!\S){re.escape(launcher_token)}(?!\S)", linux_line)
+        assert watcher_token not in linux_line
+        assert QA_EVIDENCE_LAUNCHER_ISO_FILENAME != QA_EVIDENCE_WATCHER_ISO_FILENAME
 
     def test_single_word_token_no_embedded_spaces(self):
         # Deliberately a single, space-free kernel parameter (never
@@ -5281,14 +5487,14 @@ class TestEnableQaEvidenceWatcherOnQaEntry:
         # quoting for an embedded-space value is a real, untested
         # fragility in this environment; every other token this
         # project adds is already a single bare word.
-        patched = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        patched = _enable_qa_evidence_launcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
         qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
         linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
-        token = f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}"
+        token = f"systemd.run=/cdrom/{QA_EVIDENCE_LAUNCHER_ISO_FILENAME}"
         assert re.search(rf"(?<!\S){re.escape(token)}(?!\S)", linux_line)
 
     def test_inserted_before_init_arg_separator_never_after(self):
-        patched = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        patched = _enable_qa_evidence_launcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
         qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
         linux_line = next(li for li in qa_body.splitlines() if "linux" in li)
         before_sep, _, after_sep = linux_line.partition("---")
@@ -5296,20 +5502,22 @@ class TestEnableQaEvidenceWatcherOnQaEntry:
         assert "systemd.run=" not in after_sep
 
     def test_idempotent_no_duplicate_on_second_call(self):
-        once = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
-        twice = _enable_qa_evidence_watcher_on_qa_entry(once)
+        once = _enable_qa_evidence_launcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        twice = _enable_qa_evidence_launcher_on_qa_entry(once)
         assert once == twice
         qa_body = twice.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
         assert qa_body.count("systemd.run=") == 1
 
     def test_unrelated_production_entry_never_touched(self):
-        patched = _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
+        patched = _enable_qa_evidence_launcher_on_qa_entry(_FAKE_QA_GRUB_CFG)
         other_body = patched.split('menuentry "Try or Install Ubuntu"')[1]
         assert "systemd.run=" not in other_body
 
     def test_missing_entry_title_fails_closed(self):
         with pytest.raises(AutoinstallBootError, match="no menuentry titled"):
-            _enable_qa_evidence_watcher_on_qa_entry(_FAKE_QA_GRUB_CFG, entry_title="Does Not Exist")
+            _enable_qa_evidence_launcher_on_qa_entry(
+                _FAKE_QA_GRUB_CFG, entry_title="Does Not Exist"
+            )
 
     def test_chained_together_with_every_other_qa_only_token(self):
         # Mirrors the real order prepare_qa_install_iso chains these in.
@@ -5317,14 +5525,14 @@ class TestEnableQaEvidenceWatcherOnQaEntry:
         patched = _enable_journald_console_forwarding_on_qa_entry(patched)
         patched = _enable_systemd_debug_logging_on_qa_entry(patched)
         patched = _mask_firmware_notifier_on_qa_entry(patched)
-        patched = _enable_qa_evidence_watcher_on_qa_entry(patched)
+        patched = _enable_qa_evidence_launcher_on_qa_entry(patched)
         qa_body = patched.split(f'menuentry "{QA_ENTRY_TITLE}"')[1].split("}")[0]
         for token in (
             "autoinstall",
             "systemd.journald.forward_to_console=1",
             "systemd.log_level=debug",
             "systemd.mask=snap.firmware-updater.firmware-notifier.service",
-            f"systemd.run=/cdrom/{QA_EVIDENCE_WATCHER_ISO_FILENAME}",
+            f"systemd.run=/cdrom/{QA_EVIDENCE_LAUNCHER_ISO_FILENAME}",
         ):
             assert token in qa_body
 
