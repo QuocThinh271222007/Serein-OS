@@ -31,7 +31,12 @@
 #       exists.
 #   ===BEGIN-CRASH-EVIDENCE===/===END-CRASH-EVIDENCE===
 #       whenever it observes a new /var/crash/*block_probe_fail*.crash
-#       file (S7.1R14 - the block-probe pathology).
+#       file (S7.1R14 - the block-probe pathology). S7.1R21 Section
+#       14: a crash FILE existing is never conflated with its content
+#       being CAPTURED - the frame's own `size=` field (already
+#       present since S7.1R14) is now surfaced as an explicit summary
+#       distinction (see guest_evidence_crash_block_nonempty_count
+#       below) - a real S7.1R20 crash file was 0 bytes.
 #   === SEREIN SNAP FAILURE FRAME ===/=== END FRAME ===
 #       whenever it observes one of the recurring snap/bootstrap
 #       pathology signals (S7.1R15/R16 - a snapd.service start
@@ -40,14 +45,25 @@
 #       snapd.seeded failure) - now including the actual failed snap
 #       Change task graph, snapd.service state/journal context, and
 #       explicit ordering timestamps (S7.1R16 Objectives B-G).
+#   === SEREIN STORAGE PROBE FRAME ===/=== END STORAGE PROBE FRAME ===
+#       S7.1R21: whenever it observes the first occurrence of one of
+#       three known Filesystem/_probe/probe_once storage-probe
+#       failure signals (probe_once+cancelled, block_probe_fail,
+#       disk_probe_fail - the real S7.1R20 forensic findings) -
+#       bounded, allowlisted installer-log excerpts, read-only device
+#       topology/identity, a process snapshot, a storage-filtered
+#       journal window, and a dedicated udisks2 context section
+#       (observation only - see build_qa_evidence_watcher_script's own
+#       docstring for the complete guest-side contract).
 #
-# Run #17 (or any future run) may reproduce EITHER pathology family,
-# BOTH, or NEITHER - this script handles all four cases and always
-# produces a valid, honest output (S7.1R15 Section 22). Ordering
-# fields (e.g. snapd_failure_precedes_portal_failure) are computed
-# from the EARLIEST value each timestamp ever took across every parsed
-# frame, and read "unknown" - never guessed - whenever either side was
-# never observed in this run own bounded journal windows.
+# Run #17 (or any future run) may reproduce ANY of these pathology
+# families, all, or none - this script handles every combination and
+# always produces a valid, honest output (S7.1R15 Section 22).
+# Ordering fields (e.g. snapd_failure_precedes_portal_failure) are
+# computed from the EARLIEST value each timestamp ever took across
+# every parsed frame, and read "unknown" - never guessed - whenever
+# either side was never observed in this run's own bounded journal
+# windows.
 #
 # This script turns that raw text into:
 #
@@ -56,6 +72,8 @@
 #       per-crash artifacts (block-probe pathology)
 #   <crash-output-dir>/qa-install-snap-failure-frame-N.txt - bounded
 #       per-frame artifacts (snap/bootstrap pathology)
+#   <crash-output-dir>/qa-install-storage-probe-frame-N.txt - bounded
+#       per-frame artifacts (S7.1R21 storage-probe instrumentation)
 #
 # Never fails the job - a missing/empty guest-evidence log, or
 # malformed/unparseable block content, all produce a valid, honest
@@ -89,11 +107,12 @@ mkdir -p "${CRASH_OUTPUT_DIR}"
 
 # Section 18 bound - explicit, finite, never silently exceeded. Kept
 # equal to the guest watcher's own QA_EVIDENCE_MAX_CRASH_FILES /
-# QA_EVIDENCE_MAX_SNAP_FRAMES (serein.installer.renderer) - a single
-# shared conceptual cap per evidence kind, not independently-drifting
-# numbers.
+# QA_EVIDENCE_MAX_SNAP_FRAMES / QA_EVIDENCE_MAX_STORAGE_FRAMES
+# (serein.installer.renderer) - a single shared conceptual cap per
+# evidence kind, not independently-drifting numbers.
 MAX_CRASH_FILES=5
 MAX_SNAP_FRAMES=6
+MAX_STORAGE_FRAMES=3
 
 # Remove any stale artifact files from a previous run of this script
 # against the same output directory - never leaves a prior run's
@@ -101,6 +120,7 @@ MAX_SNAP_FRAMES=6
 # count this run.
 rm -f "${CRASH_OUTPUT_DIR}"/qa-install-block-probe-crash-*.txt 2>/dev/null || true
 rm -f "${CRASH_OUTPUT_DIR}"/qa-install-snap-failure-frame-*.txt 2>/dev/null || true
+rm -f "${CRASH_OUTPUT_DIR}"/qa-install-storage-probe-frame-*.txt 2>/dev/null || true
 
 if [ ! -f "${GUEST_EVIDENCE_LOG}" ]; then
     {
@@ -108,6 +128,7 @@ if [ ! -f "${GUEST_EVIDENCE_LOG}" ]; then
         echo "guest_evidence_log_exists=false"
         echo "guest_evidence_log_nonempty=false"
         echo "guest_evidence_crash_block_count=0"
+        echo "guest_evidence_crash_block_nonempty_count=0"
         echo "guest_evidence_crash_block_truncated=false"
         echo "guest_evidence_snap_frame_count=0"
         echo "guest_evidence_snap_frame_truncated=false"
@@ -119,6 +140,15 @@ if [ ! -f "${GUEST_EVIDENCE_LOG}" ]; then
         echo "guest_evidence_launcher_start_ts="
         echo "guest_evidence_launcher_completed=false"
         echo "guest_evidence_launcher_finish_ts="
+        echo "storage_probe_frame_count=0"
+        echo "storage_probe_frame_truncated=false"
+        echo "storage_probe_triggers="
+        echo "storage_probe_first_trigger="
+        echo "storage_probe_first_trigger_ts="
+        echo "storage_probe_device_serials_observed="
+        echo "storage_probe_process_snapshot_present=false"
+        echo "storage_probe_installer_log_present=false"
+        echo "storage_probe_udisks_context_present=false"
         echo "snapd_failure_precedes_portal_failure=unknown"
         echo "snapd_failure_precedes_desktop_security_center_failure=unknown"
         echo "snapd_failure_precedes_hold=unknown"
@@ -132,6 +162,7 @@ if [ ! -s "${GUEST_EVIDENCE_LOG}" ]; then
         echo "guest_evidence_log_exists=true"
         echo "guest_evidence_log_nonempty=false"
         echo "guest_evidence_crash_block_count=0"
+        echo "guest_evidence_crash_block_nonempty_count=0"
         echo "guest_evidence_crash_block_truncated=false"
         echo "guest_evidence_snap_frame_count=0"
         echo "guest_evidence_snap_frame_truncated=false"
@@ -143,6 +174,15 @@ if [ ! -s "${GUEST_EVIDENCE_LOG}" ]; then
         echo "guest_evidence_launcher_start_ts="
         echo "guest_evidence_launcher_completed=false"
         echo "guest_evidence_launcher_finish_ts="
+        echo "storage_probe_frame_count=0"
+        echo "storage_probe_frame_truncated=false"
+        echo "storage_probe_triggers="
+        echo "storage_probe_first_trigger="
+        echo "storage_probe_first_trigger_ts="
+        echo "storage_probe_device_serials_observed="
+        echo "storage_probe_process_snapshot_present=false"
+        echo "storage_probe_installer_log_present=false"
+        echo "storage_probe_udisks_context_present=false"
         echo "snapd_failure_precedes_portal_failure=unknown"
         echo "snapd_failure_precedes_desktop_security_center_failure=unknown"
         echo "snapd_failure_precedes_hold=unknown"
@@ -151,16 +191,19 @@ if [ ! -s "${GUEST_EVIDENCE_LOG}" ]; then
 fi
 
 # A single awk pass over the raw evidence log, splitting it into
-# discrete blocks of EITHER kind. Each well-formed block is written to
+# discrete blocks of ANY kind. Each well-formed block is written to
 # its own numbered file under CRASH_OUTPUT_DIR; a block missing its
 # END marker (truncated mid-write, e.g. the host timeout killed QEMU
 # while the guest was writing) is counted as a parse error and
 # discarded rather than guessed at. Crash blocks are deduplicated by
-# `filename=`; snap frames are deduplicated by `trigger=` (the guest
-# watcher itself already exports each trigger at most once per run,
-# but this is never trusted blindly here either) - the same real event
-# re-exported is kept only once (the FIRST occurrence).
-CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_snap="${MAX_SNAP_FRAMES}" '
+# `filename=`; snap AND storage frames are deduplicated by `trigger=`
+# (the guest watcher itself already exports each trigger at most once
+# per run, but this is never trusted blindly here either) - the same
+# real event re-exported is kept only once (the FIRST occurrence).
+# Parser = evidence extraction only (Section 15) - this script never
+# interprets root cause, it only surfaces what the guest itself wrote.
+CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_snap="${MAX_SNAP_FRAMES}" \
+    -v max_storage="${MAX_STORAGE_FRAMES}" '
     BEGIN {
         # CRASH_DIR is read via ENVIRON, never `-v` - a `-v` assignment
         # is escape-processed like an awk string literal, which would
@@ -173,8 +216,22 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         block_kind = ""
         parse_error_count = 0
         crash_seen_count = 0
+        crash_nonempty_count = 0
         snap_seen_count = 0
         triggers_list = ""
+        # S7.1R21: storage-probe frame state.
+        storage_seen_count = 0
+        storage_triggers_list = ""
+        storage_first_trigger = ""
+        storage_first_trigger_ts = ""
+        storage_serial_protected_seen = 0
+        storage_serial_target_seen = 0
+        storage_process_snapshot_present = "false"
+        storage_installer_log_present = "false"
+        storage_udisks_context_present = "false"
+        storage_awaiting_section = ""
+        current_storage_trigger = ""
+        current_storage_ts = ""
         # S7.1R16 Section 8/Objectives F-G: the boot marker and the
         # earliest observed value of each ordering timestamp across
         # EVERY parsed snap frame - "earliest" because a later frame
@@ -246,6 +303,7 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         block_kind = "crash"
         buf = ""
         current_filename = ""
+        current_crash_size = ""
         next
     }
     /^===END-CRASH-EVIDENCE===$/ {
@@ -258,6 +316,13 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         if (current_filename in seen_crash) { next }
         seen_crash[current_filename] = 1
         crash_seen_count++
+        # S7.1R21 Section 14: a crash FILE existing is never the same
+        # fact as its content being captured - a real S7.1R20 crash
+        # file was 0 bytes (size=0). Tracked from the frame own
+        # size= field, already present since S7.1R14.
+        if (current_crash_size != "" && current_crash_size + 0 > 0) {
+            crash_nonempty_count++
+        }
         if (crash_seen_count > max_crash) { next }
         out = crash_dir "/qa-install-block-probe-crash-" crash_seen_count ".txt"
         printf "%s", buf > out
@@ -287,11 +352,69 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         close(out)
         next
     }
+    /^=== SEREIN STORAGE PROBE FRAME ===$/ {
+        block_kind = "storage"
+        buf = ""
+        current_storage_trigger = ""
+        current_storage_ts = ""
+        storage_awaiting_section = ""
+        next
+    }
+    /^=== END STORAGE PROBE FRAME ===$/ {
+        if (block_kind != "storage") { next }
+        block_kind = ""
+        if (current_storage_trigger == "") {
+            parse_error_count++
+            next
+        }
+        if (current_storage_trigger in seen_storage) { next }
+        seen_storage[current_storage_trigger] = 1
+        storage_seen_count++
+        storage_triggers_list = (storage_triggers_list == "" ? current_storage_trigger \
+            : storage_triggers_list "," current_storage_trigger)
+        if (storage_first_trigger == "") {
+            storage_first_trigger = current_storage_trigger
+            storage_first_trigger_ts = current_storage_ts
+        }
+        if (storage_seen_count > max_storage) { next }
+        out = crash_dir "/qa-install-storage-probe-frame-" storage_seen_count ".txt"
+        printf "%s", buf > out
+        close(out)
+        next
+    }
     {
         if (block_kind == "crash") {
             if ($0 ~ /^filename=/) {
                 current_filename = substr($0, 10)
+            } else if ($0 ~ /^size=/) {
+                current_crash_size = substr($0, index($0, "=") + 1)
             }
+            buf = buf $0 "\n"
+        } else if (block_kind == "storage") {
+            if ($0 ~ /^trigger=/) {
+                current_storage_trigger = substr($0, index($0, "=") + 1)
+            } else if ($0 ~ /^timestamp=/) {
+                current_storage_ts = substr($0, index($0, "=") + 1)
+            } else if ($0 ~ /^\[INSTALLER_LOG_/) {
+                storage_awaiting_section = "installer_log"
+            } else if ($0 ~ /^\[PROCESS_SNAPSHOT\]$/) {
+                storage_awaiting_section = "process_snapshot"
+            } else if ($0 ~ /^\[UDISKS_JOURNAL_CONTEXT\]$/ || $0 ~ /^\[UDISKS_PROCESS_SNAPSHOT\]$/) {
+                storage_awaiting_section = "udisks_context"
+            } else if (storage_awaiting_section != "") {
+                if ($0 != "NOT_OBSERVED" && $0 != "") {
+                    if (storage_awaiting_section == "installer_log") {
+                        storage_installer_log_present = "true"
+                    } else if (storage_awaiting_section == "process_snapshot") {
+                        storage_process_snapshot_present = "true"
+                    } else if (storage_awaiting_section == "udisks_context") {
+                        storage_udisks_context_present = "true"
+                    }
+                }
+                storage_awaiting_section = ""
+            }
+            if ($0 ~ /SEREIN-PROTECTED-DISK/) { storage_serial_protected_seen = 1 }
+            if ($0 ~ /SEREIN-TARGET-DISK/) { storage_serial_target_seen = 1 }
             buf = buf $0 "\n"
         } else if (block_kind == "snap") {
             if ($0 ~ /^trigger=/) {
@@ -328,11 +451,33 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         printf "guest_evidence_log_exists=true\n"
         printf "guest_evidence_log_nonempty=true\n"
         printf "guest_evidence_crash_block_count=%d\n", crash_seen_count
+        # S7.1R21 Section 14: file-exists is never conflated with
+        # content-captured - a real S7.1R20 crash file was 0 bytes.
+        printf "guest_evidence_crash_block_nonempty_count=%d\n", crash_nonempty_count
         printf "guest_evidence_crash_block_truncated=%s\n", (crash_seen_count > max_crash ? "true" : "false")
         printf "guest_evidence_snap_frame_count=%d\n", snap_seen_count
         printf "guest_evidence_snap_frame_truncated=%s\n", (snap_seen_count > max_snap ? "true" : "false")
         printf "guest_evidence_snap_triggers=%s\n", triggers_list
         printf "guest_evidence_parse_error_count=%d\n", parse_error_count
+
+        # S7.1R21 storage probe internal-evidence instrumentation
+        # summary - extraction only, never a root-cause interpretation
+        # (Section 15 own explicit instruction).
+        printf "storage_probe_frame_count=%d\n", storage_seen_count
+        printf "storage_probe_frame_truncated=%s\n", \
+            (storage_seen_count > max_storage ? "true" : "false")
+        printf "storage_probe_triggers=%s\n", storage_triggers_list
+        printf "storage_probe_first_trigger=%s\n", storage_first_trigger
+        printf "storage_probe_first_trigger_ts=%s\n", storage_first_trigger_ts
+        serials = ""
+        if (storage_serial_protected_seen) { serials = "SEREIN-PROTECTED-DISK" }
+        if (storage_serial_target_seen) {
+            serials = (serials == "" ? "SEREIN-TARGET-DISK" : serials ",SEREIN-TARGET-DISK")
+        }
+        printf "storage_probe_device_serials_observed=%s\n", serials
+        printf "storage_probe_process_snapshot_present=%s\n", storage_process_snapshot_present
+        printf "storage_probe_installer_log_present=%s\n", storage_installer_log_present
+        printf "storage_probe_udisks_context_present=%s\n", storage_udisks_context_present
 
         # S7.1R16 Section 8/Objectives F-G: honest ordering conclusions
         # only ever "true"/"false" when BOTH sides are real, observed

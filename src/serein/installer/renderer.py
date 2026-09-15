@@ -82,6 +82,18 @@ QA_EVIDENCE_MAX_FAILED_CHANGE_IDS = 5
 # total ceiling is raised again accordingly, still small, explicit,
 # and never unbounded.
 QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES = 262144
+# S7.1R21 Objective (storage probe internal-evidence instrumentation):
+# a third bounded frame kind, capturing the FIRST occurrence of each
+# of three known Filesystem/_probe/probe_once storage-probe failure
+# signals (a real S7.1R20 forensic finding - see
+# build_qa_evidence_watcher_script's own docstring). Deliberately
+# small (3, one per known trigger, each deduplicated) - never one per
+# poll iteration. The existing QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES
+# ceiling is left UNCHANGED: 5*4096 + 6*16384 + 3*32768 = 217088,
+# still comfortably under the existing 262144 ceiling, so raising it
+# is not necessary (Section 13's own "only if necessary" instruction).
+QA_EVIDENCE_MAX_STORAGE_FRAMES = 3
+QA_EVIDENCE_MAX_BYTES_PER_STORAGE_FRAME = 32768
 
 # S7.1R16 Objective A / S7.1R17 corrective: the watcher script is
 # embedded as a real file at the QA-install ISO's own root (never the
@@ -193,9 +205,10 @@ def _install_state_late_command(marker: InstallStateMarker) -> str:
 
 
 def build_qa_evidence_watcher_script() -> str:
-    """The guest-side bounded evidence producer for BOTH recurring
+    """The guest-side bounded evidence producer for THREE recurring
     pathology families this project has observed (S7.1R14 Objective A
-    + S7.1R15 Objective B + S7.1R16 Objectives A-G). A POSIX ``/bin/sh``
+    + S7.1R15 Objective B + S7.1R16 Objectives A-G + S7.1R21 storage
+    probe internal-evidence instrumentation). A POSIX ``/bin/sh``
     script (no bashisms - the live ISO's default shell is dash) that:
 
     1. emits a single ``SEREIN_EVIDENCE_WATCHER_STARTED`` marker with a
@@ -219,7 +232,34 @@ def build_qa_evidence_watcher_script() -> str:
        timestamps for the snapd/portal/desktop-security-center/
        snapd.hold sequence (Objectives F/G) - each is filled in only
        from what this run's own bounded journal window actually shows,
-       never guessed.
+       never guessed;
+    4. **S7.1R21**: watches for the first occurrence of each of three
+       known ``Filesystem/_probe/probe_once`` storage-probe failure
+       signals (``probe_once``+``cancelled`` together,
+       ``block_probe_fail``, ``disk_probe_fail`` - the exact real
+       S7.1R20 forensic findings) and exports one bounded
+       ``SEREIN STORAGE PROBE FRAME`` the first time each is seen -
+       bounded, allowlisted excerpts of real installer-internal logs
+       (``/var/log/installer/ubuntu_bootstrap.log``, confirmed present
+       in real S7.1R20 evidence; ``subiquity-server-debug.log``/
+       ``curtin-install.log``, checked but never assumed present),
+       read-only device topology/identity (``lsblk``, ``udevadm``
+       properties - never relies on ``/dev/vda``/``/dev/vdb`` ordering
+       alone, since serial/udev properties let a HOST-SIDE extractor
+       classify PROTECTED/TARGET/INSTALL_MEDIA/OTHER later), a
+       read-only process snapshot filtered to storage-tool argv
+       (probert/subiquity/blkid/lsblk/parted/udevadm/udisks/
+       os-prober/grub-probe), a wider dedicated journal window
+       filtered to storage-relevant keywords (never the same narrow
+       200-line window used for snap-signal DETECTION - the real R20
+       failure window spans minutes of unrelated desktop-session
+       noise), and a dedicated udisks2 context section (journal lines,
+       active udisks processes, vd*-device mount state) to test the
+       S7.1R20 H2 hypothesis (udisks2 automount interference) without
+       disabling/masking/stopping udisks2 or changing its policy in
+       any way. This is instrumentation only - it does not, and
+       cannot, prove root cause by itself; it exists so a future real
+       run's own captured evidence can.
 
     S7.1R16 Objective A: this watcher is no longer launched via
     Subiquity autoinstall early-commands (real Run #15/#16 evidence
@@ -251,11 +291,15 @@ def build_qa_evidence_watcher_script() -> str:
     Guest-side contract (Section 6/12's absolute requirements, all held
     by construction here, never by convention):
 
-    - reads ONLY ``/var/crash/*block_probe_fail*.crash`` and the
-      guest's own local systemd journal/snap/process state (via
-      ``journalctl``/``snap``/``systemctl``/``ps``, run against the
-      guest's OWN state, never any host resource) - never any host
-      path, never any other guest path;
+    - reads ONLY ``/var/crash/*block_probe_fail*.crash``, the guest's
+      own local systemd journal/snap/process state (via
+      ``journalctl``/``snap``/``systemctl``/``ps``), and - S7.1R21 -
+      a small, fixed, explicitly allowlisted family of files under
+      ``/var/log/installer/`` plus ``lsblk``/``udevadm`` device
+      topology/identity output, run against the guest's OWN state,
+      never any host resource - never any host path, never any other
+      guest path, and NEVER a recursive/arbitrary export of
+      ``/var/log`` or any other directory;
     - writes ONLY to the named virtio-serial port - never any other
       file, device, or network socket;
     - never executes a host command, never opens a network connection,
@@ -265,18 +309,19 @@ def build_qa_evidence_watcher_script() -> str:
       loop, never ``while true`` - it exits on its own well before the
       host's own QEMU timeout, rather than depending on the guest ever
       shutting down gracefully;
-    - bounded: at most ``MAX_CRASH_FILES`` distinct crash files and at
-      most ``MAX_SNAP_FRAMES`` distinct snap-pathology frames are ever
-      exported, each capped at its own per-item byte limit, under one
-      shared ``MAX_TOTAL_EVIDENCE_BYTES`` ceiling; at most
-      ``MAX_FAILED_CHANGE_IDS`` failed-Change task graphs are ever
+    - bounded: at most ``MAX_CRASH_FILES`` distinct crash files, at
+      most ``MAX_SNAP_FRAMES`` distinct snap-pathology frames, and -
+      S7.1R21 - at most ``MAX_STORAGE_FRAMES`` distinct storage-probe
+      frames are ever exported, each capped at its own per-item byte
+      limit, under one shared ``MAX_TOTAL_EVIDENCE_BYTES`` ceiling; at
+      most ``MAX_FAILED_CHANGE_IDS`` failed-Change task graphs are ever
       captured per frame, never hardcoded to Change ID 1 - every
       truncation is recorded explicitly (``truncated=true``/``false``),
       never silent;
-    - deduplicated: an in-memory ``seen`` list keyed by crash filename
-      or ``snap:<trigger>``, so the same crash file or the same snap
-      signal is exported at most once per run, even though the watcher
-      polls repeatedly;
+    - deduplicated: an in-memory ``seen`` list keyed by crash filename,
+      ``snap:<trigger>``, or - S7.1R21 - ``storage:<trigger>``, so the
+      same crash file or the same snap/storage signal is exported at
+      most once per run, even though the watcher polls repeatedly;
     - a failing diagnostic command (``snap``/``systemctl``/
       ``journalctl``/``ps`` unavailable, or erroring) reads as
       ``NOT_OBSERVED`` and never aborts the watcher (no ``set -e``) -
@@ -292,12 +337,15 @@ def build_qa_evidence_watcher_script() -> str:
         f"MAX_SNAP_FRAMES={QA_EVIDENCE_MAX_SNAP_FRAMES}",
         f"MAX_BYTES_PER_SNAP_FRAME={QA_EVIDENCE_MAX_BYTES_PER_SNAP_FRAME}",
         f"MAX_FAILED_CHANGE_IDS={QA_EVIDENCE_MAX_FAILED_CHANGE_IDS}",
+        f"MAX_STORAGE_FRAMES={QA_EVIDENCE_MAX_STORAGE_FRAMES}",
+        f"MAX_BYTES_PER_STORAGE_FRAME={QA_EVIDENCE_MAX_BYTES_PER_STORAGE_FRAME}",
         f"MAX_TOTAL_EVIDENCE_BYTES={QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES}",
         f"MAX_ITERATIONS={QA_EVIDENCE_WATCHER_MAX_ITERATIONS}",
         f"SLEEP_SECONDS={QA_EVIDENCE_WATCHER_SLEEP_SECONDS}",
         'seen=""',
         "exported_count=0",
         "snap_frame_count=0",
+        "storage_frame_count=0",
         "total_bytes=0",
         "i=0",
         "",
@@ -349,6 +397,164 @@ def build_qa_evidence_watcher_script() -> str:
         "            }",
         "        }",
         "    '",
+        "}",
+        "",
+        "# S7.1R21 storage probe internal-evidence instrumentation:",
+        "# captures one bounded SEREIN STORAGE PROBE FRAME for the given",
+        "# trigger name ($1). Called at most once per trigger (caller",
+        "# already deduplicates via $seen before calling), and only",
+        "# while storage_frame_count < MAX_STORAGE_FRAMES. Observation",
+        "# only - never mounts, signals, kills, restarts, or writes",
+        "# installer state; a failing diagnostic command reads as",
+        "# NOT_OBSERVED and never aborts the watcher.",
+        "_emit_storage_frame() {",
+        '    s_trigger="$1"',
+        "    storage_frame_count=$((storage_frame_count + 1))",
+        '    s_ts=$(cut -d" " -f1 /proc/uptime 2>/dev/null || echo "")',
+        "",
+        "    # Section 7: bounded, allowlisted installer-log excerpts",
+        "    # only - a small fixed list, each existence-checked first,",
+        "    # never assumed, never a whole-file export. Only",
+        "    # /var/log/installer/ubuntu_bootstrap.log was confirmed",
+        "    # present in real S7.1R20 guest evidence - the other two",
+        "    # are well-known standard Subiquity/curtin log names,",
+        "    # checked the same defensive way, never assumed.",
+        "    s_storage_grep="
+        "'Filesystem|_probe|probe_once|probert|block_probe|disk_probe|"
+        "restricted|udev|blkid|parted|lsblk|device|timeout|cancel|"
+        "exception|traceback'",
+        '    s_log_bootstrap="NOT_OBSERVED"',
+        "    if [ -r /var/log/installer/ubuntu_bootstrap.log ]; then",
+        '        s_log_bootstrap=$(grep -iE "$s_storage_grep" '
+        "/var/log/installer/ubuntu_bootstrap.log 2>/dev/null | tail -n 60)",
+        '        [ -z "$s_log_bootstrap" ] && s_log_bootstrap="NOT_OBSERVED"',
+        "    fi",
+        '    s_log_subiquity_debug="NOT_OBSERVED"',
+        "    if [ -r /var/log/installer/subiquity-server-debug.log ]; then",
+        '        s_log_subiquity_debug=$(grep -iE "$s_storage_grep" '
+        "/var/log/installer/subiquity-server-debug.log 2>/dev/null | tail -n 60)",
+        '        [ -z "$s_log_subiquity_debug" ] && s_log_subiquity_debug="NOT_OBSERVED"',
+        "    fi",
+        '    s_log_curtin="NOT_OBSERVED"',
+        "    if [ -r /var/log/installer/curtin-install.log ]; then",
+        "        s_log_curtin=$(grep -iE "
+        "'block_probe|disk_probe|device|timeout|cancel|exception|traceback' "
+        "/var/log/installer/curtin-install.log 2>/dev/null | tail -n 40)",
+        '        [ -z "$s_log_curtin" ] && s_log_curtin="NOT_OBSERVED"',
+        "    fi",
+        "",
+        "    # Section 8: read-only device topology/identity - never",
+        "    # mounts, never modifies. Serial/udev properties let a",
+        "    # HOST-SIDE extractor classify",
+        "    # PROTECTED/TARGET/INSTALL_MEDIA/OTHER later, never this",
+        "    # watcher itself, and never by guest device-path ordering alone.",
+        "    s_lsblk=$(lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,RO,SERIAL 2>/dev/null)",
+        '    [ -z "$s_lsblk" ] && s_lsblk="NOT_OBSERVED"',
+        '    s_udev_props="NOT_OBSERVED"',
+        "    if command -v udevadm >/dev/null 2>&1; then",
+        "        s_udev_props=$(",
+        "            for d in /sys/block/vd* /sys/block/sr*; do",
+        '                [ -e "$d" ] || continue',
+        '                dn=$(basename "$d")',
+        '                udevadm info --query=property --name="/dev/$dn" 2>/dev/null | '
+        "grep -E '^(DEVNAME|ID_SERIAL|ID_SERIAL_SHORT|ID_MODEL|ID_BUS)='",
+        "            done",
+        "        )",
+        '        [ -z "$s_udev_props" ] && s_udev_props="NOT_OBSERVED"',
+        "    fi",
+        "",
+        "    # Section 9: one bounded, read-only process snapshot - no",
+        "    # signal, no kill, no ptrace, no state change of any kind.",
+        "    s_procs=$(ps -eo pid,ppid,stat,etime,args 2>/dev/null | grep -iE "
+        "'probert|subiquity|blkid|lsblk|parted|udevadm|udisks|os-prober|grub-probe' | "
+        "grep -v 'grep -')",
+        '    [ -z "$s_procs" ] && s_procs="NOT_OBSERVED"',
+        "",
+        "    # Section 10: a wider, DEDICATED journal fetch (never the",
+        "    # shared 200-line snap-detection window alone) filtered to",
+        "    # storage-relevant keywords only.",
+        "    s_journal_wide=$(journalctl --no-pager -o short-monotonic -n 1000 2>/dev/null) "
+        '|| s_journal_wide=""',
+        '    s_journal_window="NOT_OBSERVED"',
+        '    if [ -n "$s_journal_wide" ]; then',
+        '        s_journal_window=$(printf "%s" "$s_journal_wide" | grep -iE '
+        "'subiquity|Filesystem|probe_once|probert|block_probe|disk_probe|udisks|udev|"
+        "blkid|parted' | tail -n 80)",
+        '        [ -z "$s_journal_window" ] && s_journal_window="NOT_OBSERVED"',
+        "    fi",
+        "",
+        "    # Section 11 (H2 falsification/support): udisks-specific",
+        "    # context only - never disables/masks/stops udisks, never",
+        "    # changes automount policy, observation only.",
+        '    s_udisks_journal="NOT_OBSERVED"',
+        '    if [ -n "$s_journal_wide" ]; then',
+        '        s_udisks_journal=$(printf "%s" "$s_journal_wide" | grep -iE '
+        "'udisks|automount' | tail -n 40)",
+        '        [ -z "$s_udisks_journal" ] && s_udisks_journal="NOT_OBSERVED"',
+        "    fi",
+        "    s_udisks_procs=$(ps -eo pid,ppid,stat,etime,args 2>/dev/null | grep -i 'udisks' "
+        "| grep -v 'grep ')",
+        '    [ -z "$s_udisks_procs" ] && s_udisks_procs="NOT_OBSERVED"',
+        "    s_mount_state=$(mount 2>/dev/null | grep -E 'vda|vdb')",
+        '    [ -z "$s_mount_state" ] && s_mount_state="NOT_OBSERVED"',
+        "",
+        "    # Section 6/13: header fields + per-item bound with an",
+        "    # honest truncated= flag - the body is sized BEFORE the",
+        "    # header is finalized so the flag is never wrong.",
+        "    s_header_budget=200",
+        "    s_body_budget=$((MAX_BYTES_PER_STORAGE_FRAME - s_header_budget))",
+        '    [ "$s_body_budget" -lt 0 ] && s_body_budget=0',
+        "    s_body=$(",
+        '        echo "[INSTALLER_LOG_UBUNTU_BOOTSTRAP]"; echo "$s_log_bootstrap"',
+        '        echo ""',
+        '        echo "[INSTALLER_LOG_SUBIQUITY_SERVER_DEBUG]"; echo "$s_log_subiquity_debug"',
+        '        echo ""',
+        '        echo "[INSTALLER_LOG_CURTIN_INSTALL]"; echo "$s_log_curtin"',
+        '        echo ""',
+        '        echo "[DEVICE_TOPOLOGY_LSBLK]"; echo "$s_lsblk"',
+        '        echo ""',
+        '        echo "[DEVICE_UDEV_PROPERTIES]"; echo "$s_udev_props"',
+        '        echo ""',
+        '        echo "[PROCESS_SNAPSHOT]"; echo "$s_procs"',
+        '        echo ""',
+        '        echo "[STORAGE_JOURNAL_WINDOW]"; echo "$s_journal_window"',
+        '        echo ""',
+        '        echo "[UDISKS_JOURNAL_CONTEXT]"; echo "$s_udisks_journal"',
+        '        echo ""',
+        '        echo "[UDISKS_PROCESS_SNAPSHOT]"; echo "$s_udisks_procs"',
+        '        echo ""',
+        '        echo "[MOUNT_STATE_VD_DEVICES]"; echo "$s_mount_state"',
+        "    )",
+        '    s_body_full_len=${#s_body}',
+        '    s_frame_trunc="false"',
+        '    if [ "$s_body_full_len" -gt "$s_body_budget" ]; then',
+        '        s_body=$(printf "%s" "$s_body" | head -c "$s_body_budget")',
+        '        s_frame_trunc="true"',
+        "    fi",
+        "    s_frame=$(",
+        '        echo "=== SEREIN STORAGE PROBE FRAME ==="',
+        '        echo "frame_sequence=$storage_frame_count"',
+        '        echo "trigger=$s_trigger"',
+        '        echo "timestamp=$s_ts"',
+        '        echo "truncated=$s_frame_trunc"',
+        '        echo ""',
+        '        printf "%s" "$s_body"',
+        '        echo ""',
+        '        echo "=== END STORAGE PROBE FRAME ==="',
+        "    )",
+        '    s_flen=${#s_frame}',
+        "    remaining=$((MAX_TOTAL_EVIDENCE_BYTES - total_bytes))",
+        '    if [ "$remaining" -gt 0 ] && [ -e "$PORT" ] && [ -w "$PORT" ]; then',
+        '        [ "$s_flen" -gt "$remaining" ] && s_frame=$(printf "%s" "$s_frame" | '
+        'head -c "$remaining") && s_flen="$remaining"',
+        "        # A trailing newline is always appended here (never part of",
+        "        # the byte-capped $s_frame itself) so two consecutive",
+        "        # frames can never run together onto the same line - the",
+        "        # host-side extractor's own ^=== ... ===$ anchored match",
+        "        # depends on this separator existing unconditionally.",
+        '        printf "%s\\n" "$s_frame" >> "$PORT" 2>/dev/null || true',
+        "        total_bytes=$((total_bytes + s_flen + 1))",
+        "    fi",
         "}",
         "",
         "# S7.1R16 Objective A/8: the boot marker - written ONCE, before",
@@ -571,6 +777,55 @@ def build_qa_evidence_watcher_script() -> str:
         "                    total_bytes=$((total_bytes + flen))",
         "                fi",
         "            fi",
+        "        fi",
+        "",
+        "        # S7.1R21 storage probe internal-evidence",
+        "        # instrumentation: the first occurrence of any of the",
+        "        # three real S7.1R20 forensic signals -",
+        "        # probe_once+cancelled, block_probe_fail,",
+        "        # disk_probe_fail - triggers one bounded",
+        "        # SEREIN STORAGE PROBE FRAME. Reuses the SAME",
+        "        # $recent_journal fetch above for trigger DETECTION",
+        "        # (cheap, already-fetched), but the frame's own",
+        "        # journal-window CONTENT uses a separate, wider,",
+        "        # dedicated fetch below (Section 10 - the real R20",
+        "        # failure window spans minutes of unrelated noise the",
+        "        # narrow 200-line detection window would not capture).",
+        "        #",
+        "        # The three triggers are checked with INDEPENDENT `if`",
+        "        # statements below, never `elif` - a real run's own",
+        "        # `-n 200` journal snapshot commonly keeps showing an",
+        "        # ALREADY-DEDUPLICATED earlier trigger's own lines for",
+        "        # many subsequent polls (they do not scroll out of a",
+        "        # 200-line window quickly), so an elif chain would let",
+        "        # the first-priority trigger perpetually 'win' the",
+        "        # branch and never fall through to check the other two",
+        "        # - confirmed as a real bug via this round's own",
+        "        # functional test before being fixed here.",
+        '        if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
+        'printf "%s" "$recent_journal" | grep -qi \'probe_once\' && '
+        'printf "%s" "$recent_journal" | grep -qi \'cancelled\'; then',
+        '            case " $seen " in',
+        '                *" storage:probe_cancelled "*) ;;',
+        '                *) seen="$seen storage:probe_cancelled"; '
+        '_emit_storage_frame probe_cancelled ;;',
+        "            esac",
+        "        fi",
+        '        if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
+        'printf "%s" "$recent_journal" | grep -qi \'block_probe_fail\'; then',
+        '            case " $seen " in',
+        '                *" storage:block_probe_fail "*) ;;',
+        '                *) seen="$seen storage:block_probe_fail"; '
+        '_emit_storage_frame block_probe_fail ;;',
+        "            esac",
+        "        fi",
+        '        if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
+        'printf "%s" "$recent_journal" | grep -qi \'disk_probe_fail\'; then',
+        '            case " $seen " in',
+        '                *" storage:disk_probe_fail "*) ;;',
+        '                *) seen="$seen storage:disk_probe_fail"; '
+        '_emit_storage_frame disk_probe_fail ;;',
+        "            esac",
         "        fi",
         "    fi",
         "    i=$((i + 1))",
