@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/installer-layer-b-evidence.schema.json",
+  "title": "Serein Installer Layer-B Evidence",
+  "description": "Compact, machine-readable evidence a real Installer Layer-B run (target selection, plan validation, real installer execution, protected-disk hashing, installed-system boot) produces (S7.1 Section 38). Every field except source_commit is constructible even when an earlier stage failed or never ran - stage-result fields use \"not_performed\" for that, never a fabricated pass/fail. Never includes a username, hostname, home directory, or a real credential - the QA credential is generated at runtime and never recorded here.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "source_commit",
+    "failure_stage",
+    "failure_reason",
+    "secondary_failures",
+    "installer_backend",
+    "installer_backend_version",
+    "installer_backend_available",
+    "target_explicit",
+    "target_identity",
+    "target_identity_revalidated",
+    "protected_disk_identities",
+    "plan_valid",
+    "all_destructive_ops_on_target",
+    "target_disk_before_sha256",
+    "target_disk_after_sha256",
+    "target_disk_changed",
+    "protected_disk_before_sha256",
+    "protected_disk_after_sha256",
+    "protected_disk_modification_count",
+    "protected_disk_hash_unchanged",
+    "target_esp_present",
+    "target_root_present",
+    "protected_esp_unchanged",
+    "installation_status",
+    "install_media_removed_for_boot",
+    "installed_boot_status",
+    "installed_boot_mode",
+    "installed_boot_marker",
+    "install_media_attached_during_installed_boot",
+    "serein_core_present",
+    "firstboot_provisioning",
+    "autoinstall_mode",
+    "autoinstall_production_default",
+    "target_disk_attached",
+    "physical_disk_passthrough"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "diskIdentity": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "serial": { "type": ["string", "null"] },
+        "wwn": { "type": ["string", "null"] },
+        "id_path": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "size_bytes": { "type": ["integer", "null"] },
+        "observed_device_path": { "type": ["string", "null"] }
+      }
+    }
+  },
+  "properties": {
+    "schema_version": { "const": 1 },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "failure_stage": { "type": ["string", "null"] },
+    "failure_reason": { "type": ["string", "null"] },
+    "secondary_failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["stage", "reason"],
+        "properties": {
+          "stage": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "installer_backend": { "type": ["string", "null"] },
+    "installer_backend_version": { "type": ["string", "null"] },
+    "installer_backend_available": { "type": "boolean" },
+    "target_explicit": { "type": "boolean" },
+    "target_identity": { "$ref": "#/$defs/diskIdentity" },
+    "target_identity_revalidated": { "type": "boolean" },
+    "protected_disk_identities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/diskIdentity" }
+    },
+    "plan_valid": { "type": "boolean" },
+    "all_destructive_ops_on_target": { "type": "boolean" },
+    "target_disk_before_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$|^$" },
+    "target_disk_after_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$|^$" },
+    "target_disk_changed": { "type": "boolean" },
+    "protected_disk_before_sha256": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+    },
+    "protected_disk_after_sha256": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+    },
+    "protected_disk_modification_count": { "type": "integer", "minimum": 0 },
+    "protected_disk_hash_unchanged": { "type": "boolean" },
+    "target_esp_present": { "type": "boolean" },
+    "target_root_present": { "type": "boolean" },
+    "protected_esp_unchanged": { "type": "boolean" },
+    "installation_status": { "type": "string", "enum": ["pass", "fail", "not_performed"] },
+    "install_media_removed_for_boot": { "type": "boolean" },
+    "installed_boot_status": { "type": "string", "enum": ["pass", "fail", "not_performed"] },
+    "installed_boot_mode": { "type": ["string", "null"], "enum": ["uefi", "bios", null] },
+    "installed_boot_marker": { "type": ["string", "null"] },
+    "install_media_attached_during_installed_boot": { "type": "boolean" },
+    "serein_core_present": { "type": "boolean" },
+    "firstboot_provisioning": { "type": "string", "enum": ["pending", "complete", "unknown"] },
+    "autoinstall_mode": { "type": "string", "enum": ["qa_only", "production"] },
+    "autoinstall_production_default": { "const": false },
+    "target_disk_attached": { "type": "boolean" },
+    "physical_disk_passthrough": { "const": false }
+  }
+}

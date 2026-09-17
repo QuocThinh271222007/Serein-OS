@@ -217,9 +217,14 @@ class TestBaseImage:
     def test_unverified_base_cannot_build(self, tmp_path, monkeypatch):
         # run_build must fail closed if the cached base ISO does not
         # exist / does not match - it must never proceed to extraction.
+        # Uses a hermetic fake repo (never the real REPO_ROOT, whose own
+        # cache/upstream/ may legitimately hold a real, verified base
+        # ISO) with its cached ISO removed after the fact.
         monkeypatch.chdir(tmp_path)
+        repo_root = _fake_repo_root(tmp_path)
+        (repo_root / "cache" / "upstream" / "fake-base.iso").unlink()
         with pytest.raises(BuildError):
-            run_build(repo_root=REPO_ROOT, work_dir=tmp_path / "work",
+            run_build(repo_root=repo_root, work_dir=tmp_path / "work",
                        output_iso=tmp_path / "out.iso", source_commit="a" * 40)
 
 
@@ -1099,12 +1104,15 @@ class TestBuildPipeline:
                        output_iso=tmp_path / "out.iso", source_commit="")
 
     def test_run_build_fails_closed_without_cached_base(self, tmp_path):
-        # Uses the real pinned base-image.json (base.py always loads
-        # from the repo's own contract) but no cached ISO exists under
-        # tmp_path's cache dir, so this must fail before any extraction.
+        # A hermetic fake repo (never the real REPO_ROOT, whose own
+        # cache/upstream/ may legitimately hold a real, verified base
+        # ISO) with no cached ISO present - must fail before any
+        # extraction.
+        repo_root = _fake_repo_root(tmp_path)
+        (repo_root / "cache" / "upstream" / "fake-base.iso").unlink()
         with pytest.raises(BuildError, match="verification failed"):
             run_build(
-                repo_root=REPO_ROOT, work_dir=tmp_path / "work",
+                repo_root=repo_root, work_dir=tmp_path / "work",
                 output_iso=tmp_path / "out.iso", source_commit="a" * 40,
             )
 

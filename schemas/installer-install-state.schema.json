@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/installer-install-state.schema.json",
+  "title": "Serein Install-State Marker",
+  "description": "The S7.2 handoff contract written to /etc/serein/install-state.json on a freshly installed target (S7.1 Section 27-28). firstboot_provisioning must remain \"pending\" on every S7.1-produced installation - S7.1 never performs S7.2 provisioning itself.",
+  "type": "object",
+  "required": [
+    "schema_version", "phase", "installation_complete", "firstboot_provisioning",
+    "source_media_version", "source_commit"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "phase": { "const": "s7.1" },
+    "installation_complete": { "const": true },
+    "firstboot_provisioning": { "type": "string", "enum": ["pending", "complete", "unknown"] },
+    "source_media_version": { "type": "string" },
+    "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" }
+  }
+}

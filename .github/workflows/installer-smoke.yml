@@ -1,0 +1,1121 @@
+name: Installer Smoke (real target-disk installation)
+
+# Layer B for S7.1 (Sections 42-52; storage-lifetime + evidence-fidelity
+# corrective added by S7.1R) - the real, multi-GB installer execution
+# path: builds the S7.0 production/QA media, embeds a real QA-only
+# autoinstall config, boots a real installer under real QEMU against
+# two real virtual disks (a protected fixture that MUST remain
+# byte-identical, and a target the install is explicitly allowed to
+# destroy), and then boots the INSTALLED target on its own to prove it
+# is genuinely self-contained. Mirrors iso-smoke.yml's conventions
+# exactly (same trigger model, same first-failure-wins evidence
+# discipline, same "evidence always uploaded, closure gate always
+# enforced" contract) - see docs/installer/architecture.md.
+#
+# Two ways to run it:
+#   - workflow_dispatch: manual, any time, optionally pinned to an
+#     exact SHA via the `sha` input.
+#   - pull_request (labeled/synchronize/reopened) + the
+#     `run-installer-smoke` label present: opt-in per PR, deliberately
+#     a SEPARATE label from S7.0's `run-iso-smoke` - this job is even
+#     more expensive (it also builds/boots real virtual disks) and
+#     must never run merely because a PR wants the S7.0 ISO smoke test.
+#
+# Deliberately `pull_request`, never `pull_request_target` - this
+# workflow executes code from the feature branch and must never run
+# with write-capable secrets. `permissions: contents: read` is the
+# only permission granted; no repository secret is required anywhere.
+#
+# REAL_PHYSICAL_DISK_PASSTHROUGH=false is enforced by construction:
+# every `-drive`/`-cdrom` argument anywhere in this workflow (and in
+# every installer/scripts/*.sh script it calls) names a path this job
+# itself created inside the ephemeral runner's own workspace - never
+# `/dev/sdX`/`/dev/nvme0n1` or any other physical device path.
+#
+# Evidence is ALWAYS assembled and uploaded (`if: always()`), even when
+# an early stage fails - a real defect must produce a FAILED workflow
+# run with a PRESENT evidence artifact, never a green run and never a
+# crash that loses the evidence. The final "Enforce Installer Layer-B
+# closure" step is the one explicit fail-closed gate.
+#
+# S7.1R storage-lifetime model (Section 3-13 of the S7.1R corrective):
+# Run #1 (RUN_ID=34216492634) failed at disk_preflight because the
+# original model summed EVERY large artifact this job ever creates as
+# though they all coexisted simultaneously (55 GiB required against a
+# real ~36.4 GiB available). They do not - S7.0's own extracted work
+# tree, the production ISO, the QA ISO, and the QA-install extraction
+# tree are each only needed up through their own real final consumer,
+# never after. `installer/scripts/release-artifact.sh` (a single,
+# root-confined, exact-path, never-sudo helper - mirrors
+# distribution/scripts/record-failure.sh's "one canonical helper"
+# discipline) frees each one immediately after that consumer succeeds,
+# so later stages' preflight-relevant peak is genuinely smaller.
+# `installer/scripts/log-disk-usage.sh` records real available/used
+# space plus `du -sh` of whatever large artifacts currently exist after
+# every major stage, so a real run produces real telemetry this
+# estimate can be corrected against - exactly like S7.0's own preflight
+# arithmetic was revised more than once after real evidence.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Exact commit SHA to build (defaults to the current ref's HEAD)"
+        required: false
+        default: ""
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  installer-smoke:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+       contains(github.event.pull_request.labels.*.name, 'run-installer-smoke'))
+    runs-on: ubuntu-latest
+    # S7.1R8 Objective A / S7.1R9 Objective C / S7.1R10 Objective B: an
+    # EXPLICIT, bounded job timeout - never relying on GitHub's own
+    # much larger 360-minute default, matching this workflow's own
+    # "always bounded, never open-ended" discipline for every other
+    # timeout it defines.
+    #
+    # Real Run #9 (RUN_ID=34371427617) proved R8's 180-minute budget
+    # was ALSO too tight - real observed timing:
+    #   job start  ~15:37:17 UTC
+    #   QEMU start ~16:57:46 UTC  (pre-QEMU: ~80.5 min - a major
+    #                              contributor was fetching the pinned
+    #                              base image, ~68 min of that alone)
+    #   QEMU end   ~18:27:54 UTC  (90 min - the real install budget)
+    #   job end    ~18:31:38 UTC
+    #   total observed: ~174 min, even though the run never reached
+    #   ANY of the downstream closure steps (target-layout inspection,
+    #   both boot checks) because the install itself did not finish -
+    #   those steps' own real time still has to be added on top of the
+    #   observed total, not folded into it.
+    #
+    # Real Run #10 (RUN_ID=34432290533) reached real Subiquity
+    # postinstall and started real `unattended-upgrades` at
+    # ~5131.64s, with the R9 firmware-notifier storm mitigation
+    # confirmed working (no recurrence) - yet still timed out at the
+    # previous 5400s QEMU budget, leaving only ~268s for the real
+    # security-update postinstall stage. This is now direct, proven
+    # evidence 5400s is empirically insufficient (never merely because
+    # the run failed) - see the "Run real QA autoinstall" step's own
+    # comment for the full Objective A rationale behind the 5400s ->
+    # 6600s (110 min) QEMU budget increase.
+    #
+    # Revised, evidence-based job-level budget:
+    #   worst observed pre-install setup (Run #9):        ~80 min
+    #   real QEMU installer budget (R10 Objective A: 6600s): 110 min
+    #   boot check A (self-contained, <=600s TCG bound):   <=10 min
+    #   boot check B (with protected disk, same bound):    <=10 min
+    #   target-layout inspection + hashing/evidence/
+    #     upload/closure:                                  ~15 min
+    #   CI variance reserve (network/runner contention,
+    #     base-image-fetch variance beyond Run #9's own
+    #     observed ~68 min):                                ~25 min
+    #   -------------------------------------------------------------
+    #   total:                                              ~250 min
+    #
+    # Rounded up to a comfortably bounded 270 min (4.5h) - the task's
+    # own stated ceiling for this corrective, well under GitHub's own
+    # 360-min ceiling, with real margin. Not an unbounded/arbitrary
+    # increase - every component of this budget is either a real
+    # observed run duration or an independently-bounded downstream
+    # step's own documented timeout (neither boot check's own bound is
+    # weakened or removed by this job-level change).
+    timeout-minutes: 270
+    steps:
+      - name: Determine expected source SHA
+        id: expected-sha
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha=${{ inputs.sha != '' && inputs.sha || github.sha }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.expected-sha.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Verify exact-head checkout
+        run: |
+          EXPECTED_SOURCE_SHA="${{ steps.expected-sha.outputs.sha }}"
+          ACTUAL_CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          echo "EXPECTED_SOURCE_SHA=${EXPECTED_SOURCE_SHA}"
+          echo "ACTUAL_CHECKED_OUT_SHA=${ACTUAL_CHECKED_OUT_SHA}"
+          if [ "${EXPECTED_SOURCE_SHA}" != "${ACTUAL_CHECKED_OUT_SHA}" ]; then
+            echo "::error::checked-out SHA does not match the expected feature-head SHA - refusing to build"
+            exit 1
+          fi
+          echo "SOURCE_COMMIT=${ACTUAL_CHECKED_OUT_SHA}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (editable, with dev dependencies)
+        run: python -m pip install -e ".[dev]"
+
+      # Ephemeral GitHub-hosted-runner setup only - never target-host
+      # mutation. Includes S7.0's own build tooling (this job first
+      # reuses run_build() unchanged) plus the additional real tools
+      # S7.1 needs to create/inspect real virtual disks: qemu-utils
+      # (qemu-img/qemu-nbd), parted, dosfstools (mkfs.vfat),
+      # e2fsprogs (mkfs.ext4) - never installed on, or run against, any
+      # host block device.
+      - name: Install build + installer tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso jq qemu-system-x86 qemu-utils ovmf \
+            parted dosfstools e2fsprogs
+
+      - name: Reclaim ephemeral runner SDK space
+        if: runner.environment == 'github-hosted'
+        run: |
+          FREE_BEFORE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
+          echo "FREE_SPACE_BEFORE_CLEANUP_KB=${FREE_BEFORE_KB}"
+
+          for candidate in \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            ; do
+            resolved="$(realpath -m "${candidate}")"
+            if [ "${resolved}" != "${candidate}" ]; then
+              echo "skipping ${candidate}: does not resolve to itself" >&2
+              continue
+            fi
+            case "${resolved}" in
+              /usr/local/lib/android|/usr/share/dotnet|/opt/ghc|/usr/local/.ghcup|/usr/share/swift) ;;
+              *) echo "skipping ${candidate}: not on the exact allowlist" >&2; continue ;;
+            esac
+            if [ -d "${resolved}" ]; then
+              size="$(du -sh "${resolved}" 2>/dev/null | cut -f1 || echo '?')"
+              echo "removing ${resolved} (${size})"
+              sudo rm -rf --one-file-system -- "${resolved}"
+            fi
+          done
+
+          FREE_AFTER_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
+          echo "FREE_SPACE_AFTER_CLEANUP_KB=${FREE_AFTER_KB}"
+          echo "SPACE_RECLAIMED_KB=$((FREE_AFTER_KB - FREE_BEFORE_KB))"
+
+      - name: "Disk usage: after_cleanup"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_cleanup
+
+      # Disk-space preflight (S7.1R Corrective A) - a REAL simultaneous-
+      # residency model, not a sum of every artifact this job ever
+      # creates. Named components, each tied to a real lifecycle point
+      # documented in docs/installer/storage-lifecycle.md:
+      #
+      #   S7.0's OWN internal peak (base ISO + extracted tree +
+      #   production ISO + QA ISO, all alive briefly while the QA
+      #   rebuild is in progress, before EPHEMERAL_STORAGE=1 releases
+      #   the base ISO) is already 28 GiB - see iso-smoke.yml's own
+      #   preflight, unchanged, since this job reuses build-iso.sh
+      #   as-is. This job's build step can never need less than that.
+      #
+      #   The real peak AFTER that step returns is reached inside
+      #   "Prepare QA-install ISO", which needs the QA ISO (7, still the
+      #   source), a full second extraction of it (7,
+      #   qa-install-extracted), and the QA-install ISO being written
+      #   (7) all at once = 21 GiB - by this point S7.0's own base ISO
+      #   and extracted tree, and the production ISO, have ALL already
+      #   been released by their own real final consumers (see the
+      #   "Release ..." steps below), so they do not add to this peak.
+      #
+      #   PROTECTED+TARGET qcow2 fixtures are SPARSE - their combined
+      #   4+8=12 GiB figure is VIRTUAL capacity, never budgeted directly
+      #   as guaranteed host allocation (S7.1R Section 9). A
+      #   freshly-created, lightly populated pair (GPT + FAT32 ESP +
+      #   ext4 data/root with a few sentinel files, no OS content yet)
+      #   allocates well under 1 GiB combined - real allocated size is
+      #   measured directly via `du -sh`/`qemu-img info` in the disk-
+      #   usage telemetry steps below, never assumed. A REAL install
+      #   DOES grow the target's actual allocated bytes as curtin
+      #   copies real content into it though - the live QA-install
+      #   medium's own squashfs is the practical upper bound on how
+      #   much a base install can populate, budgeted below as
+      #   FIXTURE_QCOW2_ALLOCATED_GIB, distinct from and much smaller
+      #   than FIXTURE_QCOW2_VIRTUAL_GIB (documented for contrast only,
+      #   never summed into the required total).
+      #
+      #   S7.1R6: real Run #6 (RUN_ID=34265949262) proved curtin
+      #   actually progressed into the target chroot's real apt/dpkg
+      #   phase (genuine package-database work, not merely a partition
+      #   table write) before the previous 1800s timeout - meaning a
+      #   real, successful run (now with a 3600s budget, Objective A)
+      #   plausibly grows the target's real allocated bytes well beyond
+      #   the original conservative estimate. FIXTURE_QCOW2_ALLOCATED_GIB
+      #   is revised 6->12 accordingly - still comfortably within the
+      #   SAME REQUIRED_GIB, since ISOPREP_PEAK_GIB remains the binding
+      #   constraint either way (see the arithmetic below).
+      #
+      #   Two candidate peak moments, the real maximum of which is used:
+      #     ISOPREP_PEAK_GIB = QA_ISO_GIB(7, isoprep's own source) +
+      #       QA_INSTALL_EXTRACTED_TREE_GIB(7, isoprep's own independent
+      #       re-extraction) + QA_INSTALL_ISO_GIB(7, being rebuilt) = 21
+      #     INSTALL_PEAK_GIB = QA_INSTALL_ISO_GIB(7, still present until
+      #       released right after the real install completes -
+      #       Section 47) + FIXTURE_QCOW2_ALLOCATED_GIB(12, revised
+      #       real-allocation estimate, mostly target-disk growth - the
+      #       protected disk's real allocated size never meaningfully
+      #       changes, which is the entire point of the safety proof) = 19
+      #   By this point S7.0's own base ISO, extracted tree, and
+      #   production ISO have ALL already been released by their own
+      #   real final consumers (see the "Release ..." steps below), so
+      #   none of them add to either candidate peak.
+      #
+      #   PEAK_GIB = max(ISOPREP_PEAK_GIB, INSTALL_PEAK_GIB) = 21
+      #   + SAFETY_MARGIN_GIB (6 - non-zero, generous given these are
+      #     still estimates, not measured; this number is expected to
+      #     be revised after real disk-usage telemetry from a real run,
+      #     exactly like S7.0's own preflight arithmetic was revised
+      #     more than once)
+      #   = REQUIRED_GIB (27)
+      - name: Disk space preflight
+        run: |
+          df -h .
+          QA_ISO_GIB=7
+          QA_INSTALL_EXTRACTED_TREE_GIB=7
+          QA_INSTALL_ISO_GIB=7
+          FIXTURE_QCOW2_VIRTUAL_GIB=20
+          FIXTURE_QCOW2_ALLOCATED_GIB=12
+          SAFETY_MARGIN_GIB=6
+
+          ISOPREP_PEAK_GIB=$((QA_ISO_GIB + QA_INSTALL_EXTRACTED_TREE_GIB + QA_INSTALL_ISO_GIB))
+          INSTALL_PEAK_GIB=$((QA_INSTALL_ISO_GIB + FIXTURE_QCOW2_ALLOCATED_GIB))
+          if [ "${ISOPREP_PEAK_GIB}" -ge "${INSTALL_PEAK_GIB}" ]; then
+            PEAK_GIB=${ISOPREP_PEAK_GIB}
+          else
+            PEAK_GIB=${INSTALL_PEAK_GIB}
+          fi
+          REQUIRED_GIB=$((PEAK_GIB + SAFETY_MARGIN_GIB))
+          REQUIRED_KB=$((REQUIRED_GIB * 1024 * 1024))
+          AVAILABLE_KB="$(df -Pk . | tail -1 | awk '{print $4}')"
+          echo "BUDGET_COMPONENTS:"
+          echo "  QA_ISO_GIB=${QA_ISO_GIB} (isoprep's own source, still present)"
+          echo "  QA_INSTALL_EXTRACTED_TREE_GIB=${QA_INSTALL_EXTRACTED_TREE_GIB} (isoprep's own independent re-extraction)"
+          echo "  QA_INSTALL_ISO_GIB=${QA_INSTALL_ISO_GIB} (being rebuilt)"
+          echo "  FIXTURE_QCOW2_VIRTUAL_GIB=${FIXTURE_QCOW2_VIRTUAL_GIB} (documented for contrast only - NEVER budgeted directly)"
+          echo "  FIXTURE_QCOW2_ALLOCATED_GIB=${FIXTURE_QCOW2_ALLOCATED_GIB} (real-allocation estimate, distinct from virtual capacity)"
+          echo "  (S7.0's own base ISO/extracted tree/production ISO are excluded -"
+          echo "   each is released by its own real final consumer before either peak moment)"
+          echo "ISOPREP_PEAK_GIB=${ISOPREP_PEAK_GIB}"
+          echo "INSTALL_PEAK_GIB=${INSTALL_PEAK_GIB}"
+          echo "ESTIMATED_MAX_CONCURRENT_GIB=${PEAK_GIB}"
+          echo "SAFETY_MARGIN_GIB=${SAFETY_MARGIN_GIB}"
+          echo "REQUIRED_GIB=${REQUIRED_GIB}"
+          echo "AVAILABLE_KB=${AVAILABLE_KB}"
+          echo "REQUIRED_KB=${REQUIRED_KB}"
+          if [ "${AVAILABLE_KB}" -lt "${REQUIRED_KB}" ]; then
+            ./distribution/scripts/record-failure.sh "disk_preflight" \
+              "insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required"
+            echo "::error::insufficient disk space: ${AVAILABLE_KB} KiB available, ${REQUIRED_KB} KiB required"
+            exit 1
+          fi
+
+      # Reuses S7.0's own, unmodified, already-closed pipeline
+      # (Section 3-4: "prefer configuration and adapters, never
+      # reopening S7.0 internals"). production_build/qa_transition/
+      # qa_build evidence for THIS run comes from THIS pipeline
+      # succeeding here, exactly as in iso-smoke.yml.
+      - name: Fetch pinned base image
+        run: |
+          ./distribution/scripts/fetch-base-image.sh || {
+            ./distribution/scripts/record-failure.sh "base_fetch" "fetch-base-image.sh failed"
+            exit 1
+          }
+
+      - name: Verify base image (fail-closed, checksum + signature)
+        run: |
+          ./distribution/scripts/verify-base-image.sh || {
+            ./distribution/scripts/record-failure.sh "base_verification" \
+              "verify-base-image.sh failed - checksum or signature mismatch"
+            exit 1
+          }
+
+      - name: "Disk usage: after_base_fetch"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_base_fetch
+
+      - name: Build Serein Alpha ISO (production + QA variant)
+        id: build
+        run: |
+          EPHEMERAL_STORAGE=1 ./distribution/scripts/build-iso.sh || {
+            ./distribution/scripts/record-failure.sh "production_or_qa_build" "build-iso.sh failed"
+            exit 1
+          }
+
+      # S7.1R Section 8: EPHEMERAL_STORAGE=1 already makes run_build()
+      # release the cached base ISO itself (verified directly against
+      # src/serein/distribution/build.py, not assumed) - but it never
+      # deletes build/work/extracted, the (~7 GiB) tree the base ISO was
+      # extracted into. Nothing in this workflow ever reads that tree
+      # again after this step - strict inspection re-extracts its own
+      # copy straight from the ISO FILES, never from build/work - so it
+      # is released here, right after its one and only real consumer
+      # (this build step) finishes.
+      #
+      # S7.1R2 Corrective D: Run #2 showed two release/cleanup step
+      # failures (not the causal blocker - execution continued into the
+      # real install attempt regardless). release-artifact.sh itself
+      # already treats "already absent" as a documented no-op, never a
+      # fatal error (Section 14 requirement 6); what was missing was
+      # that a GENUINE release failure (e.g. a real permission/path
+      # problem) had no recorded evidence trail at all. Every release
+      # step now records a real, first-failure-wins-safe
+      # `artifact_release_failed` stage on failure (visible in evidence
+      # - Section 14 requirement 7) without ever aborting the job over
+      # a best-effort cleanup step or masking the real causal blocker
+      # (record-failure.sh's own first-failure-wins semantics guarantee
+      # this can never overwrite an earlier real defect).
+      - name: Release S7.0 build work tree
+        if: always()
+        run: |
+          ./installer/scripts/release-artifact.sh build/work/extracted || {
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for build/work/extracted (secondary, non-blocking)"
+          }
+
+      - name: "Disk usage: after_s7_0_build"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_s7_0_build
+
+      - name: Strict-inspect production ISO
+        id: inspect-prod
+        if: always()
+        run: |
+          PROD_ISO="dist/serein-alpha-26.04-amd64.iso"
+          if [ ! -f "${PROD_ISO}" ]; then
+            echo "status=not_performed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if python -m serein.distribution inspect "${PROD_ISO}" --strict \
+              --work-dir dist/inspect-strict-work/production \
+              --expected-source-commit "${SOURCE_COMMIT}"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "production_inspection" \
+              "strict production ISO inspection failed"
+            exit 1
+          fi
+
+      # S7.1R Section 5: the production ISO has no consumer anywhere in
+      # this workflow after its own strict inspection - never read again
+      # by render-autoinstall/prepare-qa-install-iso/fixture creation/
+      # install, all of which only ever touch the QA ISO. Its manifest/
+      # sha256 sidecars are deliberately NOT deleted (tiny, and closure
+      # evidence never needs to be reconstructed from them, but keeping
+      # them costs nothing and preserves forensic value).
+      - name: Release production ISO
+        if: always()
+        run: |
+          ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64.iso || {
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the production ISO (secondary, non-blocking)"
+          }
+
+      - name: "Disk usage: after_prod_inspection"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_prod_inspection
+
+      - name: Strict-inspect QA ISO
+        id: inspect-qa
+        if: always()
+        run: |
+          QA_ISO="dist/serein-alpha-26.04-amd64-qa.iso"
+          if [ ! -f "${QA_ISO}" ]; then
+            echo "status=not_performed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if python -m serein.distribution inspect "${QA_ISO}" --strict \
+              --work-dir dist/inspect-strict-work/qa \
+              --expected-source-commit "${SOURCE_COMMIT}"; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "qa_inspection" \
+              "strict QA ISO inspection failed"
+            exit 1
+          fi
+
+      - name: "Disk usage: after_qa_inspection"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_qa_inspection
+
+      # S7.1 begins here - everything above is unmodified S7.0.
+      #
+      # Explicit, fixed serials (never an implicit/largest-disk
+      # selection - Section 9): run-qa-install.sh always attaches the
+      # protected fixture FIRST (serial=SEREIN-PROTECTED-DISK, -> guest
+      # /dev/vda) and the target fixture SECOND
+      # (serial=SEREIN-TARGET-DISK, -> guest /dev/vdb). The rendered
+      # autoinstall.yaml's storage `match` stanza references
+      # SEREIN-TARGET-DISK's serial directly - this is the real,
+      # in-guest analog of Section 11's "prefer stable evidence" for a
+      # virtual disk that has no real hardware serial of its own.
+      - name: Render QA autoinstall config
+        id: render-autoinstall
+        if: always() && steps.inspect-qa.outputs.status == 'pass'
+        run: |
+          if python -m serein.installer render-autoinstall \
+              --target-device-path /dev/vdb --target-serial SEREIN-TARGET-DISK \
+              --protected-disk SEREIN-PROTECTED-DISK:/dev/vda \
+              --source-commit "${SOURCE_COMMIT}" --source-media-version "26.04.1" \
+              --out-yaml dist/autoinstall.yaml --out-plan dist/installer-plan.json \
+              --qa-allow-autoinstall; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installer_config_invalid" \
+              "render-autoinstall failed - plan invalid or renderer refused"
+            exit 1
+          fi
+
+      - name: Prepare QA-install ISO
+        id: prepare-qa-install-iso
+        if: always() && steps.render-autoinstall.outputs.status == 'pass'
+        run: |
+          if python -m serein.installer prepare-qa-install-iso \
+              --qa-iso dist/serein-alpha-26.04-amd64-qa.iso \
+              --autoinstall-yaml dist/autoinstall.yaml \
+              --work-dir build/installer-work \
+              --out dist/serein-alpha-26.04-amd64-qa-install.iso; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installer_config_invalid" \
+              "prepare-qa-install-iso failed"
+            exit 1
+          fi
+
+      # S7.1R Section 6-7: the QA ISO's last consumer is this exact
+      # step (isoprep's own source) - never read again afterward. The
+      # QA-install extraction tree is temporary derived data whose only
+      # consumer was the rebuild that already happened inside this same
+      # step - releasing both together, right here, closes the single
+      # largest avoidable overlap this job had.
+      - name: Release QA ISO and QA-install extraction tree
+        if: always()
+        run: |
+          ./installer/scripts/release-artifact.sh \
+            dist/serein-alpha-26.04-amd64-qa.iso \
+            build/installer-work/qa-install-extracted || {
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the QA ISO/extraction tree (secondary, non-blocking)"
+          }
+
+      - name: "Disk usage: after_qa_install_iso"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_qa_install_iso
+
+      - name: Create fixture disks (protected + target)
+        id: create-fixtures
+        if: always() && steps.prepare-qa-install-iso.outputs.status == 'pass'
+        run: |
+          if ./installer/scripts/create-fixture-disks.sh dist/installer-fixtures; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installer_unavailable" \
+              "create-fixture-disks.sh failed"
+            exit 1
+          fi
+
+      - name: "Disk usage: after_fixture_creation"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_fixture_creation
+
+      # S7.1R Section 16: the closest honest, real, host-side analog of
+      # a TOCTOU re-match, immediately before the real destructive
+      # install begins - see installer/scripts/verify-fixture-topology.sh
+      # for exactly what this does and does not prove.
+      - name: Re-verify fixture topology
+        id: verify-topology
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/verify-fixture-topology.sh \
+            dist/installer-fixtures/disk-protected.qcow2 \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "target_changed" \
+              "fixture topology re-verification failed"
+            exit 1
+          }
+
+      # S7.1R4 Section 8 (generalized to both disks in S7.1R5 Objective
+      # D): a real, immediate-pre-install baseline for each disk's four
+      # separately-measured facts (container bytes, full guest-visible
+      # logical block content, and the two real sentinel files) - never
+      # merely the existing plain container-only sha256sum this
+      # workflow already takes at fixture-creation time. Establishing
+      # this baseline as close to the real install as possible (after
+      # topology re-verification, right before the destructive step)
+      # minimizes any time-of-check-to-time-of-use gap. Diagnostic only
+      # - never gates anything; the existing container-hash-based
+      # closure gate is unchanged.
+      #
+      # S7.1R5 Corrective A (Run #5, RUN_ID=34255177947, failed here):
+      # this step itself was the FIRST real workflow failure - the
+      # original implementation used qemu-nbd/a kernel nbd device node,
+      # which the exact underlying failure could not be reproduced
+      # locally (BLOCKED - no qemu-nbd in this development environment)
+      # but was the one operation in that script with no precedent of
+      # proven success anywhere in this repository (see
+      # installer/scripts/hash-disk-image.sh's own header for the full
+      # analysis). Replaced with a qemu-img-convert + losetup based
+      # implementation that needs no nbd kernel module and no
+      # kernel-nbd device node at all. This step's own failure is now
+      # ALSO wired into the established record-failure.sh secondary,
+      # non-blocking discipline (Section 18 of the S7.1R5 corrective) -
+      # a real defect the S7.1R4 version of this step did not, unlike
+      # every other failure-capable step in this workflow, ever call
+      # record-failure.sh at all, meaning its own real Run #5 failure
+      # was invisible to the evidence/closure system entirely.
+      - name: Hash protected disk (pre-install baseline)
+        id: protected-hash-before
+        if: always() && steps.verify-topology.outcome == 'success'
+        run: |
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./installer/scripts/record-secondary-failure.sh "protected_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the protected disk pre-install baseline (secondary, non-blocking)"
+          }
+
+      - name: Hash target disk (pre-install baseline)
+        id: target-hash-before
+        if: always() && steps.verify-topology.outcome == 'success'
+        run: |
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./installer/scripts/record-secondary-failure.sh "target_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the target disk pre-install baseline (secondary, non-blocking)"
+          }
+
+      # The real installer execution (Section 42-43). QA-only autoinstall
+      # (Section 7) - never production media, never a physical disk
+      # (Section 49-50).
+      #
+      # S7.1R2 Corrective B (Run #2, RUN_ID=34219273003, failed here):
+      # run-qa-install.sh now always writes qa-install-qemu-result.env
+      # (Section 7's required QEMU startup evidence fields) whether it
+      # passes or fails - cat it straight into this step's own outputs
+      # so downstream steps can see qemu_exit_status/qemu_started/
+      # failure_stage/installer_userspace_reached without ever
+      # re-deriving them. The precise failure_stage the script computed
+      # (qemu_startup/installer_timeout/installer_execution - Section 9)
+      # is what actually gets recorded as the causal blocker now,
+      # replacing the old generic, undifferentiated "install_failed".
+      #
+      # S7.1R6 Objective A: this is the ONE real, expensive Layer-B QA
+      # install budget - real Run #6 (RUN_ID=34265949262) proved the
+      # installer was ACTIVELY progressing (real curtin chroot/apt
+      # phase - "chroot ... dpkg --print-architecture", "Applying
+      # debconf selections") at ~1769s, only ~31s before the previous
+      # 1800s deadline killed it. This is the first real evidence that
+      # authorizes a bounded increase - never merely because the run
+      # failed, and never an unbounded wait: `timeout --signal=TERM`
+      # inside run-qa-install.sh still fail-closes at this new bound.
+      # Every OTHER timeout in this codebase (the bounded, non-
+      # destructive startup probe; bootcheck.py's installed-target
+      # boot-check timeout) is a genuinely separate, already-bounded
+      # scope and is deliberately left unchanged.
+      #
+      # S7.1R8 Objective A: real Run #8 (RUN_ID=34355674598) proved
+      # the installer was STILL actively progressing right up to the
+      # 3600s deadline - real curtin extract (~2107.5s->3268.4s), real
+      # curthooks (~3323.9s), EFI package install completing
+      # (~3487.6s), and kernel package installation actively starting
+      # (~3561s) when QEMU was killed at 3600s, with no idle/deadlocked
+      # period anywhere in that timeline. This is direct, proven
+      # evidence the 3600s budget is now insufficient - bumped to
+      # 5400s (90 min), still fail-closed via
+      # run-qa-install.sh's own `timeout --signal=TERM`, never
+      # unbounded.
+      #
+      # S7.1R9 Objective D: real Run #9 (RUN_ID=34371427617) reached
+      # much further - real curtin curthooks completing (~5049.98s),
+      # Subiquity postinstall entering (~5050.86s), and real-server
+      # unattended-upgrades actually starting (~5320.23s) - only ~80s
+      # before the 5400s deadline. Run #9 ALSO exposed a real,
+      # pathological restart storm of
+      # snap.firmware-updater.firmware-notifier.service (>=599
+      # observed restarts, from ~3730.94s onward, running concurrently
+      # with curthooks/postinstall) that plausibly consumed real
+      # scheduling/CPU resources during exactly this window - see
+      # serein.installer.isoprep._mask_firmware_notifier_on_qa_entry
+      # (S7.1R9 Objective A), which neutralizes it QA-side-only via a
+      # transient, this-boot-only systemd.mask= kernel parameter.
+      # DECISION at R9: KEEP 5400s, letting Run #10 be the real
+      # empirical test of whether removing the storm alone was
+      # sufficient.
+      #
+      # S7.1R10 Objective A: real Run #10 (RUN_ID=34432290533) PROVED
+      # that bet correct on the storm (the mask was actually loaded,
+      # confirmed via boot-parameter evidence, and the R9 restart
+      # storm did NOT recur) - but the installer STILL timed out.
+      # Run #10 reached real Subiquity postinstall and started real
+      # `unattended-upgrades` at ~5131.64s, leaving only ~268s
+      # (5400 - 5131.64) before the 5400s deadline killed QEMU, with
+      # no fatal unattended-upgrades error observed before that -
+      # INSTALLER_ACTIVE_AT_TIMEOUT=PROVEN,
+      # 5400_SECOND_TIMEOUT_SUFFICIENT=PROVEN_FALSE. With the storm
+      # ruled out as the (sole) cause, this is now direct evidence
+      # that the real security-update postinstall stage itself simply
+      # needs more real time than 5400s provides - bumped to 6600s
+      # (110 min), still fail-closed via run-qa-install.sh's own
+      # `timeout --signal=TERM`, never unbounded, never retried.
+      # 6600S_TIMEOUT_SUFFICIENT is NOT_OBSERVED until a real Run #11
+      # - this corrective does not claim it is proven sufficient.
+      - name: Run real QA autoinstall
+        id: run-install
+        if: always() && steps.verify-topology.outcome == 'success'
+        run: |
+          set +e
+          ./installer/scripts/run-qa-install.sh \
+              dist/serein-alpha-26.04-amd64-qa-install.iso \
+              dist/installer-fixtures/disk-protected.qcow2 \
+              dist/installer-fixtures/disk-target.qcow2 \
+              --timeout 6600
+          RUN_STATUS=$?
+          set -e
+
+          if [ -f dist/installer-fixtures/qa-install-qemu-result.env ]; then
+            cat dist/installer-fixtures/qa-install-qemu-result.env >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ "${RUN_STATUS}" -eq 0 ]; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            FAILURE_STAGE="$(
+              grep -m1 '^failure_stage=' dist/installer-fixtures/qa-install-qemu-result.env \
+                2>/dev/null | cut -d= -f2
+            )"
+            FAILURE_STAGE="${FAILURE_STAGE:-install_failed}"
+            ./distribution/scripts/record-failure.sh "${FAILURE_STAGE}" \
+              "real QA autoinstall run failed - see qa-install-serial.log and qa-install-qemu-stderr.log"
+            exit 1
+          fi
+
+      # S7.1R4 Section 10: a narrowly scoped, targeted extraction of
+      # the handful of serial-log lines that actually matter for
+      # diagnosing WHY the real installer did or did not progress
+      # (Subiquity/curtin/autoinstall/cloud-init activity, tracebacks,
+      # explicit error/warning lines) - diagnostic only, never a gate,
+      # never a substitute for the full retained serial log (still
+      # uploaded unabridged below).
+      - name: Extract installer signals from serial log
+        if: always()
+        run: |
+          ./installer/scripts/extract-installer-signals.sh \
+            dist/installer-fixtures/qa-install-serial.log \
+            dist/installer-fixtures/qa-install-subiquity-signals.log
+
+      # S7.1R7 Objective A: real Run #7 (RUN_ID=34335197624) revealed a
+      # ~3044s pre-Subiquity bootstrap window (snapd seeding, service
+      # restarts, a desktop-security-center hook/sanity timeout, mass
+      # snap service removal/remount, an NTP 10-minute wait) that
+      # consumed nearly the entire 3600s budget before curtin ever got
+      # meaningful runtime. This purely host-side, bounded parse of the
+      # already-captured serial log (surfaced in real detail thanks to
+      # S7.1R5's systemd.journald.forward_to_console=1 fix) turns that
+      # free-text evidence into a compact, machine-readable,
+      # run-to-run-comparable milestone record - zero guest-modification
+      # risk, never itself a gate.
+      - name: Extract bootstrap milestones from serial log
+        if: always()
+        run: |
+          ./installer/scripts/extract-bootstrap-milestones.sh \
+            dist/installer-fixtures/qa-install-serial.log \
+            dist/installer-fixtures/qa-install-bootstrap-milestones.env \
+            "${{ steps.run-install.outputs.qemu_elapsed_seconds }}"
+
+      # S7.1R12 Objectives C-G: real Run #11/#12 both reproduced a
+      # catastrophic snap Change/Task lifecycle (a desktop-security-
+      # center configure-hook sanity-timeout failure, a real mass
+      # RemoveSnapServices sequence, a /snap/snapd/current missing
+      # window) - this bounded, host-side, read-only pass extracts
+      # dynamically-discovered snap Change/Task, snapd.hold, and
+      # desktop-portal forensic evidence from the SAME already-
+      # captured serial log (see this script's own header for why
+      # this is raw-log extraction, never a live in-guest sampler),
+      # never itself a gate, never blocking on any diagnostic
+      # command's own success.
+      - name: Extract snap Change/Task forensics from serial log
+        if: always()
+        run: |
+          ./installer/scripts/extract-snap-change-forensics.sh \
+            dist/installer-fixtures/qa-install-serial.log \
+            dist/installer-fixtures/qa-install-snap-change-forensics.env
+
+      # S7.1R13 Objectives A-F: real Run #13 (RUN_ID=34706519567)
+      # entered Subiquity/autoinstall but never reached real Curtin
+      # storage partitioning - filesystem probes were still being
+      # attempted (unrestricted->restricted->unrestricted cycling)
+      # right up to the 6600s host timeout. This bounded, host-side,
+      # read-only pass extracts Subiquity/probert/os-prober storage-
+      # probe forensic evidence from the SAME already-captured serial
+      # log (see this script's own header for why this is raw-log
+      # extraction, never a live in-guest crash-report collector),
+      # never itself a gate, never blocking on any diagnostic
+      # command's own success.
+      - name: Extract storage-probe forensics from serial log
+        if: always()
+        run: |
+          ./installer/scripts/extract-storage-probe-forensics.sh \
+            dist/installer-fixtures/qa-install-serial.log \
+            dist/installer-fixtures/qa-install-storage-probe-forensics.env
+
+      # S7.1R14 Objective A: the guest-side bounded crash-evidence
+      # watcher (serein.installer.renderer._qa_evidence_watcher_script,
+      # embedded via an early-commands autoinstall directive) appends
+      # bounded crash evidence to the QA-only, structurally one-way
+      # virtio-serial sink run-qa-install.sh wires up
+      # (qa-install-guest-evidence.log). This bounded, host-side,
+      # read-only pass turns that raw evidence into a compact summary
+      # plus per-crash artifact files, never itself a gate, never
+      # blocking on any diagnostic command's own success - see this
+      # script's own header for the full architectural note.
+      - name: Extract guest evidence from QA-install run
+        if: always()
+        run: |
+          ./installer/scripts/extract-guest-evidence.sh \
+            dist/installer-fixtures/qa-install-guest-evidence.log \
+            dist/installer-fixtures/qa-install-guest-evidence.env \
+            dist/installer-fixtures
+
+      # S7.1 Section 47: remove the install ISO once the real install
+      # has actually finished with it - never attached to any later
+      # boot-check QEMU command anyway, but genuinely releasing the
+      # bytes now (rather than only "never referencing" them) also
+      # closes out the last of the job's large avoidable overlaps.
+      - name: Release QA-install ISO
+        if: always()
+        run: |
+          ./installer/scripts/release-artifact.sh dist/serein-alpha-26.04-amd64-qa-install.iso || {
+            ./installer/scripts/record-secondary-failure.sh "artifact_release_failed" \
+              "release-artifact.sh failed for the QA-install ISO (secondary, non-blocking)"
+          }
+
+      # The central S7.1 proof (Section 44-46) - hash BOTH disk images
+      # after the install, regardless of whether the install step
+      # itself reported success, so a defect that corrupts the
+      # protected disk is caught even if the install otherwise
+      # "succeeded".
+      - name: Record post-install disk hashes
+        id: post-install-hashes
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          PROTECTED_AFTER="$(sha256sum dist/installer-fixtures/disk-protected.qcow2 | cut -d' ' -f1)"
+          TARGET_AFTER="$(sha256sum dist/installer-fixtures/disk-target.qcow2 | cut -d' ' -f1)"
+          echo "protected_after=${PROTECTED_AFTER}" >> "$GITHUB_OUTPUT"
+          echo "target_after=${TARGET_AFTER}" >> "$GITHUB_OUTPUT"
+          echo "REAL_PROTECTED_DISK_SHA256_AFTER=${PROTECTED_AFTER}"
+          echo "REAL_TARGET_DISK_SHA256_AFTER=${TARGET_AFTER}"
+
+      # S7.1R4 Section 8 (generalized in S7.1R5): the post-install
+      # counterpart to the "before" hashing steps above - same four
+      # separately-measured facts, now AFTER the real install attempt,
+      # for BOTH disks (Objective D: the target's guest-visible content
+      # must be proven distinctly from its container bytes too - a
+      # changed container hash alone, per Run #5's own evidence, is not
+      # proof curtin ever wrote real partitions). Diagnostic only -
+      # never gates anything; comparing these against the "before"
+      # step's outputs is what actually distinguishes container-level-
+      # only mutation from real guest-visible block mutation (Section
+      # 8's central distinction) - this workflow does not yet
+      # auto-classify that distinction into a gate (Section 16: never
+      # silently change the safety contract's semantics without
+      # explicit spec justification). Both run regardless of install
+      # success, so a genuinely stalled/timed-out install (like Run #5)
+      # still produces real diagnostic evidence rather than none.
+      - name: Hash protected disk (post-install)
+        id: protected-hash-after
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-protected.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./installer/scripts/record-secondary-failure.sh "protected_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the protected disk post-install measurement (secondary, non-blocking)"
+          }
+
+      - name: Hash target disk (post-install)
+        id: target-hash-after
+        if: always() && steps.create-fixtures.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/hash-disk-image.sh \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./installer/scripts/record-secondary-failure.sh "target_disk_diagnostic_failed" \
+              "hash-disk-image.sh failed for the target disk post-install measurement (secondary, non-blocking)"
+          }
+
+      # S7.1R4 Section 8 (generalized in S7.1R5): persist the
+      # before/after comparison for BOTH disks as real evidence FILES
+      # (not merely step outputs visible only in job logs), so a human
+      # reviewing the downloaded artifact can see the
+      # container-vs-logical-vs-sentinel distinction directly. Purely
+      # diagnostic - written unconditionally whenever both measurements
+      # for that disk ran, never gates anything.
+      - name: Compare protected-disk measurements
+        if: always() && steps.protected-hash-after.outcome == 'success'
+        run: |
+          {
+            echo "container_sha256_before=${{ steps.protected-hash-before.outputs.container_sha256 }}"
+            echo "container_sha256_after=${{ steps.protected-hash-after.outputs.container_sha256 }}"
+            echo "logical_sha256_before=${{ steps.protected-hash-before.outputs.logical_sha256 }}"
+            echo "logical_sha256_after=${{ steps.protected-hash-after.outputs.logical_sha256 }}"
+            echo "esp_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.esp_sentinel_sha256 }}"
+            echo "esp_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.esp_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_before=${{ steps.protected-hash-before.outputs.data_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_after=${{ steps.protected-hash-after.outputs.data_sentinel_sha256 }}"
+            if [ "${{ steps.protected-hash-before.outputs.container_sha256 }}" != \
+                 "${{ steps.protected-hash-after.outputs.container_sha256 }}" ]; then
+              echo "container_changed=true"
+            else
+              echo "container_changed=false"
+            fi
+            if [ "${{ steps.protected-hash-before.outputs.logical_sha256 }}" != \
+                 "${{ steps.protected-hash-after.outputs.logical_sha256 }}" ]; then
+              echo "logical_changed=true"
+            else
+              echo "logical_changed=false"
+            fi
+          } | tee dist/installer-fixtures/protected-disk-diagnostic.env
+
+      - name: Compare target-disk measurements
+        if: always() && steps.target-hash-after.outcome == 'success'
+        run: |
+          {
+            echo "container_sha256_before=${{ steps.target-hash-before.outputs.container_sha256 }}"
+            echo "container_sha256_after=${{ steps.target-hash-after.outputs.container_sha256 }}"
+            echo "logical_sha256_before=${{ steps.target-hash-before.outputs.logical_sha256 }}"
+            echo "logical_sha256_after=${{ steps.target-hash-after.outputs.logical_sha256 }}"
+            echo "esp_sentinel_sha256_before=${{ steps.target-hash-before.outputs.esp_sentinel_sha256 }}"
+            echo "esp_sentinel_sha256_after=${{ steps.target-hash-after.outputs.esp_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_before=${{ steps.target-hash-before.outputs.data_sentinel_sha256 }}"
+            echo "data_sentinel_sha256_after=${{ steps.target-hash-after.outputs.data_sentinel_sha256 }}"
+            if [ "${{ steps.target-hash-before.outputs.container_sha256 }}" != \
+                 "${{ steps.target-hash-after.outputs.container_sha256 }}" ]; then
+              echo "container_changed=true"
+            else
+              echo "container_changed=false"
+            fi
+            if [ "${{ steps.target-hash-before.outputs.logical_sha256 }}" != \
+                 "${{ steps.target-hash-after.outputs.logical_sha256 }}" ]; then
+              echo "logical_changed=true"
+            else
+              echo "logical_changed=false"
+            fi
+          } | tee dist/installer-fixtures/target-disk-diagnostic.env
+
+      - name: "Disk usage: after_install"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_install
+
+      - name: Inspect target disk layout
+        id: inspect-target-layout
+        if: always() && steps.run-install.outputs.status == 'pass'
+        run: |
+          ./installer/scripts/inspect-target-layout.sh \
+            dist/installer-fixtures/disk-target.qcow2 >> "$GITHUB_OUTPUT" || {
+            ./distribution/scripts/record-failure.sh "install_failed" \
+              "target disk layout inspection failed"
+            exit 1
+          }
+
+      - name: "Disk usage: after_target_inspection"
+        if: always()
+        run: ./installer/scripts/log-disk-usage.sh after_target_inspection
+
+      # Section 47: the target must boot ON ITS OWN, no install medium
+      # attached - the primary evidence this closure gate consumes.
+      - name: Boot installed target (self-contained, no protected disk)
+        id: installed-boot
+        if: always() && steps.inspect-target-layout.outcome == 'success'
+        run: |
+          if ./installer/scripts/boot-installed-target.sh \
+              dist/installer-fixtures/disk-target.qcow2 \
+              --result-json dist/installed-boot-result.json; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            ./distribution/scripts/record-failure.sh "installed_boot_failed" \
+              "installed target failed to boot on its own - see installed-boot-serial.log"
+            exit 1
+          fi
+
+      # Section 15's acceptance scenario (secondary, non-gating -
+      # informational only): the target must ALSO still boot with the
+      # protected disk present alongside it.
+      - name: Boot installed target (with protected disk present)
+        id: installed-boot-with-protected
+        if: always() && steps.inspect-target-layout.outcome == 'success'
+        continue-on-error: true
+        run: |
+          ./installer/scripts/boot-installed-target.sh \
+            dist/installer-fixtures/disk-target.qcow2 \
+            --protected-disk dist/installer-fixtures/disk-protected.qcow2 \
+            --result-json dist/installed-boot-with-protected-result.json
+
+      # S7.1R Corrective B (Section 14-21): every evidence field below
+      # is derived from a REAL stage's own observed outcome - never
+      # unconditional. A real run (#1) incorrectly recorded
+      # target_explicit/target_identity_revalidated/target_disk_attached
+      # as true even though disk_preflight failed before any of those
+      # stages ever ran. "Evidence records observed stage completion,
+      # not intended topology."
+      - name: Assemble Installer Layer-B evidence
+        if: always()
+        run: |
+          ARGS=(--source-commit "${SOURCE_COMMIT}" --out dist/s7-1-installer-layer-b-evidence.json)
+
+          if [ -f dist/.failure_stage ]; then
+            ARGS+=(--failure-stage "$(cat dist/.failure_stage)")
+          fi
+          if [ -f dist/.failure_reason ]; then
+            ARGS+=(--failure-reason "$(cat dist/.failure_reason)")
+          fi
+
+          # S7.1R6 Objective D: every real secondary/non-blocking
+          # failure this run recorded (installer/scripts/
+          # record-secondary-failure.sh) - purely additive visibility,
+          # never touching --failure-stage/-reason above, which remain
+          # computed exclusively from dist/.failure_stage/.failure_reason
+          # (record-failure.sh's own, unmodified, first-failure-wins
+          # mechanism).
+          if [ -f dist/.secondary_failures ]; then
+            while IFS=$'\t' read -r SECONDARY_STAGE SECONDARY_REASON; do
+              [ -n "${SECONDARY_STAGE}" ] || continue
+              ARGS+=(--secondary-failure "${SECONDARY_STAGE}:${SECONDARY_REASON}")
+            done < dist/.secondary_failures
+          fi
+
+          ARGS+=(--installer-backend curtin)
+          ARGS+=(--target-serial SEREIN-TARGET-DISK --target-device-path /dev/vdb)
+          ARGS+=(--protected-disk SEREIN-PROTECTED-DISK:/dev/vda)
+
+          # target_explicit: only once the target was actually declared
+          # AND validated against a plan (render-autoinstall's own job).
+          if [ "${{ steps.render-autoinstall.outputs.status }}" = "pass" ]; then
+            ARGS+=(--target-explicit)
+          fi
+
+          # target_disk_attached: only once the real fixture-disk
+          # topology was observed to exist (create-fixtures succeeded) -
+          # never merely because the workflow source code names a
+          # target serial (Section 17 - this is the exact real defect).
+          if [ "${{ steps.create-fixtures.outputs.status }}" = "pass" ]; then
+            ARGS+=(--target-disk-attached)
+          fi
+
+          # target_identity_revalidated: only once the real re-
+          # verification stage actually ran and passed (Section 16).
+          if [ "${{ steps.verify-topology.outcome }}" = "success" ] && \
+             [ "${{ steps.verify-topology.outputs.target_identity_revalidated }}" = "true" ]; then
+            ARGS+=(--target-identity-revalidated)
+          fi
+
+          if [ "${{ steps.render-autoinstall.outputs.status }}" = "pass" ] && \
+             [ -f dist/installer-plan.json ] && \
+             [ "$(python -c "import json;print(json.load(open('dist/installer-plan.json'))['validation']['valid'])")" = "True" ]; then
+            ARGS+=(--installer-backend-available --plan-valid --all-destructive-ops-on-target)
+          fi
+
+          if [ -n "${{ steps.post-install-hashes.outputs.protected_after }}" ]; then
+            PROTECTED_BEFORE="$(cut -d' ' -f1 dist/installer-fixtures/disk-protected.sha256-before 2>/dev/null || echo "")"
+            TARGET_BEFORE="$(cut -d' ' -f1 dist/installer-fixtures/disk-target.sha256-before 2>/dev/null || echo "")"
+            if [ -n "${PROTECTED_BEFORE}" ]; then
+              ARGS+=(--protected-before-sha256 "${PROTECTED_BEFORE}")
+            fi
+            ARGS+=(--protected-after-sha256 "${{ steps.post-install-hashes.outputs.protected_after }}")
+            if [ -n "${TARGET_BEFORE}" ]; then
+              ARGS+=(--target-disk-before-sha256 "${TARGET_BEFORE}")
+            fi
+            ARGS+=(--target-disk-after-sha256 "${{ steps.post-install-hashes.outputs.target_after }}")
+            # Section 46: a byte-identical protected disk trivially
+            # proves its own ESP sub-region is unchanged too - never a
+            # separate claim.
+            if [ "${PROTECTED_BEFORE}" = "${{ steps.post-install-hashes.outputs.protected_after }}" ] && \
+               [ -n "${PROTECTED_BEFORE}" ]; then
+              ARGS+=(--protected-esp-unchanged)
+            fi
+          fi
+
+          if [ "${{ steps.inspect-target-layout.outputs.target_esp_present }}" = "true" ]; then
+            ARGS+=(--target-esp-present)
+          fi
+          if [ "${{ steps.inspect-target-layout.outputs.target_root_present }}" = "true" ]; then
+            ARGS+=(--target-root-present)
+          fi
+
+          ARGS+=(--installation-status "${{ steps.run-install.outputs.status || 'not_performed' }}")
+
+          if [ -f dist/installed-boot-result.json ]; then
+            ARGS+=(--installed-boot-result dist/installed-boot-result.json)
+            ARGS+=(--install-media-removed-for-boot)
+          fi
+
+          if [ "${{ steps.inspect-target-layout.outputs.serein_core_present }}" = "true" ]; then
+            ARGS+=(--serein-core-present)
+          fi
+          FIRSTBOOT="${{ steps.inspect-target-layout.outputs.firstboot_provisioning || 'unknown' }}"
+          ARGS+=(--firstboot-provisioning "${FIRSTBOOT}")
+
+          python -m serein.installer evidence "${ARGS[@]}"
+          cat dist/s7-1-installer-layer-b-evidence.json
+
+      # S7.1R2 Corrective C: every path here is the EXACT path the
+      # named producer writes (installer/scripts/run-qa-install.sh
+      # derives all three qa-install-qemu-* paths from
+      # `dirname "${TARGET_DISK}"`, i.e. dist/installer-fixtures - the
+      # same directory the fixture creation/hash steps already use) -
+      # never invented, never guessed. `if-no-files-found: warn` (not
+      # `error`) because a run that never even reaches fixture creation
+      # legitimately produces none of these, which must not itself fail
+      # the upload step.
+      - name: Upload compact Installer Layer-B evidence (never disk images/ISOs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serein-s7-1-installer-layer-b-evidence
+          path: |
+            dist/installer-plan.json
+            dist/s7-1-installer-layer-b-evidence.json
+            dist/installer-fixtures/*.sha256-before
+            dist/installed-boot-result.json
+            dist/installed-boot-with-protected-result.json
+            dist/installer-fixtures/qa-install-serial.log
+            dist/installer-fixtures/qa-install-qemu-stdout.log
+            dist/installer-fixtures/qa-install-qemu-stderr.log
+            dist/installer-fixtures/qa-install-qemu-result.env
+            dist/installer-fixtures/qa-install-subiquity-signals.log
+            dist/installer-fixtures/qa-install-bootstrap-milestones.env
+            dist/installer-fixtures/qa-install-snap-change-forensics.env
+            dist/installer-fixtures/qa-install-storage-probe-forensics.env
+            dist/installer-fixtures/qa-install-guest-evidence.log
+            dist/installer-fixtures/qa-install-guest-evidence.env
+            dist/installer-fixtures/qa-install-block-probe-crash-*.txt
+            dist/installer-fixtures/protected-disk-diagnostic.env
+            dist/installer-fixtures/target-disk-diagnostic.env
+            dist/.secondary_failures
+            dist/installer-fixtures/installed-boot/installed-boot-serial.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce Installer Layer-B closure
+        if: always()
+        run: |
+          python -m serein.installer closure-gate \
+            --evidence dist/s7-1-installer-layer-b-evidence.json \
+            --expected-source-commit "${SOURCE_COMMIT}"

@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/installer-disk-inventory.schema.json",
+  "title": "Serein Installer Disk Inventory",
+  "description": "Real, read-only disk inventory from serein.installer.diskprobe (S7.1 Section 10). Every disk defaults to protected=true/target_eligible=false - only serein.installer.diskguard.classify_protection may ever change that, and only relative to an explicitly selected target. Absent evidence is null/empty, never fabricated.",
+  "type": "object",
+  "required": ["schema_version", "disks"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "disks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "device_path", "canonical_path", "kernel_name", "model", "vendor", "serial", "wwn",
+          "id_path", "size_bytes", "logical_sector_size", "physical_sector_size", "transport",
+          "removable", "partition_table", "partitions", "filesystem_signatures",
+          "install_media", "mounted", "windows_detected", "windows_efi_detected",
+          "windows_recovery_detected", "protected", "protection_reasons", "target_eligible",
+          "target_blockers", "identity_confidence"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "device_path": { "type": "string" },
+          "canonical_path": { "type": ["string", "null"] },
+          "kernel_name": { "type": ["string", "null"] },
+          "model": { "type": ["string", "null"] },
+          "vendor": { "type": ["string", "null"] },
+          "serial": { "type": ["string", "null"] },
+          "wwn": { "type": ["string", "null"] },
+          "id_path": { "type": ["string", "null"] },
+          "size_bytes": { "type": ["integer", "null"] },
+          "logical_sector_size": { "type": ["integer", "null"] },
+          "physical_sector_size": { "type": ["integer", "null"] },
+          "transport": { "type": ["string", "null"] },
+          "removable": { "type": ["boolean", "null"] },
+          "partition_table": { "type": ["string", "null"] },
+          "partitions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "device_path", "kernel_name", "size_bytes", "filesystem", "label",
+                "partition_uuid", "mounted", "mountpoint"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "device_path": { "type": "string" },
+                "kernel_name": { "type": ["string", "null"] },
+                "size_bytes": { "type": ["integer", "null"] },
+                "filesystem": { "type": ["string", "null"] },
+                "label": { "type": ["string", "null"] },
+                "partition_uuid": { "type": ["string", "null"] },
+                "mounted": { "type": ["boolean", "null"] },
+                "mountpoint": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "filesystem_signatures": { "type": "array", "items": { "type": "string" } },
+          "install_media": { "type": "boolean" },
+          "mounted": { "type": "boolean" },
+          "windows_detected": { "type": "boolean" },
+          "windows_efi_detected": { "type": "boolean" },
+          "windows_recovery_detected": { "type": "boolean" },
+          "protected": { "type": "boolean" },
+          "protection_reasons": { "type": "array", "items": { "type": "string" } },
+          "target_eligible": { "type": "boolean" },
+          "target_blockers": { "type": "array", "items": { "type": "string" } },
+          "identity_confidence": { "type": "string", "enum": ["low", "medium", "high"] }
+        }
+      }
+    }
+  }
+}

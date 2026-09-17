@@ -1,8 +1,8 @@
 # S7 Roadmap (Section 1)
 
 ```
-S7.0  Bootable ISO prototype        (this repository)
-S7.1  Installer integration          (not started)
+S7.0  Bootable ISO prototype        (merged - main)
+S7.1  Installer integration          (in progress - feat/serein-s7-1-installer-integration)
 S7.2  First-boot provisioning         (not started)
 S7.3  Recovery / repair / fallback     (not started)
 ```
@@ -25,16 +25,19 @@ See `docs/distribution/known-limitations.md` for exactly what real
 one-command follow-up (installing build tooling in the already-present
 WSL2 environment) needed to complete it.
 
-## S7.1 - Installer integration (future, not started)
+## S7.1 - Installer integration (in progress)
 
-Would build on S7.0's payload/base-image contract to actually make the
+Builds on S7.0's payload/base-image contract to actually make the
 Subiquity-based installer place Serein's payload into a real target
 installation - late-commands, package installation into the target
 root, and the Discover -> Resolve -> Plan -> Validate -> Apply ->
 Verify -> Record lifecycle (`docs/architecture/installer-contract.md`)
 applied to a real disk for the first time in this repository's history.
-Nothing in S7.0 pre-empts this - `distribution/boot/qa-serial-entry.cfg`
-and the boot-smoke harness never install to any disk (Section 92).
+Nothing in S7.0 pre-empted this - `distribution/boot/qa-serial-entry.cfg`
+and the boot-smoke harness never installed to any disk (Section 92).
+See `docs/installer/` for the full S7.1 design and
+`docs/installer/known-limitations.md` for exactly what real (Layer B)
+target-disk installation evidence does and does not exist yet.
 
 ## S7.2 - First-boot provisioning (future, not started)
 

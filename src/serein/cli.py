@@ -59,6 +59,12 @@ from serein.hardware.power_policy import detect_power_policy
 from serein.hardware.probe import probe_hardware
 from serein.hardware.storage_policy import detect_storage_policy
 from serein.hardware.thermal import detect_thermal
+from serein.installer.diskguard import classify_protection
+from serein.installer.diskprobe import probe_disks
+from serein.installer.doctor import run_installer_checks
+from serein.installer.identity import capture_target_identity
+from serein.installer.planner import build_install_plan, validate_plan
+from serein.installer.status import build_installer_status
 from serein.profiles.registry import list_profiles
 from serein.veil.capabilities import build_veil_capabilities
 from serein.veil.doctor import run_veil_checks
@@ -805,6 +811,102 @@ def _cmd_distribution_inspect(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+def _cmd_installer_status(_args: argparse.Namespace) -> int:
+    status = build_installer_status()
+    print("SEREIN INSTALLER")
+    print()
+    print("Backend")
+    print(f"  curtin        {'yes' if status.installer_backend_available else 'no'}")
+    print()
+    print("Disk probing")
+    print(f"  lsblk         {'yes' if status.disk_probe_tool_available else 'no'}")
+    print(f"  disks seen    {status.disk_count_observed}")
+    return 0
+
+
+def _cmd_installer_disks(args: argparse.Namespace) -> int:
+    inventory = probe_disks()
+    if args.json:
+        print(json.dumps(inventory.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN INSTALLER DISKS")
+    print()
+    if not inventory.disks:
+        print("  (no disks observed - lsblk unavailable, or none present)")
+        return 0
+    for disk in inventory.disks:
+        print(disk.device_path)
+        print(f"  model          {disk.model or 'unknown'}")
+        print(f"  serial         {disk.serial or 'unknown'}")
+        print(f"  size_bytes     {disk.size_bytes if disk.size_bytes is not None else 'unknown'}")
+        print(f"  transport      {disk.transport or 'unknown'}")
+        print(f"  install media  {'yes' if disk.install_media else 'no'}")
+        print(f"  mounted        {'yes' if disk.mounted else 'no'}")
+        print(f"  windows        {'yes' if disk.windows_detected else 'no'}")
+        print(f"  identity conf. {disk.identity_confidence}")
+        print()
+    return 0
+
+
+def _cmd_installer_doctor(args: argparse.Namespace) -> int:
+    report = run_installer_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN INSTALLER DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_installer_plan(args: argparse.Namespace) -> int:
+    # Read-only planning preview (Section 23-24): probes, resolves, and
+    # validates a plan, but never renders/writes an installer config,
+    # never wipes/formats/mounts/partitions, and never touches EFI/NVRAM
+    # or an autoinstall config.
+    inventory = probe_disks()
+    target_disk = next(
+        (d for d in inventory.disks if args.target in (d.device_path, d.serial)), None
+    )
+    if target_disk is None:
+        print(f"FAIL: NO_TARGET: no disk matching {args.target!r} was observed", file=sys.stderr)
+        return 1
+
+    classified = classify_protection(inventory, target_disk.device_path)
+    target = next(d for d in classified.disks if d.device_path == target_disk.device_path)
+    if not target.target_eligible:
+        print(
+            f"FAIL: TARGET_ACTIVE: {target.device_path} is not target-eligible "
+            f"({', '.join(target.target_blockers) or 'unspecified'})",
+            file=sys.stderr,
+        )
+        return 1
+
+    target_identity = capture_target_identity(target)
+    protected = [d for d in classified.disks if d.device_path != target.device_path]
+    protected_identities = tuple(capture_target_identity(d) for d in protected)
+    protected_paths = tuple(d.device_path for d in protected)
+
+    plan = build_install_plan(target_identity, target.device_path, protected_identities)
+    validated = validate_plan(plan, protected_paths)
+
+    if args.json:
+        print(json.dumps(validated.to_dict(), indent=2, sort_keys=True))
+        return 0 if validated.validation.valid else 1
+
+    print(f"SEREIN INSTALLER PLAN - target {validated.target_device_path}")
+    print()
+    for op in validated.operations:
+        kind_label = "DESTRUCTIVE" if op.destructive else "safe"
+        print(f"  [{kind_label:11}] {op.kind:24} {op.device}")
+    print()
+    if validated.validation.valid:
+        print("VALID")
+        return 0
+    print(f"INVALID: {list(validated.validation.reasons)}")
+    return 1
+
+
 def _cmd_focus_status(_args: argparse.Namespace) -> int:
     status = build_focus_status()
     print("SEREIN FOCUS")
@@ -1311,6 +1413,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     distribution_inspect_parser.set_defaults(func=_cmd_distribution_inspect)
+
+    installer_parser = subparsers.add_parser(
+        "installer", help="Guarded target-disk installer status/planning (read-only)"
+    )
+    installer_subparsers = installer_parser.add_subparsers(
+        dest="installer_command", required=True
+    )
+
+    installer_subparsers.add_parser(
+        "status", help="Show installer backend/disk-probe availability"
+    ).set_defaults(func=_cmd_installer_status)
+
+    installer_disks_parser = installer_subparsers.add_parser(
+        "disks", help="Show the real disk inventory (read-only)"
+    )
+    installer_disks_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    installer_disks_parser.set_defaults(func=_cmd_installer_disks)
+
+    installer_doctor_parser = installer_subparsers.add_parser(
+        "doctor", help="Run Installer-layer diagnostics"
+    )
+    installer_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    installer_doctor_parser.set_defaults(func=_cmd_installer_doctor)
+
+    installer_plan_parser = installer_subparsers.add_parser(
+        "plan",
+        help="Preview the destructive install plan for an explicit target (read-only - "
+             "never writes/wipes/formats/mounts/installs anything)",
+    )
+    installer_plan_parser.add_argument(
+        "--target", required=True,
+        help="Target disk selector - a device path (e.g. /dev/sdb) or a disk serial number. "
+             "Never a default/implicit selection (Section 9) - there is no 'largest disk' mode.",
+    )
+    installer_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    installer_plan_parser.set_defaults(func=_cmd_installer_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
