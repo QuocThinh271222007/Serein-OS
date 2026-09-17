@@ -54,7 +54,22 @@
 #       topology/identity, a process snapshot, a storage-filtered
 #       journal window, and a dedicated udisks2 context section
 #       (observation only - see build_qa_evidence_watcher_script's own
-#       docstring for the complete guest-side contract).
+#       docstring for the complete guest-side contract). S7.1R22: each
+#       frame now also carries `trigger_source=` (journal_cursor,
+#       bounded_window_fallback, or crash_file - HOW the trigger fired,
+#       never guessed) and `trigger_event_timestamp=` (the matched
+#       journal line's own monotonic timestamp, or NOT_OBSERVED for a
+#       crash_file trigger - never fabricated from the frame's own,
+#       separate, `frame_capture_timestamp=`/`timestamp=` field). Real
+#       S7.1R21-TCG-REPRO-1 evidence proved the shared 200-line
+#       snap-signal journal snapshot this frame kind's DETECTION
+#       (never its own separate, wider CONTENT fetch, already
+#       unaffected) previously reused is unreliable under high journal
+#       volume - see build_qa_evidence_watcher_script's own docstring
+#       for the full corrective. An OLD-format frame (no
+#       trigger_source=/trigger_event_timestamp= lines) parses fine
+#       here - those two fields simply read NOT_OBSERVED, never a
+#       parser failure.
 #
 # Run #17 (or any future run) may reproduce ANY of these pathology
 # families, all, or none - this script handles every combination and
@@ -149,6 +164,9 @@ if [ ! -f "${GUEST_EVIDENCE_LOG}" ]; then
         echo "storage_probe_process_snapshot_present=false"
         echo "storage_probe_installer_log_present=false"
         echo "storage_probe_udisks_context_present=false"
+        echo "storage_probe_frame_first_source="
+        echo "storage_probe_frame_first_event_ts="
+        echo "storage_probe_frame_first_capture_ts="
         echo "snapd_failure_precedes_portal_failure=unknown"
         echo "snapd_failure_precedes_desktop_security_center_failure=unknown"
         echo "snapd_failure_precedes_hold=unknown"
@@ -183,6 +201,9 @@ if [ ! -s "${GUEST_EVIDENCE_LOG}" ]; then
         echo "storage_probe_process_snapshot_present=false"
         echo "storage_probe_installer_log_present=false"
         echo "storage_probe_udisks_context_present=false"
+        echo "storage_probe_frame_first_source="
+        echo "storage_probe_frame_first_event_ts="
+        echo "storage_probe_frame_first_capture_ts="
         echo "snapd_failure_precedes_portal_failure=unknown"
         echo "snapd_failure_precedes_desktop_security_center_failure=unknown"
         echo "snapd_failure_precedes_hold=unknown"
@@ -224,6 +245,16 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         storage_triggers_list = ""
         storage_first_trigger = ""
         storage_first_trigger_ts = ""
+        # S7.1R22: HOW/WHEN the first frame actually fired - distinct
+        # facts from storage_first_trigger/storage_first_trigger_ts
+        # above (which is WHICH signal). Stay empty (never
+        # "NOT_OBSERVED") for an old-format frame with no
+        # trigger_source=/trigger_event_timestamp= lines, matching
+        # every other unobserved-field convention already used
+        # elsewhere in this script.
+        storage_first_source = ""
+        storage_first_event_ts = ""
+        storage_first_capture_ts = ""
         storage_serial_protected_seen = 0
         storage_serial_target_seen = 0
         storage_process_snapshot_present = "false"
@@ -357,6 +388,9 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         buf = ""
         current_storage_trigger = ""
         current_storage_ts = ""
+        current_storage_source = ""
+        current_storage_event_ts = ""
+        current_storage_capture_ts = ""
         storage_awaiting_section = ""
         next
     }
@@ -375,6 +409,9 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         if (storage_first_trigger == "") {
             storage_first_trigger = current_storage_trigger
             storage_first_trigger_ts = current_storage_ts
+            storage_first_source = current_storage_source
+            storage_first_event_ts = current_storage_event_ts
+            storage_first_capture_ts = current_storage_capture_ts
         }
         if (storage_seen_count > max_storage) { next }
         out = crash_dir "/qa-install-storage-probe-frame-" storage_seen_count ".txt"
@@ -395,6 +432,12 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
                 current_storage_trigger = substr($0, index($0, "=") + 1)
             } else if ($0 ~ /^timestamp=/) {
                 current_storage_ts = substr($0, index($0, "=") + 1)
+            } else if ($0 ~ /^trigger_source=/) {
+                current_storage_source = substr($0, index($0, "=") + 1)
+            } else if ($0 ~ /^trigger_event_timestamp=/) {
+                current_storage_event_ts = substr($0, index($0, "=") + 1)
+            } else if ($0 ~ /^frame_capture_timestamp=/) {
+                current_storage_capture_ts = substr($0, index($0, "=") + 1)
             } else if ($0 ~ /^\[INSTALLER_LOG_/) {
                 storage_awaiting_section = "installer_log"
             } else if ($0 ~ /^\[PROCESS_SNAPSHOT\]$/) {
@@ -469,6 +512,12 @@ CRASH_DIR="${CRASH_OUTPUT_DIR}" awk -v max_crash="${MAX_CRASH_FILES}" -v max_sna
         printf "storage_probe_triggers=%s\n", storage_triggers_list
         printf "storage_probe_first_trigger=%s\n", storage_first_trigger
         printf "storage_probe_first_trigger_ts=%s\n", storage_first_trigger_ts
+        # S7.1R22: HOW/WHEN the first frame actually fired - see this
+        # script header comment above for why these are distinct facts
+        # from storage_probe_first_trigger/_ts above.
+        printf "storage_probe_frame_first_source=%s\n", storage_first_source
+        printf "storage_probe_frame_first_event_ts=%s\n", storage_first_event_ts
+        printf "storage_probe_frame_first_capture_ts=%s\n", storage_first_capture_ts
         serials = ""
         if (storage_serial_protected_seen) { serials = "SEREIN-PROTECTED-DISK" }
         if (storage_serial_target_seen) {

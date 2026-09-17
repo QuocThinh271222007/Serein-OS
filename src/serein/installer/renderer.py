@@ -94,6 +94,25 @@ QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES = 262144
 # is not necessary (Section 13's own "only if necessary" instruction).
 QA_EVIDENCE_MAX_STORAGE_FRAMES = 3
 QA_EVIDENCE_MAX_BYTES_PER_STORAGE_FRAME = 32768
+# S7.1R22 (storage probe TRIGGER reliability corrective - forensic
+# instrumentation only, never a storage/installer behavioral change):
+# R21-TCG-REPRO-1 proved a real R20 storage-probe failure (probe_once
+# cancelled + block_probe_fail) occurred in-guest while the watcher
+# and evidence channel were both demonstrably alive, yet
+# storage_probe_frame_count stayed 0. The shared 200-line
+# `recent_journal` snapshot used for storage-TRIGGER DETECTION (never
+# the frame's own separate, wider CONTENT fetch, which was already
+# fine) is the prime suspect: under a busy boot, unrelated journal
+# volume can scroll the real trigger line out of the last-200-line
+# window between one 10s poll and the next, before the watcher ever
+# sees it. Detection now uses a per-poll `journalctl --after-cursor`
+# batch when the guest's journalctl supports it (verified at watcher
+# startup, never assumed), bounded by these two ceilings so a busy
+# journal still cannot make this detection step unbounded; the
+# bounded-window fallback (guest journalctl lacking cursor support)
+# reuses the SAME ceilings.
+QA_EVIDENCE_MAX_STORAGE_DETECTION_LINES = 4000
+QA_EVIDENCE_MAX_STORAGE_DETECTION_BYTES = 262144
 
 # S7.1R16 Objective A / S7.1R17 corrective: the watcher script is
 # embedded as a real file at the QA-install ISO's own root (never the
@@ -233,21 +252,22 @@ def build_qa_evidence_watcher_script() -> str:
        snapd.hold sequence (Objectives F/G) - each is filled in only
        from what this run's own bounded journal window actually shows,
        never guessed;
-    4. **S7.1R21**: watches for the first occurrence of each of three
-       known ``Filesystem/_probe/probe_once`` storage-probe failure
-       signals (``probe_once``+``cancelled`` together,
-       ``block_probe_fail``, ``disk_probe_fail`` - the exact real
-       S7.1R20 forensic findings) and exports one bounded
-       ``SEREIN STORAGE PROBE FRAME`` the first time each is seen -
-       bounded, allowlisted excerpts of real installer-internal logs
-       (``/var/log/installer/ubuntu_bootstrap.log``, confirmed present
-       in real S7.1R20 evidence; ``subiquity-server-debug.log``/
-       ``curtin-install.log``, checked but never assumed present),
-       read-only device topology/identity (``lsblk``, ``udevadm``
-       properties - never relies on ``/dev/vda``/``/dev/vdb`` ordering
-       alone, since serial/udev properties let a HOST-SIDE extractor
-       classify PROTECTED/TARGET/INSTALL_MEDIA/OTHER later), a
-       read-only process snapshot filtered to storage-tool argv
+    4. **S7.1R21, trigger reliability corrected S7.1R22**: watches for
+       the first occurrence of each of three known
+       ``Filesystem/_probe/probe_once`` storage-probe failure signals
+       (``probe_once``+``cancelled`` together, ``block_probe_fail``,
+       ``disk_probe_fail`` - the exact real S7.1R20 forensic findings)
+       and exports one bounded ``SEREIN STORAGE PROBE FRAME`` the
+       first time each is seen - bounded, allowlisted excerpts of real
+       installer-internal logs (``/var/log/installer/ubuntu_bootstrap.log``,
+       confirmed present in real S7.1R20 evidence;
+       ``subiquity-server-debug.log``/``curtin-install.log``, checked
+       but never assumed present), read-only device topology/identity
+       (``lsblk``, ``udevadm`` properties - never relies on
+       ``/dev/vda``/``/dev/vdb`` ordering alone, since serial/udev
+       properties let a HOST-SIDE extractor classify
+       PROTECTED/TARGET/INSTALL_MEDIA/OTHER later), a read-only
+       process snapshot filtered to storage-tool argv
        (probert/subiquity/blkid/lsblk/parted/udevadm/udisks/
        os-prober/grub-probe), a wider dedicated journal window
        filtered to storage-relevant keywords (never the same narrow
@@ -260,6 +280,53 @@ def build_qa_evidence_watcher_script() -> str:
        any way. This is instrumentation only - it does not, and
        cannot, prove root cause by itself; it exists so a future real
        run's own captured evidence can.
+
+       **S7.1R22 trigger-detection corrective**: real S7.1R21-TCG-REPRO-1
+       evidence proved the ORIGINAL trigger-DETECTION mechanism (all
+       three signals checked against the SAME shared, snap-signal
+       ``recent_journal`` 200-line snapshot) is genuinely unreliable -
+       ``probe_once``+``cancelled`` and ``block_probe_fail`` both
+       demonstrably occurred in that real run, yet
+       ``storage_probe_frame_count`` stayed 0, because unrelated
+       journal volume between one 10s poll and the next can scroll the
+       real trigger line out of a fixed last-200-line window before
+       the watcher ever inspects it. Two independent, structural fixes
+       replace it, never merely a larger ``-n`` bound (which only
+       widens the same race, it does not remove it):
+
+       - ``block_probe_fail`` now fires directly from the SAME
+         ``/var/crash/*block_probe_fail*.crash`` file scan this
+         watcher already performs for the pre-existing crash-evidence
+         capture - a crash file's mere EXISTENCE is a real, durable,
+         journal-volume-proof signal regardless of how much unrelated
+         journal noise followed it, under its own independent dedup
+         key (``storage:block_probe_fail``, distinct from the
+         filename-keyed dedup the existing crash-evidence capture
+         already uses, so neither mechanism starves the other).
+       - ``probe_once``+``cancelled`` and ``disk_probe_fail`` now use
+         a dedicated, PER-POLL ``journalctl --after-cursor`` batch
+         (only entries genuinely new since the previous poll) when
+         this guest's journalctl supports cursor mode - verified once
+         at watcher startup, never assumed - so unrelated journal
+         volume can no longer evict a trigger line before this watcher
+         inspects it. If cursor mode is unavailable/fails, detection
+         falls back to a dedicated, explicitly weaker bounded window
+         (``MAX_STORAGE_DETECTION_LINES``/``MAX_STORAGE_DETECTION_BYTES``
+         - independent of the shared snap-signal window, so at least
+         does not inherit ITS unrelated volatility either), and the
+         frame records which mode actually fired it
+         (``trigger_source=journal_cursor|bounded_window_fallback|crash_file``)
+         so this is never silently assumed reliable. ``probe_once``
+         and ``cancelled`` must now co-occur on the SAME journal line
+         to count (real evidence confirms Subiquity emits both
+         substrings on one line) - never a same-buffer,
+         possibly-different-line match, which risked a false positive
+         from two unrelated events.
+
+       This round corrects the SENSOR only - it does not, and must
+       not, change Subiquity/curtin storage behavior, udisks policy,
+       or any timeout; the underlying storage pathology this sensor
+       observes remains unfixed and is out of scope here.
 
     S7.1R16 Objective A: this watcher is no longer launched via
     Subiquity autoinstall early-commands (real Run #15/#16 evidence
@@ -331,7 +398,14 @@ def build_qa_evidence_watcher_script() -> str:
     lines = [
         "#!/bin/sh",
         "set -u",
-        f'PORT="{QA_EVIDENCE_PORT_PATH}"',
+        # S7.1R22 Section 14 test affordance only (same pattern as
+        # MAX_ITERATIONS/SLEEP_SECONDS below): a real run never sets
+        # these env vars, so production PORT/crash-glob-dir are
+        # unchanged - but a watcher-level test can point both at a
+        # plain temp file/dir instead of the real QEMU virtio-serial
+        # port and /var/crash.
+        'PORT="${SEREIN_TEST_PORT:-' + QA_EVIDENCE_PORT_PATH + '}"',
+        'CRASH_GLOB_DIR="${SEREIN_TEST_CRASH_DIR:-/var/crash}"',
         f"MAX_CRASH_FILES={QA_EVIDENCE_MAX_CRASH_FILES}",
         f"MAX_BYTES_PER_CRASH={QA_EVIDENCE_MAX_BYTES_PER_CRASH}",
         f"MAX_SNAP_FRAMES={QA_EVIDENCE_MAX_SNAP_FRAMES}",
@@ -340,8 +414,17 @@ def build_qa_evidence_watcher_script() -> str:
         f"MAX_STORAGE_FRAMES={QA_EVIDENCE_MAX_STORAGE_FRAMES}",
         f"MAX_BYTES_PER_STORAGE_FRAME={QA_EVIDENCE_MAX_BYTES_PER_STORAGE_FRAME}",
         f"MAX_TOTAL_EVIDENCE_BYTES={QA_EVIDENCE_MAX_TOTAL_EVIDENCE_BYTES}",
-        f"MAX_ITERATIONS={QA_EVIDENCE_WATCHER_MAX_ITERATIONS}",
-        f"SLEEP_SECONDS={QA_EVIDENCE_WATCHER_SLEEP_SECONDS}",
+        # S7.1R22 Section 14 test affordance only: a real run never
+        # sets these env vars, so production behavior (the literal
+        # constants below) is unchanged - but a watcher-level test can
+        # now run the actual generated script end-to-end in a handful
+        # of iterations instead of the real ~6600s ceiling.
+        'MAX_ITERATIONS="${SEREIN_QA_WATCHER_MAX_ITERATIONS:-'
+        f'{QA_EVIDENCE_WATCHER_MAX_ITERATIONS}}}"',
+        'SLEEP_SECONDS="${SEREIN_QA_WATCHER_SLEEP_SECONDS:-'
+        f'{QA_EVIDENCE_WATCHER_SLEEP_SECONDS}}}"',
+        f"MAX_STORAGE_DETECTION_LINES={QA_EVIDENCE_MAX_STORAGE_DETECTION_LINES}",
+        f"MAX_STORAGE_DETECTION_BYTES={QA_EVIDENCE_MAX_STORAGE_DETECTION_BYTES}",
         'seen=""',
         "exported_count=0",
         "snap_frame_count=0",
@@ -399,18 +482,30 @@ def build_qa_evidence_watcher_script() -> str:
         "    '",
         "}",
         "",
-        "# S7.1R21 storage probe internal-evidence instrumentation:",
-        "# captures one bounded SEREIN STORAGE PROBE FRAME for the given",
-        "# trigger name ($1). Called at most once per trigger (caller",
-        "# already deduplicates via $seen before calling), and only",
-        "# while storage_frame_count < MAX_STORAGE_FRAMES. Observation",
-        "# only - never mounts, signals, kills, restarts, or writes",
-        "# installer state; a failing diagnostic command reads as",
-        "# NOT_OBSERVED and never aborts the watcher.",
+        "# S7.1R21 storage probe internal-evidence instrumentation,",
+        "# trigger metadata added S7.1R22: captures one bounded SEREIN",
+        "# STORAGE PROBE FRAME for the given trigger name ($1). Called",
+        "# at most once per trigger (caller already deduplicates via",
+        "# $seen before calling), and only while storage_frame_count <",
+        "# MAX_STORAGE_FRAMES. Observation only - never mounts, signals,",
+        "# kills, restarts, or writes installer state; a failing",
+        "# diagnostic command reads as NOT_OBSERVED and never aborts the",
+        "# watcher.",
+        "#",
+        "# S7.1R22 Section 9: $2 (trigger_source) and $3",
+        "# (trigger_event_timestamp) are distinct facts from this",
+        "# frame's own capture-time $s_ts - a durable crash-file trigger",
+        "# may legitimately have no real original-failure timestamp",
+        "# available (trigger_event_timestamp=NOT_OBSERVED), which is",
+        "# never fabricated from the unrelated frame-capture moment.",
         "_emit_storage_frame() {",
         '    s_trigger="$1"',
+        '    s_source="${2:-NOT_OBSERVED}"',
+        '    s_event_ts="${3:-NOT_OBSERVED}"',
+        '    [ -z "$s_event_ts" ] && s_event_ts="NOT_OBSERVED"',
         "    storage_frame_count=$((storage_frame_count + 1))",
         '    s_ts=$(cut -d" " -f1 /proc/uptime 2>/dev/null || echo "")',
+        '    [ -z "$s_ts" ] && s_ts="NOT_OBSERVED"',
         "",
         "    # Section 7: bounded, allowlisted installer-log excerpts",
         "    # only - a small fixed list, each existence-checked first,",
@@ -536,6 +631,9 @@ def build_qa_evidence_watcher_script() -> str:
         '        echo "frame_sequence=$storage_frame_count"',
         '        echo "trigger=$s_trigger"',
         '        echo "timestamp=$s_ts"',
+        '        echo "frame_capture_timestamp=$s_ts"',
+        '        echo "trigger_source=$s_source"',
+        '        echo "trigger_event_timestamp=$s_event_ts"',
         '        echo "truncated=$s_frame_trunc"',
         '        echo ""',
         '        printf "%s" "$s_body"',
@@ -572,14 +670,58 @@ def build_qa_evidence_watcher_script() -> str:
         "    total_bytes=$((total_bytes + boot_ts_len + 48))",
         "fi",
         "",
+        "# S7.1R22: establish a per-poll storage-journal cursor if this",
+        "# guest's journalctl actually supports --show-cursor/",
+        "# --after-cursor - verified here, once, never assumed (Section",
+        "# 6 of the R22 corrective). probe_once+cancelled/disk_probe_fail",
+        "# detection below then only ever scans entries genuinely NEW",
+        "# since the previous poll, so unrelated journal volume can",
+        "# never again silently evict a real trigger line before this",
+        "# watcher checks it (the real R21-TCG-REPRO-1 defect). A",
+        "# failure here is diagnostic-only and never aborts the",
+        "# watcher - STORAGE_TRIGGER_MODE simply stays the explicitly",
+        "# weaker bounded-window fallback.",
+        'storage_cursor=""',
+        'STORAGE_TRIGGER_MODE="bounded_window_fallback"',
+        '_cursor_probe=$(journalctl --no-pager -n 0 --show-cursor 2>/dev/null)',
+        'if [ -n "$_cursor_probe" ]; then',
+        '    _probe_cursor=$(printf "%s\\n" "$_cursor_probe" | '
+        'sed -n "s/^-- cursor: //p" | tail -n1)',
+        '    if [ -n "$_probe_cursor" ]; then',
+        '        storage_cursor="$_probe_cursor"',
+        '        STORAGE_TRIGGER_MODE="journal_cursor"',
+        "    fi",
+        "fi",
+        "",
         'while [ "$i" -lt "$MAX_ITERATIONS" ]; do',
         '    if [ -e "$PORT" ] && [ -w "$PORT" ]; then',
-        "        for f in /var/crash/*block_probe_fail*.crash; do",
+        '        for f in "$CRASH_GLOB_DIR"/*block_probe_fail*.crash; do',
         '            [ -e "$f" ] || continue',
         '            case " $seen " in',
         '                *" $f "*) continue ;;',
         "            esac",
         '            seen="$seen $f"',
+        "",
+        "            # S7.1R22 Section 5A/8: a durable,",
+        "            # journal-volume-proof direct trigger - this crash",
+        "            # file's mere EXISTENCE is real regardless of how",
+        "            # much journal noise followed it. An INDEPENDENT",
+        "            # dedup key from the filename-keyed $seen entry",
+        "            # just above (fires once total per run, not once",
+        "            # per crash file), so neither this nor the",
+        "            # existing per-file crash-evidence capture below",
+        "            # starves the other.",
+        '            if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ]; then',
+        '                case " $seen " in',
+        '                    *" storage:block_probe_fail "*) ;;',
+        "                    *)",
+        '                        seen="$seen storage:block_probe_fail"',
+        "                        _emit_storage_frame block_probe_fail crash_file "
+        "NOT_OBSERVED",
+        "                        ;;",
+        "                esac",
+        "            fi",
+        "",
         '            [ "$exported_count" -ge "$MAX_CRASH_FILES" ] && continue',
         "            exported_count=$((exported_count + 1))",
         '            size=$(wc -c < "$f" 2>/dev/null || echo 0)',
@@ -779,53 +921,78 @@ def build_qa_evidence_watcher_script() -> str:
         "            fi",
         "        fi",
         "",
-        "        # S7.1R21 storage probe internal-evidence",
-        "        # instrumentation: the first occurrence of any of the",
-        "        # three real S7.1R20 forensic signals -",
-        "        # probe_once+cancelled, block_probe_fail,",
-        "        # disk_probe_fail - triggers one bounded",
-        "        # SEREIN STORAGE PROBE FRAME. Reuses the SAME",
-        "        # $recent_journal fetch above for trigger DETECTION",
-        "        # (cheap, already-fetched), but the frame's own",
-        "        # journal-window CONTENT uses a separate, wider,",
-        "        # dedicated fetch below (Section 10 - the real R20",
-        "        # failure window spans minutes of unrelated noise the",
-        "        # narrow 200-line detection window would not capture).",
-        "        #",
-        "        # The three triggers are checked with INDEPENDENT `if`",
-        "        # statements below, never `elif` - a real run's own",
-        "        # `-n 200` journal snapshot commonly keeps showing an",
-        "        # ALREADY-DEDUPLICATED earlier trigger's own lines for",
-        "        # many subsequent polls (they do not scroll out of a",
-        "        # 200-line window quickly), so an elif chain would let",
-        "        # the first-priority trigger perpetually 'win' the",
-        "        # branch and never fall through to check the other two",
-        "        # - confirmed as a real bug via this round's own",
-        "        # functional test before being fixed here.",
-        '        if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
-        'printf "%s" "$recent_journal" | grep -qi \'probe_once\' && '
-        'printf "%s" "$recent_journal" | grep -qi \'cancelled\'; then',
-        '            case " $seen " in',
-        '                *" storage:probe_cancelled "*) ;;',
-        '                *) seen="$seen storage:probe_cancelled"; '
-        '_emit_storage_frame probe_cancelled ;;',
-        "            esac",
+        "        # S7.1R22 storage-trigger reliability corrective:",
+        "        # probe_once+cancelled and disk_probe_fail are now",
+        "        # detected from a DEDICATED per-poll batch - NEVER the",
+        "        # shared, volatile $recent_journal window used for",
+        "        # snap-signal detection above (that window's own",
+        "        # volatility is exactly what caused the real",
+        "        # R21-TCG-REPRO-1 miss: a genuine trigger line scrolled",
+        "        # out of the last-200-line snapshot between polls,",
+        "        # before this watcher ever inspected it).",
+        "        # block_probe_fail no longer depends on any journal",
+        "        # window at all - it already fires directly from the",
+        "        # crash-file scan above (Section 5A), a durable signal",
+        "        # unaffected by journal volume entirely.",
+        '        if [ "$STORAGE_TRIGGER_MODE" = "journal_cursor" ]; then',
+        '            _storage_raw=$(journalctl --no-pager -o short-monotonic '
+        '--after-cursor="$storage_cursor" --show-cursor 2>/dev/null)',
+        '            if [ -n "$_storage_raw" ]; then',
+        '                _new_cursor=$(printf "%s\\n" "$_storage_raw" | '
+        'sed -n "s/^-- cursor: //p" | tail -n1)',
+        '                [ -n "$_new_cursor" ] && storage_cursor="$_new_cursor"',
+        '                storage_batch=$(printf "%s\\n" "$_storage_raw" | '
+        'grep -v "^-- cursor: " | grep -v "^-- No entries --\\$" | '
+        'head -c "$MAX_STORAGE_DETECTION_BYTES")',
+        "            else",
+        '                storage_batch=""',
+        "            fi",
+        "        else",
+        '            storage_batch=$(journalctl --no-pager -o short-monotonic '
+        '-n "$MAX_STORAGE_DETECTION_LINES" 2>/dev/null | '
+        'head -c "$MAX_STORAGE_DETECTION_BYTES") || storage_batch=""',
         "        fi",
-        '        if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
-        'printf "%s" "$recent_journal" | grep -qi \'block_probe_fail\'; then',
-        '            case " $seen " in',
-        '                *" storage:block_probe_fail "*) ;;',
-        '                *) seen="$seen storage:block_probe_fail"; '
-        '_emit_storage_frame block_probe_fail ;;',
-        "            esac",
-        "        fi",
-        '        if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
-        'printf "%s" "$recent_journal" | grep -qi \'disk_probe_fail\'; then',
-        '            case " $seen " in',
-        '                *" storage:disk_probe_fail "*) ;;',
-        '                *) seen="$seen storage:disk_probe_fail"; '
-        '_emit_storage_frame disk_probe_fail ;;',
-        "            esac",
+        '        if [ -n "$storage_batch" ] && '
+        '[ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ]; then',
+        "            # Section 7: probe_once and cancelled must co-occur",
+        "            # on the SAME journal line to count (real evidence",
+        "            # confirms Subiquity emits both substrings on one",
+        "            # line) - piping one grep's already line-filtered",
+        "            # output into a second grep keeps the match",
+        "            # anchored to a single line, never a same-buffer,",
+        "            # different-line false association.",
+        '            _po_line=$(printf "%s\\n" "$storage_batch" | '
+        'grep -i \'probe_once\' | grep -i \'cancelled\' | head -n1)',
+        '            if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
+        '[ -n "$_po_line" ]; then',
+        '                case " $seen " in',
+        '                    *" storage:probe_cancelled "*) ;;',
+        "                    *)",
+        '                        seen="$seen storage:probe_cancelled"',
+        '                        _po_ts=$(printf "%s" "$_po_line" | '
+        'sed -nE "s/^\\[[[:space:]]*([0-9]+\\.[0-9]+)\\].*/\\1/p")',
+        '                        [ -z "$_po_ts" ] && _po_ts="NOT_OBSERVED"',
+        '                        _emit_storage_frame probe_cancelled '
+        '"$STORAGE_TRIGGER_MODE" "$_po_ts"',
+        "                        ;;",
+        "                esac",
+        "            fi",
+        '            _dp_line=$(printf "%s\\n" "$storage_batch" | '
+        'grep -i \'disk_probe_fail\' | head -n1)',
+        '            if [ "$storage_frame_count" -lt "$MAX_STORAGE_FRAMES" ] && '
+        '[ -n "$_dp_line" ]; then',
+        '                case " $seen " in',
+        '                    *" storage:disk_probe_fail "*) ;;',
+        "                    *)",
+        '                        seen="$seen storage:disk_probe_fail"',
+        '                        _dp_ts=$(printf "%s" "$_dp_line" | '
+        'sed -nE "s/^\\[[[:space:]]*([0-9]+\\.[0-9]+)\\].*/\\1/p")',
+        '                        [ -z "$_dp_ts" ] && _dp_ts="NOT_OBSERVED"',
+        '                        _emit_storage_frame disk_probe_fail '
+        '"$STORAGE_TRIGGER_MODE" "$_dp_ts"',
+        "                        ;;",
+        "                esac",
+        "            fi",
         "        fi",
         "    fi",
         "    i=$((i + 1))",

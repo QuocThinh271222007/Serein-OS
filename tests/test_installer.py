@@ -784,11 +784,12 @@ class TestQaEvidenceGuestProducer:
 
     def test_watcher_script_watches_only_block_probe_fail_crash_files(self):
         script = self._script()
-        assert "/var/crash/*block_probe_fail*.crash" in script
+        assert 'CRASH_GLOB_DIR="${SEREIN_TEST_CRASH_DIR:-/var/crash}"' in script
+        assert '"$CRASH_GLOB_DIR"/*block_probe_fail*.crash' in script
 
     def test_watcher_script_writes_only_to_named_evidence_port(self):
         script = self._script()
-        assert f'PORT="{QA_EVIDENCE_PORT_PATH}"' in script
+        assert f'PORT="${{SEREIN_TEST_PORT:-{QA_EVIDENCE_PORT_PATH}}}"' in script
         # every redirection into a real sink targets $PORT (or
         # /dev/null for discarded stdout/stderr) - never any other
         # file path. Filters out awk's own `>`/`>=` COMPARISON
@@ -824,8 +825,14 @@ class TestQaEvidenceGuestProducer:
         script = self._script()
         assert "while true" not in script
         assert 'while [ "$i" -lt "$MAX_ITERATIONS" ]' in script
-        assert f"MAX_ITERATIONS={QA_EVIDENCE_WATCHER_MAX_ITERATIONS}" in script
-        assert f"SLEEP_SECONDS={QA_EVIDENCE_WATCHER_SLEEP_SECONDS}" in script
+        assert (
+            "MAX_ITERATIONS=\"${SEREIN_QA_WATCHER_MAX_ITERATIONS:-"
+            f'{QA_EVIDENCE_WATCHER_MAX_ITERATIONS}}}"'
+        ) in script
+        assert (
+            "SLEEP_SECONDS=\"${SEREIN_QA_WATCHER_SLEEP_SECONDS:-"
+            f'{QA_EVIDENCE_WATCHER_SLEEP_SECONDS}}}"'
+        ) in script
 
     def test_watcher_bounded_lifetime_matches_qemu_timeout_ceiling(self):
         # The watcher must self-terminate at or before the host's own
@@ -1108,26 +1115,27 @@ def _run_watcher_for_test(
     bin_dir: Path,
     max_iterations: int = 1,
     extra_script: str = "",
+    crash_dir: Path | None = None,
 ) -> str:
     """Writes a real, syntax-checked copy of the current watcher
-    script with MAX_ITERATIONS/SLEEP_SECONDS overridden for a fast
-    test run, executes it with `bin_dir` prepended to PATH (so fake
+    script, executes it with `bin_dir` prepended to PATH (so fake
     diagnostic tools are used instead of whatever the test host
     happens to have), and returns the captured evidence-port content.
-    Skips (never fails) when no POSIX shell is available in this
-    environment - matches this project's own established
+    Overrides PORT/MAX_ITERATIONS/SLEEP_SECONDS/CRASH_GLOB_DIR via the
+    SEREIN_TEST_PORT/SEREIN_QA_WATCHER_MAX_ITERATIONS/
+    SEREIN_QA_WATCHER_SLEEP_SECONDS/SEREIN_TEST_CRASH_DIR test
+    affordances the generated script itself reads (never text
+    substitution against the script - see
+    build_qa_evidence_watcher_script's own S7.1R22 Section 14
+    comments). Skips (never fails) when no POSIX shell is available in
+    this environment - matches this project's own established
     Windows/CI-portability discipline elsewhere in this test file."""
     sh = shutil.which("sh") or shutil.which("bash")
     if sh is None:
         pytest.skip("no POSIX shell available to execute the generated watcher script")
     script = build_qa_evidence_watcher_script()
-    script = re.sub(
-        r"^MAX_ITERATIONS=\d+", f"MAX_ITERATIONS={max_iterations}", script, count=1, flags=re.M
-    )
-    script = re.sub(r"^SLEEP_SECONDS=\d+", "SLEEP_SECONDS=0", script, count=1, flags=re.M)
     port = tmp_path / "fake-port.log"
     port.write_text("", encoding="utf-8")
-    script = re.sub(r'^PORT=".*"', f'PORT="{port.as_posix()}"', script, count=1, flags=re.M)
     if extra_script:
         script += "\n" + extra_script + "\n"
     watcher_path = tmp_path / "test-watcher.sh"
@@ -1135,6 +1143,11 @@ def _run_watcher_for_test(
     watcher_path.chmod(0o755)
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    env["SEREIN_TEST_PORT"] = port.as_posix()
+    env["SEREIN_QA_WATCHER_MAX_ITERATIONS"] = str(max_iterations)
+    env["SEREIN_QA_WATCHER_SLEEP_SECONDS"] = "0"
+    if crash_dir is not None:
+        env["SEREIN_TEST_CRASH_DIR"] = crash_dir.as_posix()
     subprocess.run([sh, str(watcher_path)], cwd=tmp_path, env=env, check=False, timeout=30)
     return port.read_text(encoding="utf-8", errors="replace")
 
@@ -1290,12 +1303,18 @@ class TestQaEvidenceStorageProbeFrame:
         all_signals = (
             "[ 1173.695653] probe_once: restricted=False\n"
             "[ 1356.887591] probe_once: cancelled\n"
-            "[ 1388.901862] block_probe_fail detected\n"
             "[ 1601.649033] disk_probe_fail detected\n"
         )
         _make_fake_journalctl(bin_dir, wide_lines=all_signals, narrow_lines=all_signals)
         _make_fake_lsblk(bin_dir)
-        content = _run_watcher_for_test(tmp_path, bin_dir, max_iterations=5)
+        # block_probe_fail is a crash-file trigger (Section 5A), not a
+        # journal signal - a real crash file is required to fire it.
+        crash_dir = tmp_path / "crash"
+        crash_dir.mkdir()
+        (crash_dir / "storage-block_probe_fail-1.crash").write_text("evidence", encoding="utf-8")
+        content = _run_watcher_for_test(
+            tmp_path, bin_dir, max_iterations=5, crash_dir=crash_dir
+        )
         assert content.count("frame_sequence=1") == 1
         assert content.count("frame_sequence=2") == 1
         assert content.count("frame_sequence=3") == 1
@@ -1311,12 +1330,15 @@ class TestQaEvidenceStorageProbeFrame:
         # (3) - this proves the count check itself is real and active.
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
-        all_signals = (
-            "probe_once: cancelled\nblock_probe_fail detected\ndisk_probe_fail detected\n"
-        )
+        all_signals = "probe_once: cancelled\ndisk_probe_fail detected\n"
         _make_fake_journalctl(bin_dir, wide_lines=all_signals, narrow_lines=all_signals)
         _make_fake_lsblk(bin_dir)
-        content = _run_watcher_for_test(tmp_path, bin_dir, max_iterations=5)
+        crash_dir = tmp_path / "crash"
+        crash_dir.mkdir()
+        (crash_dir / "storage-block_probe_fail-1.crash").write_text("evidence", encoding="utf-8")
+        content = _run_watcher_for_test(
+            tmp_path, bin_dir, max_iterations=5, crash_dir=crash_dir
+        )
         assert content.count("=== SEREIN STORAGE PROBE FRAME ===") <= QA_EVIDENCE_MAX_STORAGE_FRAMES
 
     def test_functional_deduplication_across_iterations(self, tmp_path):
