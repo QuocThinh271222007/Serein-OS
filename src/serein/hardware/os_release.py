@@ -41,5 +41,10 @@ def read_os_release(root: Path) -> OSInfo:
         name=values.get("NAME"),
         version_id=values.get("VERSION_ID"),
         pretty_name=values.get("PRETTY_NAME"),
-        is_ubuntu=(os_id == "ubuntu"),
+        # A real Serein install sets ID=serein/ID_LIKE=ubuntu (Section 19
+        # of the Phase-7-completion brief - Serein remains technically
+        # accurate as Ubuntu-based) - "Ubuntu-compatible" must keep
+        # meaning that on an actual Serein system, never only ID=ubuntu
+        # literally.
+        is_ubuntu=(os_id == "ubuntu" or "ubuntu" in id_like),
     )

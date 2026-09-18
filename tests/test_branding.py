@@ -10,8 +10,11 @@ import jsonschema
 import pytest
 
 from serein.branding.manifest import ASSETS, missing_assets, pending_asset_requests
+from serein.branding.os_identity import render_issue, render_issue_net, render_os_release
 from serein.branding.tokens import load_design_tokens
+from serein.desktop.models import TARGET_UBUNTU_VERSION
 from serein.distribution.payload import PAYLOAD_RESOURCE_ROOTS, collect_resource_entries
+from serein.hardware.os_release import read_os_release
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMAS_DIR = REPO_ROOT / "schemas"
@@ -137,3 +140,42 @@ class TestPayloadWiring:
         paths = {e.path for e in entries}
         for asset in pending_asset_requests():
             assert asset.repo_path not in paths
+
+
+class TestOSIdentity:
+    def test_os_release_round_trips_through_the_real_reader(self, tmp_path: Path) -> None:
+        etc = tmp_path / "etc"
+        etc.mkdir()
+        (etc / "os-release").write_text(render_os_release(), encoding="utf-8")
+        info = read_os_release(tmp_path)
+        assert info.id == "serein"
+        assert info.pretty_name == "Serein OS"
+        assert info.version_id == TARGET_UBUNTU_VERSION
+
+    def test_id_like_ubuntu_makes_is_ubuntu_true(self, tmp_path: Path) -> None:
+        # The exact real-world correctness fix this module required:
+        # a Serein system (ID=serein) must still count as
+        # Ubuntu-compatible via ID_LIKE, not just a literal ID=ubuntu.
+        etc = tmp_path / "etc"
+        etc.mkdir()
+        (etc / "os-release").write_text(render_os_release(), encoding="utf-8")
+        info = read_os_release(tmp_path)
+        assert "ubuntu" in info.id_like
+        assert info.is_ubuntu is True
+
+    def test_never_claims_independence_from_ubuntu(self) -> None:
+        text = render_os_release()
+        assert "ID_LIKE=ubuntu" in text
+        assert f'VERSION_ID="{TARGET_UBUNTU_VERSION}"' in text
+
+    def test_issue_uses_real_getty_escape_sequences(self) -> None:
+        text = render_issue()
+        assert "\\n" in text
+        assert "\\l" in text
+        assert "Serein OS" in text
+
+    def test_issue_net_is_plain_text_no_escape_sequences(self) -> None:
+        text = render_issue_net()
+        assert "\\n" not in text
+        assert "\\l" not in text
+        assert text.strip() == "Serein OS"

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from serein.ai.status import build_ai_status
+from serein.branding.os_identity import render_issue, render_issue_net, render_os_release
 from serein.cyber.status import build_cyber_status
 from serein.desktop import config as desktop_config
 from serein.desktop.models import DESKTOP_CONFIG_VERSION
@@ -31,6 +32,7 @@ from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.development.status import build_development_status
 from serein.distribution.pathsafety import resolve_within
 from serein.hardware.executor import apply_hardware_plan
+from serein.hardware.os_release import read_os_release
 from serein.hardware.planner import build_hardware_plan
 from serein.hardware.probe import probe_hardware
 from serein.installer.payload import InstallStateMarker
@@ -156,7 +158,18 @@ def step_initialize_directories(ctx: FirstbootContext) -> StepOutcome:
     """02: create the canonical Serein directories with sane, narrow
     permissions (Section 14, 26 - "No world-writable state. No broad
     chmod."). Each directory is created/chmod'd individually - never a
-    recursive chmod over an existing tree."""
+    recursive chmod over an existing tree.
+
+    Also writes Serein's own OS identity (``/etc/os-release``,
+    ``/etc/issue``, ``/etc/issue.net`` - Section 19). First boot is the
+    correct, and currently the only, place this can happen for every
+    real install path (see ``serein.branding.os_identity``'s own
+    docstring for why - never the squashfs, never curtin
+    late-commands). Verified by reading the freshly-written
+    ``/etc/os-release`` back through the SAME
+    ``read_os_release`` detector ``desktop.status``/``core.status``
+    already use, rather than trusting the write alone.
+    """
     created = []
     for relative in _CORE_DIRECTORIES:
         target = resolve_within(ctx.root, relative)
@@ -170,10 +183,35 @@ def step_initialize_directories(ctx: FirstbootContext) -> StepOutcome:
             pass
         created.append(str(target))
 
+    etc_dir = resolve_within(ctx.root, "etc")
+    etc_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(etc_dir / "os-release", render_os_release())
+    atomic_write_text(etc_dir / "issue", render_issue())
+    atomic_write_text(etc_dir / "issue.net", render_issue_net())
+
+    os_info = read_os_release(ctx.root)
+    os_identity_verified = os_info.id == "serein" and os_info.is_ubuntu
+    os_identity = {
+        "id": os_info.id,
+        "pretty_name": os_info.pretty_name,
+        "is_ubuntu": os_info.is_ubuntu,
+        "verified": os_identity_verified,
+    }
+    if not os_identity_verified:
+        return StepOutcome(
+            passed=False,
+            detail="wrote OS identity files but verification did not observe them",
+            reason="os_identity_verify_failed",
+            evidence={"directories": created, "os_identity": os_identity},
+        )
+
     return StepOutcome(
         passed=True,
-        detail=f"ensured {len(created)} canonical Serein directories exist (mode 0755)",
-        evidence={"directories": created, "mode": "0755"},
+        detail=(
+            f"ensured {len(created)} canonical Serein directories exist (mode 0755); "
+            "wrote and verified OS identity"
+        ),
+        evidence={"directories": created, "mode": "0755", "os_identity": os_identity},
     )
 
 

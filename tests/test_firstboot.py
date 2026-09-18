@@ -622,6 +622,18 @@ class TestReadOnlyCommands:
 # --------------------------------------------------------------------------
 
 
+class TestOSIdentity:
+    def test_step_02_writes_and_verifies_serein_identity(self, tmp_path: Path) -> None:
+        _write_valid_install_state(tmp_path)
+        result = run_firstboot(root=tmp_path, runner=FakeCommandRunner())
+        assert result.status == "COMPLETE"
+        for name in ("os-release", "issue", "issue.net"):
+            assert (tmp_path / "etc" / name).is_file()
+        os_release = (tmp_path / "etc" / "os-release").read_text(encoding="utf-8")
+        assert "ID=serein" in os_release
+        assert "ID_LIKE=ubuntu" in os_release
+
+
 class TestSafetyInvariants:
     def test_focus_default_is_balanced_and_never_applied(self, tmp_path: Path) -> None:
         _write_valid_install_state(tmp_path)
