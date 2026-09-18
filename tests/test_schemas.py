@@ -73,6 +73,7 @@ def _load_schema(name: str) -> dict:
         "distribution-base-image.schema.json",
         "distribution-payload-manifest.schema.json",
         "distribution-build-manifest.schema.json",
+        "focus-runtime-state.schema.json",
     ],
 )
 def test_schema_file_is_valid_json_schema(name: str) -> None:

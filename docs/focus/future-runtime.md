@@ -1,5 +1,21 @@
 # Future Runtime Boundary
 
+## Update (Phase-7-completion, S7): the runtime executor now exists
+
+`serein.focus.runtime` implements the systemd-slice + transaction
+portion of what this document originally sketched as future work -
+see that module's own docstring for the exact, current design. What
+follows below is kept as the original planning document (S6.5's own
+"where we stop" framing) for historical/provenance reasons; treat any
+line still describing something as "not implemented" against the
+actual module, not against this prose, if the two ever appear to
+disagree.
+
+Still genuinely not implemented by `serein.focus.runtime`: real
+`MemoryHigh` writes, runtime-specific lifecycle adapters (start/stop/
+quiesce a known service), and any GPU backend adapter - GPU remains
+`NOT_ENFORCEABLE` by design (Section 29), never attempted.
+
 ## Where S6.5 stops
 
 ```

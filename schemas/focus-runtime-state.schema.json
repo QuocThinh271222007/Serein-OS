@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/focus-runtime-state.schema.json",
+  "title": "Serein Focus Runtime State",
+  "description": "The one authoritative persisted active-focus record (Phase-7-completion Section 28), written to /var/lib/serein/focus/state.json. Every consumer (Fastfetch, KRunner, CLI, desktop) reads this same file.",
+  "type": "object",
+  "required": ["schema_version", "active_focus", "committed_at", "last_result"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "active_focus": {
+      "type": "string",
+      "enum": ["balanced", "dev", "ai", "cyber", "private"]
+    },
+    "committed_at": { "type": ["string", "null"] },
+    "last_result": {
+      "type": ["object", "null"],
+      "required": [
+        "schema_version", "status", "from_focus", "to_focus", "slice_results",
+        "gpu_note", "attempted_at", "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "const": 1 },
+        "status": {
+          "type": "string",
+          "enum": ["committed", "rolled_back", "blocked", "failed"]
+        },
+        "from_focus": { "type": "string" },
+        "to_focus": { "type": "string" },
+        "slice_results": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "slice_name", "cpu_weight", "io_weight", "written", "verified", "reason"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "slice_name": { "type": "string" },
+              "cpu_weight": { "type": ["integer", "null"] },
+              "io_weight": { "type": ["integer", "null"] },
+              "written": { "type": "boolean" },
+              "verified": { "type": ["boolean", "null"] },
+              "reason": { "type": "string" }
+            }
+          }
+        },
+        "gpu_note": { "type": "string" },
+        "attempted_at": { "type": "string" },
+        "reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}
