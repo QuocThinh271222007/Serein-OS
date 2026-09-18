@@ -9,11 +9,17 @@ from pathlib import Path
 import jsonschema
 import pytest
 
+from serein.branding.fastfetch import (
+    FOCUS_LABEL_COMMAND,
+    build_fastfetch_config,
+    focus_display_label,
+)
 from serein.branding.manifest import ASSETS, missing_assets, pending_asset_requests
 from serein.branding.os_identity import render_issue, render_issue_net, render_os_release
 from serein.branding.tokens import load_design_tokens
 from serein.desktop.models import TARGET_UBUNTU_VERSION
 from serein.distribution.payload import PAYLOAD_RESOURCE_ROOTS, collect_resource_entries
+from serein.focus.runtime import apply_focus_transition
 from serein.hardware.os_release import read_os_release
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +28,11 @@ SCHEMAS_DIR = REPO_ROOT / "schemas"
 
 def _load_schema(name: str) -> dict:
     return json.loads((SCHEMAS_DIR / name).read_text(encoding="utf-8"))
+
+
+class _FakeCommandRunner:
+    def run(self, args, timeout: float = 3.0):  # noqa: ANN001, ANN201
+        return None
 
 
 class TestDesignTokens:
@@ -179,3 +190,64 @@ class TestOSIdentity:
         assert "\\n" not in text
         assert "\\l" not in text
         assert text.strip() == "Serein OS"
+
+
+class TestFastfetch:
+    def test_config_is_valid_json(self) -> None:
+        config = build_fastfetch_config()
+        # Must round-trip through json.dumps/loads cleanly - the real
+        # syntax check available without a real fastfetch binary
+        # (Section 82 - never claim more than that).
+        json.loads(json.dumps(config))
+
+    def test_logo_is_file_type_never_requires_image_protocol(self) -> None:
+        config = build_fastfetch_config()
+        assert config["logo"]["type"] == "file"
+
+    def test_no_module_requires_sixel_or_kitty_graphics(self) -> None:
+        config = build_fastfetch_config()
+        text = json.dumps(config).lower()
+        assert "sixel" not in text
+        assert "kitty" not in text
+        assert "iterm" not in text
+
+    def test_focus_and_mode_modules_present(self) -> None:
+        config = build_fastfetch_config()
+        keys = {m.get("key") for m in config["modules"] if isinstance(m, dict)}
+        assert "Focus" in keys
+        assert "Mode" in keys
+
+    def test_focus_module_shells_out_to_the_same_command_the_cli_entrypoint_uses(
+        self,
+    ) -> None:
+        config = build_fastfetch_config()
+        focus_module = next(
+            m for m in config["modules"] if isinstance(m, dict) and m.get("key") == "Focus"
+        )
+        assert focus_module["text"] == FOCUS_LABEL_COMMAND
+
+    def test_focus_label_defaults_to_default_with_no_committed_transition(
+        self, tmp_path: Path
+    ) -> None:
+        assert focus_display_label(tmp_path) == "Default"
+
+    def test_focus_label_reflects_a_real_committed_transition(self, tmp_path: Path) -> None:
+        apply_focus_transition("dev", tmp_path, _FakeCommandRunner())
+        assert focus_display_label(tmp_path) == "Development"
+
+
+class TestBrandingMainEntrypoint:
+    def test_focus_label_prints_a_single_line(self, capsys) -> None:
+        from serein.branding.__main__ import main
+
+        exit_code = main(["focus-label"])
+        captured = capsys.readouterr()
+        assert exit_code == 0
+        assert captured.out.strip() == "Default"
+
+    def test_unknown_command_exits_nonzero(self) -> None:
+        from serein.branding.__main__ import main
+
+        with pytest.raises(SystemExit) as excinfo:
+            main(["not-a-real-command"])
+        assert excinfo.value.code != 0
