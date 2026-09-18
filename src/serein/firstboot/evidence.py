@@ -34,6 +34,7 @@ def assemble_firstboot_evidence(
         first_failure_reason=state.first_failure_reason,
         desktop_baseline=step_evidence.get("04-desktop-baseline", {}).get("desktop_baseline"),
         hardware_snapshot=step_evidence.get("03-apply-core-config", {}).get("hardware_snapshot"),
+        hardware_actions=step_evidence.get("03-apply-core-config", {}).get("hardware_actions"),
         forge_registration=step_evidence.get("05-development-registration", {}).get(
             "forge_registration"
         ),

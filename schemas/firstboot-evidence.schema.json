@@ -7,8 +7,9 @@
   "required": [
     "schema_version", "source_commit", "install_state_valid", "started_at", "completed_at",
     "steps", "first_failure_stage", "first_failure_reason", "desktop_baseline",
-    "hardware_snapshot", "forge_registration", "aether_registration", "ward_registration",
-    "veil_registration", "focus_default", "network_required", "network_available", "final_status"
+    "hardware_snapshot", "hardware_actions", "forge_registration", "aether_registration",
+    "ward_registration", "veil_registration", "focus_default", "network_required",
+    "network_available", "final_status"
   ],
   "additionalProperties": false,
   "properties": {
@@ -39,6 +40,7 @@
     "first_failure_reason": { "type": ["string", "null"] },
     "desktop_baseline": { "type": ["object", "null"] },
     "hardware_snapshot": { "type": ["object", "null"] },
+    "hardware_actions": { "type": ["array", "null"], "items": { "type": "object" } },
     "forge_registration": { "type": ["object", "null"] },
     "aether_registration": { "type": ["object", "null"] },
     "ward_registration": { "type": ["object", "null"] },

@@ -83,12 +83,38 @@ before any real run has produced them.
   stricter, more consistent-with-existing-precedent option. Real
   mutation lives exclusively behind `python -m serein.firstboot run
   --allow-run`.
-- **Desktop baseline (step `04`) is a registration/no-op** - S1 has no
-  unattended-apply mechanism for its Look-and-Feel package (it assumes
-  an interactive desktop session); rather than invent one, this step
-  only ever records the observed `build_desktop_status()` result and an
-  honest `applied_by_firstboot: false` note. A real apply, when S1
-  eventually supports one, is future work.
+- **Desktop baseline (step `04`) verifies + records; it does not stage
+  files itself** (Phase-7-completion Section 6/8/10) - the six
+  `owner="system"` resources in `desktop.config.RESOURCES` are the
+  idiomatic responsibility of a package/install-time mechanism (a
+  future `serein-desktop` .deb, or curtin late-commands during
+  install - see `SEREIN-DESKTOP-STAGING-PENDING` below), never a
+  first-boot runtime copy. This step verifies every one of those
+  target paths is actually present, then writes the
+  `/etc/serein/desktop/config-version` marker and re-reads it back via
+  the SAME `build_desktop_status()` detector desktop.plan/desktop.doctor
+  already use - it fails closed (never falsely "applied") if staging
+  has not happened yet. The two `owner="first-login-user"` resources
+  (the Look-and-Feel package) are still deliberately left untouched -
+  there is no user session inside a oneshot boot unit, and user config
+  must never be overwritten after first boot.
+- **Hardware apply (part of step `03`) is real but narrow** (Section
+  25) - `serein.hardware.executor.apply_hardware_plan` consumes
+  `build_hardware_plan("balanced", root)` unchanged and actually
+  performs the two actions Section 25 names as examples:
+  `set_power_profile` (via `powerprofilesctl set`/`get`) and
+  `configure_zram` (writes this repo's own pinned
+  `hardware/defaults/zram-generator.conf` to
+  `/etc/systemd/zram-generator.conf.d/90-serein.conf`, never the base
+  file, verified via `detect_memory_policy`). `cpu.epp`
+  (`set_epp`, a per-core sysfs write) and the per-device IO-scheduler
+  action are real `HardwarePlan` actions this executor does not yet
+  implement - a real plan proposing either comes back
+  `not_enforceable`, never silently dropped or falsely applied - see
+  `SEREIN-HARDWARE-EXECUTOR-CPU-IO-PENDING` below. A single hardware
+  action failing (e.g. no power-profiles-daemon on this host) never
+  fails the step or the overall run - hardware tuning is optional
+  polish, never release-blocking.
 - **The systemd unit is not yet wired into `serein.installer.payload`'s
   build/packaging path** - `distribution/systemd/serein-firstboot.service`
   exists as a standalone artifact under `distribution/systemd/`.
@@ -136,10 +162,19 @@ before any real run has produced them.
   status - enough for a future S7.3 to consume - but no auto-repair,
   recovery shell, snapshot restore, boot repair, or fallback slot exists
   here.
-- **S8 (performance/Focus Apply/resource enforcement)** -
-  `S8_OPTIMIZATION_IMPLEMENTED=false`. Step `03-apply-core-config` only
-  ever writes a hardware *awareness* snapshot and a default Focus
-  *label* - never a cgroup write, scheduler change, or benchmark.
+- **S8 (Focus Apply/resource enforcement)** -
+  `S8_OPTIMIZATION_IMPLEMENTED=false`. Step `03-apply-core-config`
+  writes a hardware *awareness* snapshot, applies the narrow S2
+  hardware actions documented above, and writes a default Focus
+  *label* only - never a cgroup write or scheduler change. See
+  `docs/focus/` for the separate S6.5 Focus runtime workstream.
+
+## Backlog (Phase-7-completion Section 27/58)
+
+| ID | Area | Severity | Description | Reason deferred | Future validation |
+|---|---|---|---|---|---|
+| `SEREIN-DESKTOP-STAGING-PENDING` | firstboot / desktop | non-blocking | The six `owner="system"` desktop resource files are not yet staged onto any installed target by any mechanism (no `serein-desktop` package, no curtin late-commands step) - `step_desktop_baseline` will legitimately fail closed on a real system until this exists. | Belongs to the install/package pipeline, not first-boot itself; a real Debian package or curtin wiring is a separate, larger change (see Section 35's package-model discussion). | A real S7.1-installed target with the resources actually staged, then a real first-boot run observing `04-desktop-baseline` pass. |
+| `SEREIN-HARDWARE-EXECUTOR-CPU-IO-PENDING` | firstboot / hardware | non-blocking | `serein.hardware.executor` does not yet implement `set_epp` (CPU energy-performance-preference sysfs write) or the per-device IO-scheduler action - a real plan proposing either reports `not_enforceable`. | Scoped out of this round to keep the first real hardware-executor pass small and fully tested; both are well-understood sysfs writes, not an open design question. | Extend `_IMPLEMENTED_ACTIONS` and add a real sysfs-write implementation, tested the same way (`tests/test_hardware_executor.py`) against a fixture root. |
 
 ## Pre-existing, unrelated test failure observed on this branch
 

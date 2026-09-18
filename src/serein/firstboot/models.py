@@ -249,6 +249,7 @@ class FirstbootEvidence:
     first_failure_reason: str | None
     desktop_baseline: dict[str, Any] | None
     hardware_snapshot: dict[str, Any] | None
+    hardware_actions: list[dict[str, Any]] | None
     forge_registration: dict[str, Any] | None
     aether_registration: dict[str, Any] | None
     ward_registration: dict[str, Any] | None
@@ -270,6 +271,7 @@ class FirstbootEvidence:
             "first_failure_reason": self.first_failure_reason,
             "desktop_baseline": self.desktop_baseline,
             "hardware_snapshot": self.hardware_snapshot,
+            "hardware_actions": self.hardware_actions,
             "forge_registration": self.forge_registration,
             "aether_registration": self.aether_registration,
             "ward_registration": self.ward_registration,

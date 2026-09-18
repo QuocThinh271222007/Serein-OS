@@ -24,15 +24,19 @@ from typing import Any
 
 from serein.ai.status import build_ai_status
 from serein.cyber.status import build_cyber_status
+from serein.desktop import config as desktop_config
+from serein.desktop.models import DESKTOP_CONFIG_VERSION
 from serein.desktop.status import build_desktop_status
 from serein.development.runner import DEFAULT_RUNNER, CommandRunner
 from serein.development.status import build_development_status
 from serein.distribution.pathsafety import resolve_within
+from serein.hardware.executor import apply_hardware_plan
+from serein.hardware.planner import build_hardware_plan
 from serein.hardware.probe import probe_hardware
 from serein.installer.payload import InstallStateMarker
 from serein.veil.status import build_veil_status
 
-from .atomic import atomic_write_json
+from .atomic import atomic_write_json, atomic_write_text
 from .eligibility import evaluate_eligibility
 from .installstate import install_state_path, read_install_state
 from .livemedia import detect_live_media
@@ -174,9 +178,23 @@ def step_initialize_directories(ctx: FirstbootContext) -> StepOutcome:
 
 
 def step_apply_core_config(ctx: FirstbootContext) -> StepOutcome:
-    """03: hardware-aware initial state (Section 16) and the default
-    Focus baseline label (Section 21) - both planning/awareness only,
-    never a resource mutation."""
+    """03: hardware-aware initial state (Section 16), a real but narrow
+    S2 hardware apply pass (SAFE_WITH_CAPABILITY_CHECK - Phase-7-
+    completion Section 8/25; see ``serein.hardware.executor``), and the
+    default Focus baseline label (Section 21 - planning/awareness only,
+    never a cgroup/scheduler mutation - ADR-0026 remains untouched by
+    this step).
+
+    Hardware actions are applied against the repository-defined
+    ``"balanced"`` profile - the same neutral default
+    ``DEFAULT_FOCUS_BASELINE`` already uses, correct for a freshly
+    provisioned system with no active workspace opinion yet. An
+    individual hardware action failing (e.g. no power-profiles-daemon
+    on this host) never fails this step or the overall run - hardware
+    tuning is optional polish, never a release-blocking concern
+    (Section 89) - the per-action outcome is still recorded in full,
+    never silently dropped.
+    """
     hw = probe_hardware(ctx.root)
     snapshot = {
         "cpu_vendor": hw.cpu.vendor,
@@ -191,6 +209,9 @@ def step_apply_core_config(ctx: FirstbootContext) -> StepOutcome:
     }
     _write_registration(ctx, HARDWARE_SNAPSHOT_RELATIVE_PATH, snapshot)
 
+    hardware_plan = build_hardware_plan(DEFAULT_FOCUS_BASELINE, ctx.root)
+    action_results = apply_hardware_plan(hardware_plan, ctx.root, ctx.runner)
+
     focus_default = {
         "policy_baseline": DEFAULT_FOCUS_BASELINE,
         "runtime_enforcement": False,
@@ -201,32 +222,104 @@ def step_apply_core_config(ctx: FirstbootContext) -> StepOutcome:
 
     return StepOutcome(
         passed=True,
-        detail="wrote hardware snapshot and default Focus baseline",
-        evidence={"hardware_snapshot": snapshot, "focus_default": focus_default},
+        detail=(
+            "wrote hardware snapshot, applied S2 hardware plan "
+            f"({len(action_results)} actions), and default Focus baseline"
+        ),
+        evidence={
+            "hardware_snapshot": snapshot,
+            "hardware_actions": [r.to_dict() for r in action_results],
+            "focus_default": focus_default,
+        },
     )
 
 
 def step_desktop_baseline(ctx: FirstbootContext) -> StepOutcome:
-    """04: S1 has no unattended Apply mechanism (Section 15) - a first
-    boot running non-interactively under systemd has no desktop session
-    to apply a Look-and-Feel package into. This step is an honest
-    registration/no-op: it records the current desktop status and defers
-    real application to a future interactive session, never fabricating
-    "applied"."""
+    """04: S1 desktop system-defaults verification + config-version
+    record (SAFE_AUTOMATIC - Phase-7-completion Section 8).
+
+    Staging the actual system-owned resource files
+    (``desktop.config.RESOURCES``, ``owner="system"``) onto the
+    installed target's real filesystem paths (``/etc/xdg/kdeglobals``,
+    etc.) is a package/install-time concern, not a first-boot concern -
+    the idiomatic Linux-native place for "install this file to this
+    system path" is a package's own file manifest (a future
+    ``serein-desktop`` .deb, or curtin late-commands during install),
+    never a first-boot runtime copy (Section 22/72 - "few permanently
+    resident services... prefer Linux-native mechanisms"). This step's
+    own job is narrower and correctly scoped: VERIFY every
+    system-owned resource actually landed where it should (never
+    re-derive that list - the same ``desktop.config.RESOURCES``
+    contract ``desktop.plan``/``desktop.doctor`` already use), then
+    RECORD the Serein desktop config-version marker once verification
+    passes - the one real mutation this step performs, and the exact
+    fact ``desktop.detect.detect_config_state`` already knows how to
+    read back (this step's "verify" reuses that SAME existing
+    detector after writing the marker, rather than inventing a second,
+    possibly-diverging way to answer "did the desktop preset apply").
+    Never touches an ``owner="first-login-user"`` resource (the
+    Look-and-Feel package) - there is no user session inside a
+    oneshot boot unit, and Section 10 requires never overwriting user
+    config after first boot.
+
+    Tracked gap (not silently glossed over): staging these files onto
+    the installed target is not yet implemented anywhere in the
+    build/install pipeline - see docs/firstboot/known-limitations.md
+    (SEREIN-DESKTOP-STAGING-PENDING). Until that exists, this step
+    legitimately fails closed on a real system rather than falsely
+    reporting success.
+    """
+    system_resources = [r for r in desktop_config.RESOURCES if r.owner == "system"]
+    missing = [
+        r for r in system_resources
+        if not resolve_within(ctx.root, r.target_path.lstrip("/")).is_file()
+    ]
+    if missing:
+        return StepOutcome(
+            passed=False,
+            detail=(
+                f"{len(missing)} of {len(system_resources)} system-owned desktop "
+                "resources are not staged at their target path (staging happens at "
+                "package/install time, not first-boot - see "
+                "SEREIN-DESKTOP-STAGING-PENDING)"
+            ),
+            reason="desktop_resources_not_staged",
+            evidence={"missing_target_paths": [r.target_path for r in missing]},
+        )
+
+    version_path = resolve_within(ctx.root, "etc/serein/desktop/config-version")
+    atomic_write_text(version_path, f"{DESKTOP_CONFIG_VERSION}\n")
+
     status = build_desktop_status(root=ctx.root, env={})
-    record = {
-        "profile_id": status.profile_id,
-        "serein_preset_applied": status.config.serein_preset_applied,
-        "applied_by_firstboot": False,
-        "note": (
-            "S1 desktop baseline has no unattended-apply mechanism yet; "
-            "first-boot only registers observed state (registration/no-op)"
-        ),
-    }
+    if (
+        not status.config.serein_preset_applied
+        or status.config.desktop_config_version != DESKTOP_CONFIG_VERSION
+    ):
+        return StepOutcome(
+            passed=False,
+            detail="wrote desktop config-version marker but verification did not observe it",
+            reason="desktop_config_verify_failed",
+            evidence={
+                "serein_preset_applied": status.config.serein_preset_applied,
+                "desktop_config_version": status.config.desktop_config_version,
+            },
+        )
+
     return StepOutcome(
         passed=True,
-        detail="registered desktop baseline observation (no unattended apply mechanism exists)",
-        evidence={"desktop_baseline": record},
+        detail=(
+            f"verified {len(system_resources)} system-owned desktop resources present; "
+            f"recorded config-version={DESKTOP_CONFIG_VERSION}"
+        ),
+        evidence={"desktop_baseline": {
+            "verified_target_paths": [r.target_path for r in system_resources],
+            "config_version": DESKTOP_CONFIG_VERSION,
+            "applied_by_firstboot": False,
+            "note": (
+                "firstboot verifies+records only; staging the files themselves is a "
+                "package/install-time concern (SEREIN-DESKTOP-STAGING-PENDING)"
+            ),
+        }},
     )
 
 

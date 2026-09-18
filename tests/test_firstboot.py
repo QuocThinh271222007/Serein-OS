@@ -17,6 +17,7 @@ from pathlib import Path
 import jsonschema
 import pytest
 
+from serein.desktop.config import RESOURCES as DESKTOP_RESOURCES
 from serein.development.runner import CommandResult
 from serein.firstboot.atomic import atomic_write_json
 from serein.firstboot.doctor import run_firstboot_checks
@@ -69,6 +70,21 @@ def _install_state_path(root: Path) -> Path:
     return root / "etc" / "serein" / "install-state.json"
 
 
+def _stage_system_desktop_resources(root: Path) -> None:
+    """Mimics what a real package/install-time staging step (not yet
+    implemented - SEREIN-DESKTOP-STAGING-PENDING) would have already
+    done before first-boot ever runs: place every ``owner="system"``
+    desktop resource at its real target path. Content fidelity is
+    desktop's own test suite's concern (test_desktop.py); first-boot's
+    ``step_desktop_baseline`` only ever checks presence."""
+    for resource in DESKTOP_RESOURCES:
+        if resource.owner != "system":
+            continue
+        target = root / resource.target_path.lstrip("/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"# staged for test: {resource.id}\n", encoding="utf-8")
+
+
 def _write_valid_install_state(
     root: Path, *, firstboot_provisioning: str = "pending", source_commit: str = SOURCE_COMMIT
 ) -> None:
@@ -79,6 +95,7 @@ def _write_valid_install_state(
         marker = dataclasses.replace(marker, firstboot_provisioning=firstboot_provisioning)
     path = _install_state_path(root)
     atomic_write_json(path, marker.to_dict())
+    _stage_system_desktop_resources(root)
 
 
 def _write_raw_install_state(root: Path, data: dict) -> None:
@@ -626,12 +643,40 @@ class TestSafetyInvariants:
         assert result.evidence is not None
         assert result.evidence.network_required is False
 
-    def test_desktop_baseline_never_claims_applied(self, tmp_path: Path) -> None:
+    def test_desktop_baseline_verifies_staged_resources_and_records_version(
+        self, tmp_path: Path
+    ) -> None:
+        # _write_valid_install_state stages the system-owned resources
+        # first (mimicking a real package/install-time staging step) -
+        # step_desktop_baseline's own job is narrower: verify they
+        # landed, then record the config-version marker.
         _write_valid_install_state(tmp_path)
         result = run_firstboot(root=tmp_path, runner=FakeCommandRunner())
+        assert result.status == "COMPLETE"
         assert result.evidence is not None
-        assert result.evidence.desktop_baseline is not None
-        assert result.evidence.desktop_baseline["applied_by_firstboot"] is False
+        record = result.evidence.desktop_baseline
+        assert record is not None
+        assert record["config_version"] == 1
+        version_marker = tmp_path / "etc" / "serein" / "desktop" / "config-version"
+        assert version_marker.is_file()
+
+    def test_desktop_baseline_fails_closed_when_resources_not_staged(
+        self, tmp_path: Path
+    ) -> None:
+        # A bare install-state marker with NO desktop resources staged
+        # (staging is a package/install-time concern - not yet
+        # implemented, SEREIN-DESKTOP-STAGING-PENDING) - the step must
+        # fail closed rather than falsely record a config-version.
+        marker = build_install_state_marker(
+            source_commit=SOURCE_COMMIT, source_media_version="26.04.1"
+        )
+        atomic_write_json(_install_state_path(tmp_path), marker.to_dict())
+        result = run_firstboot(root=tmp_path, runner=FakeCommandRunner())
+        assert result.status == "FAILED"
+        assert result.state is not None
+        assert result.state.first_failure_stage == "04-desktop-baseline"
+        version_marker = tmp_path / "etc" / "serein" / "desktop" / "config-version"
+        assert not version_marker.is_file()
 
 
 # --------------------------------------------------------------------------
