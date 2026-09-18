@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/firstboot-evidence.schema.json",
+  "title": "Serein First-Boot Provisioning Evidence",
+  "description": "Machine-readable evidence for one first-boot provisioning attempt, written to /var/lib/serein/firstboot/firstboot-evidence.json. The desktop_baseline/hardware_snapshot/*_registration/focus_default fields embed compact records derived from S1-S6.5's own status reports - their internal shape is owned by those subsystems, not constrained further here. Never includes a secret, credential, username, or real hostname.",
+  "type": "object",
+  "required": [
+    "schema_version", "source_commit", "install_state_valid", "started_at", "completed_at",
+    "steps", "first_failure_stage", "first_failure_reason", "desktop_baseline",
+    "hardware_snapshot", "forge_registration", "aether_registration", "ward_registration",
+    "veil_registration", "focus_default", "network_required", "network_available", "final_status"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "source_commit": { "type": ["string", "null"] },
+    "install_state_valid": { "type": "boolean" },
+    "started_at": { "type": ["string", "null"] },
+    "completed_at": { "type": ["string", "null"] },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "status", "started_at", "completed_at", "failure_reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "running", "passed", "failed", "skipped"]
+          },
+          "started_at": { "type": ["string", "null"] },
+          "completed_at": { "type": ["string", "null"] },
+          "failure_reason": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "first_failure_stage": { "type": ["string", "null"] },
+    "first_failure_reason": { "type": ["string", "null"] },
+    "desktop_baseline": { "type": ["object", "null"] },
+    "hardware_snapshot": { "type": ["object", "null"] },
+    "forge_registration": { "type": ["object", "null"] },
+    "aether_registration": { "type": ["object", "null"] },
+    "ward_registration": { "type": ["object", "null"] },
+    "veil_registration": { "type": ["object", "null"] },
+    "focus_default": { "type": ["object", "null"] },
+    "network_required": { "type": "boolean" },
+    "network_available": { "type": ["boolean", "null"] },
+    "final_status": { "type": "string", "enum": ["pending", "running", "failed", "complete"] }
+  }
+}

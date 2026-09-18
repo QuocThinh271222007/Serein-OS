@@ -223,6 +223,65 @@ def test_hardware_plan_rejects_unknown_profile() -> None:
     assert excinfo.value.code != 0
 
 
+def test_firstboot_status_human_output(capsys) -> None:
+    exit_code = main(["firstboot", "status"])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "SEREIN FIRSTBOOT" in captured.out
+    assert "Eligibility" in captured.out
+
+
+def test_firstboot_status_json_is_well_formed(capsys) -> None:
+    exit_code = main(["firstboot", "status", "--json"])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    data = json.loads(captured.out)
+    assert data["schema_version"] == 1
+    assert "eligibility_status" in data
+
+
+def test_firstboot_doctor_human_output_exits_zero_or_one(capsys) -> None:
+    exit_code = main(["firstboot", "doctor"])
+    captured = capsys.readouterr()
+    assert exit_code in (0, 1)
+    assert "SEREIN FIRSTBOOT DOCTOR" in captured.out
+
+
+def test_firstboot_doctor_json_is_well_formed(capsys) -> None:
+    exit_code = main(["firstboot", "doctor", "--json"])
+    captured = capsys.readouterr()
+    assert exit_code in (0, 1)
+    data = json.loads(captured.out)
+    assert "checks" in data
+
+
+def test_firstboot_plan_human_output(capsys) -> None:
+    exit_code = main(["firstboot", "plan"])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "SEREIN FIRSTBOOT PLAN" in captured.out
+    assert "Mutation: none" in captured.out
+
+
+def test_firstboot_plan_json_is_well_formed_and_side_effect_free(capsys) -> None:
+    exit_code = main(["firstboot", "plan", "--json"])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    data = json.loads(captured.out)
+    assert data["schema_version"] == 1
+    assert data["mutation"] == "none"
+    assert len(data["steps"]) == 11
+
+
+def test_firstboot_run_is_not_a_main_cli_subcommand() -> None:
+    # Section 12: the main interactive CLI only ever exposes read-only
+    # firstboot status/doctor/plan - real mutation lives exclusively
+    # behind `python -m serein.firstboot run --allow-run`.
+    with pytest.raises(SystemExit) as excinfo:
+        main(["firstboot", "run"])
+    assert excinfo.value.code != 0
+
+
 def test_no_command_exits_nonzero(capsys) -> None:
     with pytest.raises(SystemExit) as excinfo:
         main([])

@@ -40,6 +40,9 @@ from serein.distribution.inspect import inspect_extracted_tree, inspect_iso_file
 from serein.distribution.status import build_distribution_status
 from serein.doctor.checks import run_checks
 from serein.doctor.models import CheckStatus, DoctorReport
+from serein.firstboot.doctor import run_firstboot_checks
+from serein.firstboot.plan import build_firstboot_plan
+from serein.firstboot.status import build_firstboot_status
 from serein.focus.capabilities import build_focus_capabilities
 from serein.focus.doctor import run_focus_checks
 from serein.focus.evidence import gather_focus_evidence
@@ -907,6 +910,64 @@ def _cmd_installer_plan(args: argparse.Namespace) -> int:
     return 1
 
 
+def _cmd_firstboot_status(args: argparse.Namespace) -> int:
+    status = build_firstboot_status()
+    if args.json:
+        print(json.dumps(status.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN FIRSTBOOT")
+    print()
+    print(f"Eligibility    {status.eligibility_status} ({status.eligibility_reason})")
+    print(f"State          {status.state}")
+    print(
+        f"Handoff        present={status.install_state_present} "
+        f"valid={status.install_state_valid}"
+    )
+    print(f"Provisioning   {status.firstboot_provisioning or 'unknown'}")
+    print(f"Live media     {'yes' if status.live_media_detected else 'no'}")
+    print()
+    print("Steps")
+    for step_status, count in status.steps_summary.items():
+        print(f"  {step_status:<10} {count}")
+    if status.first_failure_stage:
+        print()
+        print(f"First failure  {status.first_failure_stage}: {status.first_failure_reason}")
+    return 0
+
+
+def _cmd_firstboot_doctor(args: argparse.Namespace) -> int:
+    report = run_firstboot_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN FIRSTBOOT DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_firstboot_plan(args: argparse.Namespace) -> int:
+    plan = build_firstboot_plan()
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print(
+        f"SEREIN FIRSTBOOT PLAN - eligibility: {plan.eligibility_status} "
+        f"({plan.eligibility_reason})"
+    )
+    print()
+    for step in plan.steps:
+        print(f"  [{step.id}] {step.title}")
+        print(f"            {step.description}")
+        if step.would_create:
+            print(f"            would create/update: {', '.join(step.would_create)}")
+    print()
+    print(f"systemd unit: {plan.systemd_unit}")
+    print(f"Mutation: {plan.mutation}")
+    return 0
+
+
 def _cmd_focus_status(_args: argparse.Namespace) -> int:
     status = build_focus_status()
     print("SEREIN FOCUS")
@@ -1455,6 +1516,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     installer_plan_parser.set_defaults(func=_cmd_installer_plan)
+
+    firstboot_parser = subparsers.add_parser(
+        "firstboot",
+        help="First-boot provisioning status/diagnostics/planning (read-only - see "
+             "'python -m serein.firstboot run' for the explicit mutating entrypoint)",
+    )
+    firstboot_subparsers = firstboot_parser.add_subparsers(
+        dest="firstboot_command", required=True
+    )
+
+    firstboot_status_parser = firstboot_subparsers.add_parser(
+        "status", help="Show first-boot eligibility/state/step summary"
+    )
+    firstboot_status_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    firstboot_status_parser.set_defaults(func=_cmd_firstboot_status)
+
+    firstboot_doctor_parser = firstboot_subparsers.add_parser(
+        "doctor", help="Run first-boot diagnostics"
+    )
+    firstboot_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    firstboot_doctor_parser.set_defaults(func=_cmd_firstboot_doctor)
+
+    firstboot_plan_parser = firstboot_subparsers.add_parser(
+        "plan", help="Preview what first-boot provisioning would do (side-effect free)"
+    )
+    firstboot_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    firstboot_plan_parser.set_defaults(func=_cmd_firstboot_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
