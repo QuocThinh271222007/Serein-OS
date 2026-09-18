@@ -6,13 +6,20 @@ ecosystem. It orchestrates and configures mature upstream components on top
 of Ubuntu LTS for local AI workloads, software development, cybersecurity
 research, and privacy-oriented workflows.
 
-**Current development phase: S7.0 — Bootable ISO Prototype.** Serein
-can now assemble a private development Alpha ISO from a verified Ubuntu
-26.04 base image by remastering it with a controlled, integrity-checked
-Serein payload overlay — see [`docs/distribution/`](docs/distribution/architecture.md).
-This is not a public release (the project has no selected license yet)
-and not yet a polished installer experience — S7.1/S7.2/S7.3 remain
-future work. S1 (complete) added the desktop
+**Current status: Phase 7 implementation complete; physical hardware
+validation pending.** S0-S6.5's architecture/planning layers are
+complete. S7.0 (Bootable ISO Prototype) and S7.1 (safe, real,
+target-explicit installer integration) are closed, each through many
+real, evidence-driven corrective rounds. The remaining Phase 7 scope —
+first-boot provisioning (historical S7.2), recovery/repair (historical
+S7.3), Serein identity/branding, boot theming, and signed update
+infrastructure — is implemented on `feat/serein-s7-completion` (see
+[ADR-0032](docs/adr/0032-phase-7-completion-strategy.md)). This is
+still not a public release (the project has no selected license yet),
+and no dedicated external-disk physical validation run has happened
+yet — see
+[`docs/physical-validation/architecture.md`](docs/physical-validation/architecture.md).
+S1 (complete) added the desktop
 *integration layer*: a declarative KDE Plasma package manifest,
 `/etc/xdg` configuration resources, and read-only detection/planning
 CLI. S2 (complete) added hardware *capability modeling and
@@ -57,7 +64,7 @@ moment, and PRIMARY never means EXCLUSIVE
 (`serein focus status`/`domains`/`capabilities`/
 `plan <target>`/`transition --from X --to Y`/`doctor`), built entirely
 on S2-S6's own capability evidence — no second hardware/dev/AI/cyber/
-privacy detector exists. S7.0 (in progress) proves S0-S6.5's work can be
+privacy detector exists. S7.0 (complete) proves S0-S6.5's work can be
 assembled into real, reproducible bootable media: a pinned,
 checksum-verified Ubuntu 26.04 base image, a rootless remaster pipeline
 with an allowlisted overlay, a versioned/integrity-checked Serein

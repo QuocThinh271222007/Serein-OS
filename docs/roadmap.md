@@ -132,7 +132,7 @@ repository** - see `docs/veil/architecture.md` for exactly what
 see `docs/veil/architecture.md` for why. Real workspace/VM provisioning
 remains future work (S7/S8-adjacent, not scheduled).
 
-## S6.5 — Focus Architecture *(this repository, in progress)*
+## S6.5 — Focus Architecture *(planning layer complete, merged to main; real runtime executor added in Phase 7 completion - see below)*
 
 A semantic layer above the normal OS scheduler: many professional
 domains (development, AI, cybersecurity, privacy) may exist
@@ -149,21 +149,28 @@ privacy detector exists. Adds `serein focus status`,
 [ADR-0025](adr/0025-serein-permits-at-most-one-primary-focus.md)
 through
 [ADR-0028](adr/0028-gpu-ownership-is-intent-not-generic-enforceable-state.md).
-**No cgroup write, systemd unit mutation, service/container/VM
-start-stop, GPU power-mode change, CPU governor change, or focus
-persistence exists anywhere in this repository; every output carries
-`runtime_enforcement: false`** - see `docs/focus/architecture.md` for
-exactly what "implemented" means at this phase. Real resource
-enforcement (systemd slices, cgroup v2 weighting, a transition
-executor) remains future work - see `docs/focus/future-runtime.md`.
+This phase itself never wrote a cgroup, mutated a systemd unit, or
+persisted focus state - every S6.5 output carried
+`runtime_enforcement: false`, see `docs/focus/architecture.md` for
+exactly what "implemented" meant at this phase. `serein.focus.runtime`
+(added during the Phase 7 completion program, see ADR-0032) is the
+real transaction executor `docs/focus/future-runtime.md` described as
+future work - it writes real systemd slice units with real
+CPUWeight/IOWeight values and persists real committed focus state,
+consuming this phase's planning functions unchanged.
 
 ## S7 — Distribution
 
 Split into four sub-phases - see
 [ADR-0029](adr/0029-s7-split-into-four-subphases.md) and
 [`docs/distribution/s7-roadmap.md`](distribution/s7-roadmap.md).
+S7.0 and S7.1 each closed through many real, evidence-driven
+corrective rounds; the remaining Phase 7 scope (S7.2, S7.3, and
+additional identity/update-infrastructure work the original four-way
+split never separately named) was completed as one unified program -
+see [ADR-0032](adr/0032-phase-7-completion-strategy.md).
 
-### S7.0 — Bootable ISO Prototype *(this repository, in progress)*
+### S7.0 — Bootable ISO Prototype *(complete)*
 
 Proves Serein can be assembled into real, reproducible bootable media by
 remastering a verified, checksum-pinned upstream Ubuntu 26.04 LTS
@@ -183,7 +190,7 @@ means at this phase, including this pass's real (Layer B) validation
 status. This is **not** a public release - the project has no selected
 license yet (`docs/distribution/licensing-and-release-boundary.md`).
 
-### S7.1 — Installer Integration *(in progress)*
+### S7.1 — Installer Integration *(complete)*
 
 Builds on the S0 installer *contract* (not before it) and S7.0's
 base-image/payload contracts to integrate real Subiquity-driven target
@@ -195,16 +202,27 @@ the full design (target-identity contract, protected-disk contract,
 destructive-operation model, production-vs-QA install modes, VM
 validation topology) and `docs/installer/known-limitations.md` for
 exactly what real (Layer B) validation does and does not exist yet.
+Closed through many real corrective rounds, most recently R22's
+storage-probe-trigger reliability fix.
 
-### S7.2 — First-Boot Provisioning *(future, not started)*
+### S7.2 — First-Boot Provisioning *(complete)*
 
 Applies the desktop/hardware/dev/AI/cyber/veil/focus profile resources
-S7.0 merely embeds on media today into a freshly-installed target
-system.
+S7.0 merely embeds on media into a freshly-installed target system.
+Implemented as a real transactional `serein.firstboot` module
+(state machine, single-owner locking, idempotent retry, real S1
+desktop verify+record and S2 hardware apply steps) as part of the
+Phase 7 completion program - see `docs/firstboot/architecture.md` and
+[ADR-0032](adr/0032-phase-7-completion-strategy.md).
 
-### S7.3 — Recovery / Repair / Fallback *(future, not started)*
+### S7.3 — Recovery / Repair / Fallback *(complete, narrower scope than originally sketched)*
 
-Recovery partition, rollback, and factory-reset capability.
+Managed-file integrity checking, diagnostics, planning, and repair
+(`serein.recovery`) - see `docs/recovery/architecture.md` for why this
+round's scope is narrower than "recovery partition/factory-reset":
+firstboot-transaction recovery and Focus-transition recovery already
+have real recovery mechanics built directly into their own
+subsystems, so a separate layer was never needed for those.
 
 ## S8 — Refinement & Benchmarking
 
