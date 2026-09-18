@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from serein import __version__ as _SEREIN_VERSION
+
 DISTRIBUTION_BASE_IMAGE_SCHEMA_VERSION = 1
 DISTRIBUTION_PAYLOAD_MANIFEST_SCHEMA_VERSION = 1
 DISTRIBUTION_BUILD_MANIFEST_SCHEMA_VERSION = 1
@@ -142,7 +144,19 @@ class BuildOutput:
 class BuildManifest:
     """Recorded alongside every successful build as
     ``<iso>.manifest.json`` (Section 16). Deliberately excludes any
-    host-identifying field - see docs/distribution/security.md."""
+    host-identifying field - see docs/distribution/security.md.
+
+    ``release_channel`` (``RELEASE_CHANNEL``, e.g. ``"alpha"``) is this
+    build's own maturity/type label - a build-time constant, never
+    user-configurable. This is a DIFFERENT concept from
+    ``serein.release.channels`` (Phase-7-completion Section 44's
+    stable/beta/dev *update* channel - which package stream an
+    already-installed system subscribes to, user-configurable
+    post-install) - the shared word "channel" is coincidental, never
+    conflated.
+
+    ``serein_version`` (Section 51-52) reuses ``serein.__version__``
+    directly - never a second, independently-maintained copy."""
 
     source_commit: str
     base: BaseImageSpec
@@ -155,10 +169,12 @@ class BuildManifest:
     overlay_version: str = OVERLAY_VERSION
     source_date_epoch: int | None = None
     schema_version: int = DISTRIBUTION_BUILD_MANIFEST_SCHEMA_VERSION
+    serein_version: str = _SEREIN_VERSION
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
+            "serein_version": self.serein_version,
             "release_channel": self.release_channel,
             "source_commit": self.source_commit,
             "build_schema": self.build_schema,

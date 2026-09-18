@@ -6,6 +6,7 @@
   "type": "object",
   "required": [
     "schema_version",
+    "serein_version",
     "release_channel",
     "source_commit",
     "build_schema",
@@ -19,6 +20,7 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": { "const": 1 },
+    "serein_version": { "type": "string", "minLength": 1 },
     "release_channel": { "type": "string", "enum": ["alpha"] },
     "source_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "build_schema": { "type": "integer", "minimum": 1 },
