@@ -3,6 +3,7 @@ Section 9/14, S7.2 asset-handoff contract Section 5/13)."""
 
 from __future__ import annotations
 
+import configparser
 import json
 from pathlib import Path
 
@@ -14,8 +15,10 @@ from serein.branding.fastfetch import (
     build_fastfetch_config,
     focus_display_label,
 )
+from serein.branding.grub_theme import render_grub_theme
 from serein.branding.manifest import ASSETS, missing_assets, pending_asset_requests
 from serein.branding.os_identity import render_issue, render_issue_net, render_os_release
+from serein.branding.plymouth_theme import render_plymouth_metadata, render_plymouth_script
 from serein.branding.tokens import load_design_tokens
 from serein.desktop.models import TARGET_UBUNTU_VERSION
 from serein.distribution.payload import PAYLOAD_RESOURCE_ROOTS, collect_resource_entries
@@ -251,3 +254,77 @@ class TestBrandingMainEntrypoint:
         with pytest.raises(SystemExit) as excinfo:
             main(["not-a-real-command"])
         assert excinfo.value.code != 0
+
+
+class TestGrubTheme:
+    def test_uses_pinned_design_token_colors_never_a_second_literal(self) -> None:
+        tokens = load_design_tokens()
+        theme = render_grub_theme()
+        assert tokens.color("background").hex in theme
+        assert tokens.color("primary").hex in theme
+        assert tokens.color("focus").hex in theme
+
+    def test_never_references_a_pixmap_or_image(self) -> None:
+        # No master logo asset exists yet (pending_asset_request) -
+        # this theme must be fully flat-color, never reference a file
+        # that does not exist. Only real directives are checked here -
+        # the generator's own explanatory comments legitimately mention
+        # "pixmap" in prose.
+        directive_lines = "\n".join(
+            line for line in render_grub_theme().lower().splitlines()
+            if not line.strip().startswith("#")
+        )
+        assert "desktop-image" not in directive_lines
+        assert "pixmap_style" not in directive_lines
+        assert ".png" not in directive_lines
+
+    def test_braces_are_balanced(self) -> None:
+        theme = render_grub_theme()
+        assert theme.count("{") == theme.count("}")
+        assert theme.count("{") > 0
+
+
+class TestPlymouthTheme:
+    def test_metadata_is_valid_ini(self) -> None:
+        parser = configparser.ConfigParser()
+        parser.read_string(render_plymouth_metadata())
+        assert parser.get("Plymouth Theme", "ModuleName") == "script"
+        assert parser.has_section("script")
+
+    def test_metadata_script_file_matches_the_theme_name(self) -> None:
+        parser = configparser.ConfigParser()
+        parser.read_string(render_plymouth_metadata())
+        script_file = parser.get("script", "ScriptFile")
+        assert script_file.endswith("serein.script")
+
+    def test_script_never_references_an_external_image_file(self) -> None:
+        # No master logo asset exists yet - the splash is entirely
+        # script-drawn (background fill + Image.Text), never a
+        # reference to a file that does not exist.
+        script = render_plymouth_script().lower()
+        assert ".png" not in script
+        assert "image.load" not in script.replace(" ", "")
+
+    def test_script_uses_pinned_design_token_colors(self) -> None:
+        tokens = load_design_tokens()
+        script = render_plymouth_script()
+
+        def as_rgb_expr(hex_color: str) -> tuple[float, float, float]:
+            v = hex_color.lstrip("#")
+            return (int(v[0:2], 16) / 255, int(v[2:4], 16) / 255, int(v[4:6], 16) / 255)
+
+        r, g, b = as_rgb_expr(tokens.color("background").hex)
+        assert f"{r:.4f}" in script
+        assert f"{g:.4f}" in script
+        assert f"{b:.4f}" in script
+
+    def test_braces_and_parens_are_balanced(self) -> None:
+        script = render_plymouth_script()
+        assert script.count("{") == script.count("}")
+        assert script.count("(") == script.count(")")
+
+    def test_pulse_opacity_never_reaches_zero(self) -> None:
+        # Section 22: "never fully invisible" - the pulse amplitude/
+        # offset must keep opacity bounded away from 0.
+        script = render_plymouth_script()
+        assert "0.8 + 0.2" in script
