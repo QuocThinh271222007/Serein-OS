@@ -69,6 +69,9 @@ from serein.installer.identity import capture_target_identity
 from serein.installer.planner import build_install_plan, validate_plan
 from serein.installer.status import build_installer_status
 from serein.profiles.registry import list_profiles
+from serein.recovery.doctor import run_recovery_checks
+from serein.recovery.plan import build_recovery_plan
+from serein.recovery.status import build_recovery_status
 from serein.veil.capabilities import build_veil_capabilities
 from serein.veil.doctor import run_veil_checks
 from serein.veil.planner import VALID_COMPONENTS as VEIL_VALID_COMPONENTS
@@ -968,6 +971,50 @@ def _cmd_firstboot_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_recovery_status(args: argparse.Namespace) -> int:
+    status = build_recovery_status()
+    if args.json:
+        print(json.dumps(status.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN RECOVERY")
+    print()
+    print(f"Healthy  {status.healthy}")
+    print()
+    for check in status.checks:
+        print(f"  [{check.status:8}] {check.target_path} - {check.detail}")
+    return 0
+
+
+def _cmd_recovery_doctor(args: argparse.Namespace) -> int:
+    report = run_recovery_checks()
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+        return report.exit_code
+
+    _print_doctor_report("SEREIN RECOVERY DOCTOR", report)
+    return report.exit_code
+
+
+def _cmd_recovery_plan(args: argparse.Namespace) -> int:
+    plan = build_recovery_plan()
+    if args.json:
+        print(json.dumps(plan.to_dict(), indent=2, sort_keys=True))
+        return 0
+
+    print("SEREIN RECOVERY PLAN")
+    print()
+    if not plan.actions:
+        print("  nothing to repair")
+        return 0
+    for action in plan.actions:
+        marker = "would repair" if action.would_write else "cannot auto-repair"
+        print(f"  [{marker:19}] {action.target_path} - {action.reason}")
+    print()
+    print("Mutation: none (see 'python -m serein.recovery repair --allow-repair')")
+    return 0
+
+
 def _cmd_focus_status(_args: argparse.Namespace) -> int:
     status = build_focus_status()
     print("SEREIN FOCUS")
@@ -1549,6 +1596,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Emit machine-readable JSON"
     )
     firstboot_plan_parser.set_defaults(func=_cmd_firstboot_plan)
+
+    recovery_parser = subparsers.add_parser(
+        "recovery",
+        help="Managed-file health status/diagnostics/planning (read-only - see "
+             "'python -m serein.recovery repair --allow-repair' for the explicit "
+             "mutating entrypoint)",
+    )
+    recovery_subparsers = recovery_parser.add_subparsers(dest="recovery_command", required=True)
+
+    recovery_status_parser = recovery_subparsers.add_parser(
+        "status", help="Show managed-file health summary"
+    )
+    recovery_status_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    recovery_status_parser.set_defaults(func=_cmd_recovery_status)
+
+    recovery_doctor_parser = recovery_subparsers.add_parser(
+        "doctor", help="Run recovery diagnostics"
+    )
+    recovery_doctor_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    recovery_doctor_parser.set_defaults(func=_cmd_recovery_doctor)
+
+    recovery_plan_parser = recovery_subparsers.add_parser(
+        "plan", help="Preview what repair would do (side-effect free)"
+    )
+    recovery_plan_parser.add_argument(
+        "--json", action="store_true", help="Emit machine-readable JSON"
+    )
+    recovery_plan_parser.set_defaults(func=_cmd_recovery_plan)
 
     profile_parser = subparsers.add_parser("profile", help="Profile management")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command", required=True)
