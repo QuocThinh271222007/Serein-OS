@@ -237,6 +237,9 @@ class TestPayload:
         # AI/Cyber/Veil manifests themselves live as Python modules under
         # src/serein/{ai,cyber,veil}/ and are proven embeddable via the
         # wheel-build path (test_wheel_build_is_available_as_separate_step).
+        # branding (Phase-7-completion S7.2) joined the allowlist once real
+        # shipped content existed under it (design-tokens.json, the
+        # terminal ASCII mark) - see src/serein/branding/manifest.py.
         assert top_level_roots == set(PAYLOAD_RESOURCE_ROOTS)
         assert len(entries) > 0
 

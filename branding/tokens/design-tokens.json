@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "design_language": "Quiet Velocity",
+  "core_values": ["Quiet", "Fast", "Focused", "Adaptive"],
+  "colors": {
+    "background": { "hex": "#0D1117", "role": "background" },
+    "surface": { "hex": "#151B23", "role": "surface" },
+    "elevated": { "hex": "#1C2430", "role": "elevated" },
+    "primary": { "hex": "#75BFD8", "role": "primary" },
+    "secondary": { "hex": "#91A7B4", "role": "secondary" },
+    "focus": { "hex": "#A6DCEF", "role": "focus" },
+    "text": { "hex": "#DCE6EC", "role": "text" },
+    "muted": { "hex": "#81909A", "role": "muted" }
+  },
+  "visual_ratio": {
+    "neutral": 0.90,
+    "accent": 0.08,
+    "focus_status": 0.02
+  },
+  "motion": {
+    "animation_duration_ms_min": 100,
+    "animation_duration_ms_max": 180,
+    "reduced_motion_supported": true
+  }
+}

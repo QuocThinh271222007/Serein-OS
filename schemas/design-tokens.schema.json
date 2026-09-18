@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://serein-os/schemas/design-tokens.schema.json",
+  "title": "Serein Design Tokens",
+  "description": "The single canonical source of Serein's visual identity (S7.2 Section 6, 'Quiet Velocity'). Every consumer that needs a color, ratio, or motion value - GRUB/Plymouth theme generation, desktop color-scheme files, Fastfetch/terminal output, docs - reads this file rather than hardcoding a literal value.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "design_language",
+    "core_values",
+    "colors",
+    "visual_ratio",
+    "motion"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "const": 1 },
+    "design_language": { "type": "string", "const": "Quiet Velocity" },
+    "core_values": {
+      "type": "array",
+      "items": { "type": "string", "enum": ["Quiet", "Fast", "Focused", "Adaptive"] },
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true
+    },
+    "colors": {
+      "type": "object",
+      "required": ["background", "surface", "elevated", "primary", "secondary", "focus", "text", "muted"],
+      "additionalProperties": false,
+      "properties": {
+        "background": { "$ref": "#/$defs/colorToken" },
+        "surface": { "$ref": "#/$defs/colorToken" },
+        "elevated": { "$ref": "#/$defs/colorToken" },
+        "primary": { "$ref": "#/$defs/colorToken" },
+        "secondary": { "$ref": "#/$defs/colorToken" },
+        "focus": { "$ref": "#/$defs/colorToken" },
+        "text": { "$ref": "#/$defs/colorToken" },
+        "muted": { "$ref": "#/$defs/colorToken" }
+      }
+    },
+    "visual_ratio": {
+      "description": "Section 6's '~90% neutral / ~8% subtle accent / ~2% strong focus-status' philosophy - a design guideline consumers should check their own composition against, never a runtime-enforced constraint.",
+      "type": "object",
+      "required": ["neutral", "accent", "focus_status"],
+      "additionalProperties": false,
+      "properties": {
+        "neutral": { "type": "number", "minimum": 0, "maximum": 1 },
+        "accent": { "type": "number", "minimum": 0, "maximum": 1 },
+        "focus_status": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "motion": {
+      "description": "Section 8's animation budget - milliseconds, never a proven runtime guarantee until measured (a value here is a target, not a benchmark result).",
+      "type": "object",
+      "required": ["animation_duration_ms_min", "animation_duration_ms_max", "reduced_motion_supported"],
+      "additionalProperties": false,
+      "properties": {
+        "animation_duration_ms_min": { "type": "integer", "minimum": 0 },
+        "animation_duration_ms_max": { "type": "integer", "minimum": 0 },
+        "reduced_motion_supported": { "type": "boolean" }
+      }
+    }
+  },
+  "$defs": {
+    "colorToken": {
+      "type": "object",
+      "required": ["hex", "role"],
+      "additionalProperties": false,
+      "properties": {
+        "hex": { "type": "string", "pattern": "^#[0-9A-Fa-f]{6}$" },
+        "role": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

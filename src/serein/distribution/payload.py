@@ -82,6 +82,7 @@ class WheelContentError(ValueError):
 #: Top-level repository directories that may be embedded on media.
 #: Nothing outside this allowlist is ever walked - see Section 69.
 PAYLOAD_RESOURCE_ROOTS: tuple[str, ...] = (
+    "branding",
     "desktop",
     "development",
     "hardware",
